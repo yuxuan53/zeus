@@ -88,6 +88,8 @@ class EdgeDecision:
     applied_validations: list[str] = field(default_factory=list)
     decision_snapshot_id: str = ""
     edge_source: str = ""
+    strategy_key: str = ""
+    availability_status: str = ""
     # Signal data for decision chain recording
     p_raw: Optional[np.ndarray] = None
     p_cal: Optional[np.ndarray] = None
@@ -176,6 +178,30 @@ def _edge_source_for(candidate: MarketCandidate, edge: BinEdge) -> str:
     return "opening_inertia"
 
 
+def _strategy_key_for(candidate: MarketCandidate, edge: BinEdge) -> str:
+    if candidate.discovery_mode == DiscoveryMode.DAY0_CAPTURE.value:
+        return "settlement_capture"
+    if candidate.discovery_mode == DiscoveryMode.OPENING_HUNT.value:
+        return "opening_inertia"
+    if edge.bin.is_shoulder:
+        return "shoulder_sell"
+    if edge.direction == "buy_yes":
+        return "center_buy"
+    return "opening_inertia"
+
+
+def _availability_status_for_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    name = exc.__class__.__name__
+    if "429" in text or "rate" in text or "limit" in text or "capacity" in text:
+        return "RATE_LIMITED"
+    if "chain" in text:
+        return "CHAIN_UNAVAILABLE"
+    if name == "MissingCalibrationError":
+        return "DATA_STALE"
+    return "DATA_UNAVAILABLE"
+
+
 def _get_day0_temporal_context(city: City, target_date: date, observation: Optional[dict] = None):
     try:
         if observation is not None and not observation.get("observation_time"):
@@ -225,6 +251,7 @@ def evaluate_candidate(
             decision_id=_decision_id(),
             rejection_stage="SIGNAL_QUALITY",
             rejection_reasons=["Day0 observation unavailable"],
+            availability_status="DATA_UNAVAILABLE",
             selected_method=selected_method,
             applied_validations=["day0_observation"],
         )]
@@ -258,13 +285,25 @@ def evaluate_candidate(
     ens_forecast_days = max(2, int(max(0.0, lead_days)) + 2)
 
     # Fetch ENS
-    ens_result = fetch_ensemble(city, forecast_days=ens_forecast_days)
+    try:
+        ens_result = fetch_ensemble(city, forecast_days=ens_forecast_days)
+    except Exception as e:
+        return [EdgeDecision(
+            False,
+            decision_id=_decision_id(),
+            rejection_stage="SIGNAL_QUALITY",
+            rejection_reasons=[str(e)],
+            availability_status=_availability_status_for_error(e),
+            selected_method=selected_method,
+            applied_validations=["ens_fetch"],
+        )]
     if ens_result is None or not validate_ensemble(ens_result):
         return [EdgeDecision(
             False,
             decision_id=_decision_id(),
             rejection_stage="SIGNAL_QUALITY",
             rejection_reasons=["ENS fetch failed or < 51 members"],
+            availability_status="DATA_UNAVAILABLE",
             selected_method=selected_method,
             applied_validations=["ens_fetch"],
         )]
@@ -287,6 +326,7 @@ def evaluate_candidate(
             decision_id=_decision_id(),
             rejection_stage="SIGNAL_QUALITY",
             rejection_reasons=[str(e)],
+            availability_status="DATA_STALE",
             selected_method=selected_method,
             applied_validations=["ens_fetch"],
         )]
@@ -304,6 +344,7 @@ def evaluate_candidate(
                 decision_id=_decision_id(),
                 rejection_stage="SIGNAL_QUALITY",
                 rejection_reasons=["Solar/DST context unavailable for Day0"],
+                availability_status="DATA_STALE",
                 selected_method=selected_method,
                 applied_validations=["day0_observation", "solar_context"],
             )]
@@ -321,6 +362,7 @@ def evaluate_candidate(
                 decision_id=_decision_id(),
                 rejection_stage="SIGNAL_QUALITY",
                 rejection_reasons=["No Day0 forecast hours remain for target date"],
+                availability_status="DATA_STALE",
                 selected_method=selected_method,
                 applied_validations=["day0_observation", "ens_fetch"],
             )]
@@ -383,7 +425,7 @@ def evaluate_candidate(
                 token_id=o["token_id"],
                 city=city.name,
                 target_date=target_d.isoformat(),
-                range_label=b.label,
+                range_label=bins[idx].label,
                 price=float(p_market[idx]),
                 volume=float(bid_sz + ask_sz),
                 bid=float(bid),
@@ -403,6 +445,7 @@ def evaluate_candidate(
                     decision_id=_decision_id(),
                     rejection_stage="MARKET_LIQUIDITY",
                     rejection_reasons=[str(e)],
+                    availability_status="DATA_UNAVAILABLE",
                     selected_method=selected_method,
                     applied_validations=entry_validations,
                     decision_snapshot_id=snapshot_id,
@@ -410,11 +453,39 @@ def evaluate_candidate(
                     p_cal=p_cal,
                     p_market=p_market,
                 )]
-            p_market[idx] = o["price"]
+            return [EdgeDecision(
+                False,
+                decision_id=_decision_id(),
+                rejection_stage="MARKET_LIQUIDITY",
+                rejection_reasons=[str(e)],
+                availability_status=_availability_status_for_error(e),
+                selected_method=selected_method,
+                applied_validations=entry_validations,
+                decision_snapshot_id=snapshot_id,
+                p_raw=p_raw,
+                p_cal=p_cal,
+                p_market=p_market,
+            )]
 
     agreement = "AGREE"
     if not is_day0_mode:
-        gfs_result = fetch_ensemble(city, forecast_days=ens_forecast_days, model="gfs025")
+        try:
+            gfs_result = fetch_ensemble(city, forecast_days=ens_forecast_days, model="gfs025")
+        except Exception as e:
+            return [EdgeDecision(
+                False,
+                decision_id=_decision_id(),
+                rejection_stage="SIGNAL_QUALITY",
+                rejection_reasons=[f"GFS crosscheck unavailable: {e}"],
+                availability_status=_availability_status_for_error(e),
+                selected_method=selected_method,
+                applied_validations=[*entry_validations, "gfs_crosscheck_unavailable"],
+                decision_snapshot_id=snapshot_id,
+                p_raw=p_raw,
+                p_cal=p_cal,
+                p_market=p_market,
+                agreement="CROSSCHECK_UNAVAILABLE",
+            )]
         if gfs_result is None or not validate_ensemble(
             gfs_result,
             expected_members=ensemble_crosscheck_member_count(),
@@ -424,6 +495,7 @@ def evaluate_candidate(
                 decision_id=_decision_id(),
                 rejection_stage="SIGNAL_QUALITY",
                 rejection_reasons=["GFS crosscheck unavailable"],
+                availability_status="DATA_UNAVAILABLE",
                 selected_method=selected_method,
                 applied_validations=[*entry_validations, "gfs_crosscheck_unavailable"],
                 decision_snapshot_id=snapshot_id,
@@ -460,6 +532,7 @@ def evaluate_candidate(
                 decision_id=_decision_id(),
                 rejection_stage="SIGNAL_QUALITY",
                 rejection_reasons=[f"GFS crosscheck unavailable: {e}"],
+                availability_status="DATA_UNAVAILABLE",
                 selected_method=selected_method,
                 applied_validations=[*entry_validations, "gfs_crosscheck_unavailable"],
                 decision_snapshot_id=snapshot_id,
@@ -573,6 +646,7 @@ def evaluate_candidate(
         tokens = token_map[bin_idx]
         decision_validations = list(entry_validations)
         edge_source = _edge_source_for(candidate, edge)
+        strategy_key = _strategy_key_for(candidate, edge)
 
         # Anti-churn layers 5, 6, 7
         if is_reentry_blocked(portfolio, city.name, edge.bin.label, target_date):
@@ -586,6 +660,7 @@ def evaluate_candidate(
                 applied_validations=[*decision_validations, "anti_churn"],
                 decision_snapshot_id=snapshot_id,
                 edge_source=edge_source,
+                strategy_key=strategy_key,
             ))
             continue
         check_token = tokens["token_id"] if edge.direction == "buy_yes" else tokens["no_token_id"]
@@ -600,6 +675,7 @@ def evaluate_candidate(
                 applied_validations=[*decision_validations, "anti_churn"],
                 decision_snapshot_id=snapshot_id,
                 edge_source=edge_source,
+                strategy_key=strategy_key,
             ))
             continue
         if has_same_city_range_open(portfolio, city.name, edge.bin.label):
@@ -613,6 +689,7 @@ def evaluate_candidate(
                 applied_validations=[*decision_validations, "anti_churn"],
                 decision_snapshot_id=snapshot_id,
                 edge_source=edge_source,
+                strategy_key=strategy_key,
             ))
             continue
 
@@ -659,6 +736,7 @@ def evaluate_candidate(
                 applied_validations=list(decision_validations),
                 decision_snapshot_id=snapshot_id,
                 edge_source=edge_source,
+                strategy_key=strategy_key,
             ))
             continue
 
@@ -691,6 +769,7 @@ def evaluate_candidate(
                 applied_validations=list(decision_validations),
                 decision_snapshot_id=snapshot_id,
                 edge_source=edge_source,
+                strategy_key=strategy_key,
             ))
             continue
 
@@ -719,6 +798,7 @@ def evaluate_candidate(
             applied_validations=[*decision_validations, "anti_churn"],
             decision_snapshot_id=snapshot_id,
             edge_source=edge_source,
+            strategy_key=strategy_key,
             p_raw=p_raw,
             p_cal=p_cal,
             p_market=p_market,

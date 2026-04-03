@@ -61,7 +61,7 @@ def test_analysis_spread_context_explains_multiplier():
     assert ctx["spread_multiplier"] == 1.05
 
 
-def test_analysis_member_maxes_is_identity_for_now():
+def test_analysis_member_maxes_is_identity_without_bias_reference():
     raw = [40.0, 42.0, 41.5]
     adjusted = analysis_member_maxes(raw, unit="F", lead_days=5.0)
     assert list(adjusted) == raw
@@ -69,6 +69,43 @@ def test_analysis_member_maxes_is_identity_for_now():
 
 def test_analysis_mean_offset_is_zero_for_now():
     assert analysis_mean_offset(unit="F", lead_days=5.0, ensemble_mean=42.0) == 0.0
+
+
+def test_analysis_member_maxes_applies_bounded_bias_offset_when_uncorrected():
+    raw = [40.0, 42.0, 41.5]
+    adjusted = analysis_member_maxes(
+        raw,
+        unit="F",
+        lead_days=5.0,
+        bias_corrected=False,
+        bias_reference={"source": "ecmwf", "bias": 1.5},
+    )
+    expected_offset = -0.875
+    assert list(adjusted) == __import__("pytest").approx([v + expected_offset for v in raw])
+
+
+def test_analysis_member_maxes_respects_bias_corrected_guard():
+    raw = [40.0, 42.0, 41.5]
+    adjusted = analysis_member_maxes(
+        raw,
+        unit="F",
+        lead_days=5.0,
+        bias_corrected=True,
+        bias_reference={"source": "ecmwf", "bias": 4.0, "discount_factor": 0.7},
+    )
+    assert list(adjusted) == raw
+
+
+def test_analysis_member_maxes_suppresses_offset_for_thin_bias_reference():
+    raw = [40.0, 42.0, 41.5]
+    adjusted = analysis_member_maxes(
+        raw,
+        unit="F",
+        lead_days=5.0,
+        bias_corrected=False,
+        bias_reference={"source": "ecmwf", "bias": 4.0, "discount_factor": 0.7, "n_samples": 12},
+    )
+    assert list(adjusted) == raw
 
 
 def test_analysis_mean_context_explains_offset():
@@ -125,6 +162,148 @@ def test_analysis_mean_context_caps_large_bias_offset():
     assert ctx["offset"] == -(sigma_instrument("F").value * 2.0)
 
 
+def test_analysis_mean_context_suppresses_offset_below_sample_floor():
+    ctx = analysis_mean_context(
+        unit="F",
+        lead_days=5.0,
+        ensemble_mean=42.0,
+        city_name="NYC",
+        season="MAM",
+        forecast_source="ecmwf_ifs025",
+        bias_corrected=False,
+        bias_reference={"source": "ecmwf", "bias": 4.0, "discount_factor": 0.7, "n_samples": 12},
+    )
+    assert ctx["n_samples"] == 12
+    assert ctx["sample_factor"] == 0.0
+    assert ctx["raw_offset"] == 0.0
+    assert ctx["offset"] == 0.0
+
+
+def test_analysis_mean_context_attenuates_offset_for_high_mae():
+    ctx = analysis_mean_context(
+        unit="F",
+        lead_days=6.0,
+        ensemble_mean=42.0,
+        city_name="NYC",
+        season="MAM",
+        forecast_source="ecmwf_ifs025",
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": 2.0,
+            "discount_factor": 0.7,
+            "n_samples": 30,
+            "mae": 1.5,
+        },
+    )
+    assert ctx["sample_factor"] == 1.0
+    assert ctx["mae"] == 1.5
+    assert 0.0 < ctx["mae_factor"] < 1.0
+    assert ctx["raw_offset"] == __import__("pytest").approx(-0.4666666666666667)
+    assert ctx["offset"] == ctx["raw_offset"]
+
+
+def test_analysis_mean_context_suppresses_offset_for_extreme_mae():
+    ctx = analysis_mean_context(
+        unit="F",
+        lead_days=6.0,
+        ensemble_mean=42.0,
+        city_name="NYC",
+        season="MAM",
+        forecast_source="ecmwf_ifs025",
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": 2.0,
+            "discount_factor": 0.7,
+            "n_samples": 30,
+            "mae": sigma_instrument("F").value * 4.0,
+        },
+    )
+    assert ctx["mae_factor"] == 0.0
+    assert ctx["raw_offset"] == 0.0
+    assert ctx["offset"] == 0.0
+
+
+def test_analysis_member_maxes_reflects_mae_attenuation():
+    raw = [40.0, 42.0, 41.5]
+    adjusted = analysis_member_maxes(
+        raw,
+        unit="F",
+        lead_days=6.0,
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": 2.0,
+            "discount_factor": 0.7,
+            "n_samples": 30,
+            "mae": 1.5,
+        },
+    )
+    expected_offset = -0.4666666666666667
+    assert list(adjusted) == __import__("pytest").approx([v + expected_offset for v in raw])
+
+
+def test_analysis_mean_context_normalizes_non_finite_bias_provenance():
+    ctx = analysis_mean_context(
+        unit="F",
+        lead_days=6.0,
+        ensemble_mean=42.0,
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": float("nan"),
+            "discount_factor": float("inf"),
+            "n_samples": -1,
+            "mae": float("nan"),
+        },
+    )
+    assert ctx["bias_reference"] == {"source": "ecmwf"}
+    assert ctx["n_samples"] is None
+    assert ctx["mae"] is None
+    assert ctx["sample_factor"] == 1.0
+    assert ctx["mae_factor"] == 1.0
+    assert ctx["raw_offset"] == 0.0
+    assert ctx["offset"] == 0.0
+
+
+def test_analysis_mean_context_treats_negative_mae_as_missing():
+    ctx = analysis_mean_context(
+        unit="F",
+        lead_days=6.0,
+        ensemble_mean=42.0,
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": 2.0,
+            "discount_factor": 0.7,
+            "n_samples": 30,
+            "mae": -1.0,
+        },
+    )
+    assert ctx["mae"] is None
+    assert ctx["mae_factor"] == 1.0
+    assert ctx["raw_offset"] == __import__("pytest").approx(-1.4)
+
+
+def test_analysis_member_maxes_ignore_invalid_bias_provenance():
+    raw = [40.0, 42.0, 41.5]
+    adjusted = analysis_member_maxes(
+        raw,
+        unit="F",
+        lead_days=6.0,
+        bias_corrected=False,
+        bias_reference={
+            "source": "ecmwf",
+            "bias": float("nan"),
+            "discount_factor": 0.7,
+            "n_samples": 30,
+            "mae": 1.0,
+        },
+    )
+    assert list(adjusted) == raw
+
+
 def test_analysis_sigma_context_explains_components():
     ctx = analysis_sigma_context(unit="F", lead_days=3.0, ensemble_spread=1.0, city_name="NYC", season="MAM", forecast_source="ecmwf_ifs025")
     assert ctx["unit"] == "F"
@@ -156,6 +335,16 @@ def test_day0_temporal_closure_weight_matches_existing_endpoints():
     ) == 1.0
 
 
+def test_day0_temporal_closure_weight_uses_strongest_signal_instead_of_correlated_product():
+    weight = day0_temporal_closure_weight(
+        hours_remaining=6.0,
+        peak_confidence=0.4,
+        daylight_progress=0.5,
+        ens_dominance=0.5,
+    )
+    assert weight == 0.5
+
+
 def test_day0_observation_weight_preserves_pre_sunrise_and_post_sunset_behavior():
     assert day0_observation_weight(
         hours_remaining=10.0,
@@ -164,6 +353,9 @@ def test_day0_observation_weight_preserves_pre_sunrise_and_post_sunset_behavior(
         ens_dominance=0.2,
         pre_sunrise=True,
         post_sunset=False,
+        observation_source="wu_api",
+        observation_time="2026-04-02T00:00:00+00:00",
+        current_utc_timestamp="2026-04-02T00:30:00+00:00",
     ) <= 0.05
     assert day0_observation_weight(
         hours_remaining=3.0,
@@ -172,7 +364,32 @@ def test_day0_observation_weight_preserves_pre_sunrise_and_post_sunset_behavior(
         ens_dominance=0.9,
         pre_sunrise=False,
         post_sunset=True,
+        observation_source="wu_api",
+        observation_time="2026-04-02T00:00:00+00:00",
+        current_utc_timestamp="2026-04-02T00:30:00+00:00",
     ) == 1.0
+
+
+def test_day0_observation_weight_does_not_force_full_finality_for_stale_post_sunset_observation():
+    base = day0_temporal_closure_weight(
+        hours_remaining=3.0,
+        peak_confidence=0.8,
+        daylight_progress=1.0,
+        ens_dominance=0.9,
+    )
+    weight = day0_observation_weight(
+        hours_remaining=3.0,
+        peak_confidence=0.8,
+        daylight_progress=1.0,
+        ens_dominance=0.9,
+        pre_sunrise=False,
+        post_sunset=True,
+        observation_source="wu_api",
+        observation_time="2026-04-02T00:00:00+00:00",
+        current_utc_timestamp="2026-04-02T04:00:00+00:00",
+    )
+    assert weight == base
+    assert weight < 1.0
 
 
 def test_day0_blended_highs_preserves_hard_floor_and_weight_endpoints():
@@ -298,9 +515,35 @@ def test_day0_nowcast_context_exposes_age_and_freshness():
     assert ctx["observation_source"] == "wu_api"
     assert ctx["age_hours"] == 1.0
     assert 0.0 < ctx["freshness_factor"] < 1.0
+    assert ctx["trusted_source"] is True
+    assert ctx["fresh_observation"] is True
     assert ctx["blend_weight"] == day0_nowcast_blend_weight(
         hours_remaining=1.0,
         observation_source="wu_api",
         observation_time="2026-04-02T00:00:00+00:00",
         current_utc_timestamp="2026-04-02T01:00:00+00:00",
     )
+
+
+def test_day0_nowcast_context_zeroes_untrusted_source_weight():
+    ctx = day0_nowcast_context(
+        hours_remaining=1.0,
+        observation_source="personal_weather_station",
+        observation_time="2026-04-02T00:00:00+00:00",
+        current_utc_timestamp="2026-04-02T00:30:00+00:00",
+    )
+    assert ctx["trusted_source"] is False
+    assert ctx["source_factor"] == 0.0
+    assert ctx["blend_weight"] == 0.0
+
+
+def test_day0_nowcast_context_keeps_trusted_source_positive_weight():
+    ctx = day0_nowcast_context(
+        hours_remaining=1.0,
+        observation_source="asos_station",
+        observation_time="2026-04-02T00:00:00+00:00",
+        current_utc_timestamp="2026-04-02T00:30:00+00:00",
+    )
+    assert ctx["trusted_source"] is True
+    assert ctx["source_factor"] == 1.0
+    assert ctx["blend_weight"] > 0.0

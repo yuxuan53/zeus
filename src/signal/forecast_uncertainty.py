@@ -8,9 +8,50 @@ signal consumers.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 
 from src.signal.ensemble_signal import sigma_instrument
+
+
+def _finite_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _normalized_bias_reference(bias_reference: dict | None) -> dict:
+    raw = dict(bias_reference or {})
+    normalized: dict = {}
+
+    source = raw.get("source")
+    if source:
+        normalized["source"] = str(source)
+
+    bias = _finite_float(raw.get("bias"))
+    if bias is not None:
+        normalized["bias"] = bias
+
+    mae = _finite_float(raw.get("mae"))
+    if mae is not None and mae >= 0.0:
+        normalized["mae"] = mae
+
+    discount = _finite_float(raw.get("discount_factor"))
+    if discount is not None and discount >= 0.0:
+        normalized["discount_factor"] = discount
+
+    try:
+        n_samples = int(raw.get("n_samples"))
+    except (TypeError, ValueError):
+        n_samples = None
+    if n_samples is not None and n_samples >= 0:
+        normalized["n_samples"] = n_samples
+
+    return normalized
 
 
 def analysis_member_maxes(
@@ -18,6 +59,8 @@ def analysis_member_maxes(
     *,
     unit: str,
     lead_days: float | None = None,
+    bias_corrected: bool | None = None,
+    bias_reference: dict | None = None,
 ):
     """Phase-1 seam for future lead-continuous mean/location correction.
 
@@ -25,11 +68,13 @@ def analysis_member_maxes(
     surface through a named forecast-layer boundary without changing values yet.
     """
     values = np.asarray(member_maxes, dtype=float)
-    offset = analysis_mean_context(
+    offset = analysis_mean_offset(
         unit=unit,
         lead_days=lead_days,
         ensemble_mean=float(values.mean()) if values.size else None,
-    )["offset"]
+        bias_corrected=bias_corrected,
+        bias_reference=bias_reference,
+    )
     return values + offset
 
 
@@ -68,11 +113,15 @@ def analysis_mean_offset(
     unit: str,
     lead_days: float | None = None,
     ensemble_mean: float | None = None,
+    bias_corrected: bool | None = None,
+    bias_reference: dict | None = None,
 ) -> float:
     return analysis_mean_context(
         unit=unit,
         lead_days=lead_days,
         ensemble_mean=ensemble_mean,
+        bias_corrected=bias_corrected,
+        bias_reference=bias_reference,
     )["offset"]
 
 
@@ -95,15 +144,29 @@ def analysis_mean_context(
     base_sigma = sigma_instrument(unit).value
     lead = 0.0 if lead_days is None else min(6.0, max(0.0, float(lead_days)))
     lead_factor = lead / 6.0
-    bias_reference = bias_reference or {}
+    bias_reference = _normalized_bias_reference(bias_reference)
     raw_offset = 0.0
+    sample_factor = 1.0
+    n_samples = None
+    mae = None
+    mae_factor = 1.0
+    if "n_samples" in bias_reference and bias_reference.get("n_samples") is not None:
+        n_samples = int(bias_reference.get("n_samples"))
+        if n_samples < 20:
+            sample_factor = 0.0
+    if "mae" in bias_reference and bias_reference.get("mae") is not None:
+        mae = float(bias_reference.get("mae"))
+        if mae > 0 and base_sigma > 0:
+            if mae <= base_sigma:
+                mae_factor = 1.0
+            elif mae >= base_sigma * 4.0:
+                mae_factor = 0.0
+            else:
+                mae_factor = 1.0 - ((mae - base_sigma) / (base_sigma * 3.0))
     if not bias_corrected and bias_reference:
-        try:
-            bias = float(bias_reference.get("bias", 0.0))
-            discount = float(bias_reference.get("discount_factor", 0.7))
-            raw_offset = -bias * discount * lead_factor
-        except (TypeError, ValueError):
-            raw_offset = 0.0
+        bias = float(bias_reference.get("bias", 0.0))
+        discount = float(bias_reference.get("discount_factor", 0.7))
+        raw_offset = -bias * discount * lead_factor * sample_factor * mae_factor
     max_abs_offset = base_sigma * 2.0
     offset = max(-max_abs_offset, min(max_abs_offset, raw_offset))
     return {
@@ -113,6 +176,10 @@ def analysis_mean_context(
         "forecast_source": forecast_source,
         "bias_corrected": bias_corrected,
         "bias_reference": bias_reference or {},
+        "n_samples": n_samples,
+        "sample_factor": sample_factor,
+        "mae": mae,
+        "mae_factor": mae_factor,
         "lead_days": lead_days,
         "lead_factor": lead_factor,
         "ensemble_mean": ensemble_mean,
@@ -179,7 +246,7 @@ def day0_temporal_closure_weight(
     daylight_progress: float | None,
     ens_dominance: float,
 ) -> float:
-    """Current multiplicative day0 closure policy, extracted behind a seam."""
+    """Bounded day0 closure policy driven by the strongest active signal."""
     time_closure = min(1.0, max(0.0, 1.0 - float(hours_remaining) / 12.0))
     peak_signal = min(1.0, max(0.0, float(peak_confidence)))
     daylight_signal = (
@@ -188,14 +255,12 @@ def day0_temporal_closure_weight(
         else time_closure
     )
     ens_signal = min(1.0, max(0.0, float(ens_dominance)))
-
-    residual_freedom = (
-        (1.0 - time_closure)
-        * (1.0 - 0.75 * peak_signal)
-        * (1.0 - 0.50 * daylight_signal)
-        * (1.0 - 0.35 * ens_signal)
+    return max(
+        time_closure,
+        0.75 * peak_signal,
+        0.50 * daylight_signal,
+        0.35 * ens_signal,
     )
-    return 1.0 - residual_freedom
 
 
 def day0_observation_weight(
@@ -206,6 +271,9 @@ def day0_observation_weight(
     ens_dominance: float,
     pre_sunrise: bool,
     post_sunset: bool,
+    observation_source: str = "",
+    observation_time: str | None = None,
+    current_utc_timestamp: str | None = None,
 ) -> float:
     """Current Phase-0 day0 observation dominance policy, extracted behind a seam."""
     base = day0_temporal_closure_weight(
@@ -216,14 +284,21 @@ def day0_observation_weight(
     )
     if pre_sunrise:
         return min(base, 0.05)
+    nowcast = day0_nowcast_context(
+        hours_remaining=hours_remaining,
+        observation_source=observation_source,
+        observation_time=observation_time,
+        current_utc_timestamp=current_utc_timestamp,
+    )
+    finality_ready = nowcast["trusted_source"] and nowcast["fresh_observation"]
     if post_sunset:
-        return 1.0
+        return 1.0 if finality_ready else base
     if daylight_progress is None:
         return base
     if daylight_progress <= 0.0:
         return min(base, 0.05)
     if daylight_progress >= 1.0:
-        return 1.0
+        return 1.0 if finality_ready else base
     return max(base, daylight_progress * 0.35)
 
 
@@ -386,7 +461,7 @@ def day0_nowcast_context(
     source = str(observation_source or "")
     source_lower = source.lower()
     trusted = any(tag in source_lower for tag in ("wu", "asos", "obs"))
-    source_factor = 1.0 if trusted else (0.5 if source else 0.0)
+    source_factor = 1.0 if trusted else 0.0
     hours = min(6.0, max(0.0, float(hours_remaining)))
     short_lead_progress = 1.0 - (hours / 6.0)
     age_hours = None
@@ -405,6 +480,8 @@ def day0_nowcast_context(
         except ValueError:
             age_hours = None
             freshness_factor = 0.0
+    trusted_source = source_factor >= 1.0
+    fresh_observation = freshness_factor > 0.0
 
     return {
         "hours_remaining": float(hours_remaining),
@@ -415,6 +492,8 @@ def day0_nowcast_context(
         "short_lead_progress": short_lead_progress,
         "age_hours": age_hours,
         "freshness_factor": freshness_factor,
+        "trusted_source": trusted_source,
+        "fresh_observation": fresh_observation,
         "blend_weight": 0.25 * short_lead_progress * source_factor * freshness_factor,
     }
 

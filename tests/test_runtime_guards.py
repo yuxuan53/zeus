@@ -17,6 +17,7 @@ import src.data.ensemble_client as ensemble_client
 import src.engine.cycle_runner as cycle_runner
 import src.engine.cycle_runtime as cycle_runtime
 import src.engine.evaluator as evaluator_module
+import src.execution.exit_lifecycle as exit_lifecycle_module
 from src.config import City
 from src.control import control_plane as control_plane_module
 from src.data.ecmwf_open_data import DATA_VERSION, collect_open_ens_cycle
@@ -26,7 +27,9 @@ from src.engine.time_context import lead_days_to_target
 from src.engine.evaluator import EdgeDecision, MarketCandidate
 from src.execution.executor import OrderResult
 from src.riskguard.risk_level import RiskLevel
+from src.contracts.exceptions import ObservationUnavailableError
 from src.state.db import get_connection, init_schema, query_position_events
+from src.state.decision_chain import CycleArtifact, NoTradeCase, query_learning_surface_summary, store_artifact
 from src.state.chain_reconciliation import ChainPosition, reconcile
 from src.state.portfolio import ExitContext, ExitDecision, PortfolioState, Position, load_portfolio, save_portfolio
 from src.state.strategy_tracker import StrategyTracker
@@ -329,6 +332,7 @@ def test_trade_and_no_trade_artifacts_carry_replay_reference_fields(monkeypatch,
             self.applied_validations = ["ens_fetch"]
             self.decision_snapshot_id = "snap-1"
             self.edge_source = "center_buy"
+            self.strategy_key = "center_buy" if should_trade else ""
             self.edge_context = None
             self.settlement_semantics_json = '{"measurement_unit":"F"}'
             self.epistemic_context_json = '{"decision_time_utc":"2026-04-01T00:00:00Z"}'
@@ -496,6 +500,7 @@ def test_execute_discovery_phase_logs_rejected_live_entry_telemetry(monkeypatch,
             self.applied_validations = ["ens_fetch"]
             self.decision_snapshot_id = "snap-reject"
             self.edge_source = "center_buy"
+            self.strategy_key = "center_buy"
             self.edge_context = None
             self.settlement_semantics_json = '{"measurement_unit":"F"}'
             self.epistemic_context_json = '{"decision_time_utc":"2026-04-01T00:00:00Z"}'
@@ -565,6 +570,7 @@ def test_strategy_gate_blocks_trade_execution(monkeypatch, tmp_path):
             self.applied_validations = ["ens_fetch"]
             self.decision_snapshot_id = "snap-gated"
             self.edge_source = "opening_inertia"
+            self.strategy_key = "opening_inertia"
             self.edge_context = None
             self.settlement_semantics_json = '{"measurement_unit":"F"}'
             self.epistemic_context_json = '{"decision_time_utc":"2026-04-01T00:00:00Z"}'
@@ -826,7 +832,162 @@ def test_strategy_classification_preserves_day0_and_update_semantics():
         MarketCandidate(discovery_mode=DiscoveryMode.UPDATE_REACTION.value, **base_candidate),
         shoulder_no,
     ) == "shoulder_sell"
+    assert evaluator_module._strategy_key_for(
+        MarketCandidate(discovery_mode=DiscoveryMode.DAY0_CAPTURE.value, **base_candidate),
+        center_edge,
+    ) == "settlement_capture"
+    assert evaluator_module._strategy_key_for(
+        MarketCandidate(discovery_mode=DiscoveryMode.OPENING_HUNT.value, **base_candidate),
+        center_edge,
+    ) == "opening_inertia"
+    assert evaluator_module._strategy_key_for(
+        MarketCandidate(discovery_mode=DiscoveryMode.UPDATE_REACTION.value, **base_candidate),
+        shoulder_no,
+    ) == "shoulder_sell"
     assert cycle_runner._classify_strategy(DiscoveryMode.DAY0_CAPTURE, center_edge, "") == "settlement_capture"
+
+
+def test_materialize_position_preserves_evaluator_strategy_key():
+    decision = evaluator_module.EdgeDecision(
+        should_trade=True,
+        edge=_edge(),
+        tokens={"market_id": "m1", "token_id": "yes1", "no_token_id": "no1"},
+        size_usd=10.0,
+        decision_id="d1",
+        selected_method="ens_member_counting",
+        edge_source="opening_inertia",
+        strategy_key="center_buy",
+    )
+    result = types.SimpleNamespace(
+        trade_id="t1",
+        fill_price=0.6,
+        submitted_price=0.6,
+        shares=5.0,
+        timeout_seconds=None,
+        order_id="o1",
+        status="filled",
+    )
+    city = types.SimpleNamespace(name="New York", cluster="US", settlement_unit="F")
+    candidate = types.SimpleNamespace(target_date="2026-04-01", hours_since_open=2.0)
+    deps = types.SimpleNamespace(
+        _utcnow=lambda: datetime(2026, 4, 3, 6, 0, tzinfo=timezone.utc),
+        _classify_edge_source=lambda mode, edge: "opening_inertia",
+        Position=cycle_runner.Position,
+        settings=types.SimpleNamespace(mode="paper"),
+    )
+
+    pos = cycle_runtime.materialize_position(
+        candidate,
+        decision,
+        result,
+        cycle_runner.PortfolioState(),
+        city,
+        DiscoveryMode.UPDATE_REACTION,
+        state="entered",
+        bankroll_at_entry=100.0,
+        deps=deps,
+    )
+
+    assert pos.strategy_key == "center_buy"
+    assert pos.strategy == "center_buy"
+
+
+def test_materialize_position_rejects_missing_strategy_key():
+    decision = evaluator_module.EdgeDecision(
+        should_trade=True,
+        edge=_edge(),
+        tokens={"market_id": "m1", "token_id": "yes1", "no_token_id": "no1"},
+        size_usd=10.0,
+        decision_id="d1",
+        selected_method="ens_member_counting",
+        edge_source="opening_inertia",
+        strategy_key="",
+    )
+    result = types.SimpleNamespace(
+        trade_id="t1",
+        fill_price=0.6,
+        submitted_price=0.6,
+        shares=5.0,
+        timeout_seconds=None,
+        order_id="o1",
+        status="filled",
+    )
+    city = types.SimpleNamespace(name="New York", cluster="US", settlement_unit="F")
+    candidate = types.SimpleNamespace(target_date="2026-04-01", hours_since_open=2.0)
+    deps = types.SimpleNamespace(
+        _utcnow=lambda: datetime(2026, 4, 3, 6, 0, tzinfo=timezone.utc),
+        _classify_edge_source=lambda mode, edge: "opening_inertia",
+        Position=cycle_runner.Position,
+        settings=types.SimpleNamespace(mode="paper"),
+    )
+
+    with pytest.raises(ValueError, match="strategy_key"):
+        cycle_runtime.materialize_position(
+            candidate,
+            decision,
+            result,
+            cycle_runner.PortfolioState(),
+            city,
+            DiscoveryMode.UPDATE_REACTION,
+            state="entered",
+            bankroll_at_entry=100.0,
+            deps=deps,
+        )
+
+
+def test_execution_stub_does_not_reinvent_strategy_without_strategy_key():
+    decision = evaluator_module.EdgeDecision(
+        should_trade=True,
+        edge=_edge(),
+        tokens={"market_id": "m1", "token_id": "yes1", "no_token_id": "no1"},
+        decision_id="d1",
+        edge_source="opening_inertia",
+        strategy_key="",
+        decision_snapshot_id="snap1",
+    )
+    result = types.SimpleNamespace(trade_id="t1", order_id="o1", status="rejected")
+    city = types.SimpleNamespace(name="New York")
+    candidate = types.SimpleNamespace(target_date="2026-04-01")
+    deps = types.SimpleNamespace(_classify_edge_source=lambda mode, edge: "opening_inertia")
+
+    stub = cycle_runtime._execution_stub(
+        candidate,
+        decision,
+        result,
+        city,
+        DiscoveryMode.UPDATE_REACTION,
+        deps=deps,
+    )
+
+    assert stub.strategy_key == ""
+    assert stub.strategy == ""
+
+
+def test_load_portfolio_backfills_strategy_key_from_legacy_strategy(tmp_path):
+    path = tmp_path / "positions-paper.json"
+    path.write_text(json.dumps({
+        "positions": [{
+            "trade_id": "t1",
+            "market_id": "m1",
+            "city": "NYC",
+            "cluster": "US-Northeast",
+            "target_date": "2026-04-01",
+            "bin_label": "39-40°F",
+            "direction": "buy_yes",
+            "unit": "F",
+            "token_id": "yes123",
+            "no_token_id": "no456",
+            "state": "entered",
+            "strategy": "center_buy",
+            "edge_source": "center_buy",
+        }],
+        "bankroll": 150.0,
+    }))
+
+    state = load_portfolio(path)
+
+    assert state.positions[0].strategy_key == "center_buy"
+    assert state.positions[0].strategy == "center_buy"
 
 
 def test_lead_days_use_city_local_reference_time():
@@ -2015,11 +2176,23 @@ def test_monitoring_phase_persists_live_exit_telemetry_chain(monkeypatch, tmp_pa
     assert captured["context"].market_vig is None
 
     assert [event["event_type"] for event in events] == [
+        "EXIT_INTENT",
+        "EXIT_ORDER_POSTED",
         "EXIT_ORDER_ATTEMPTED",
         "EXIT_ORDER_FILLED",
     ]
 
-    attempt_event, fill_event = events
+    intent_event, posted_event, attempt_event, fill_event = events
+    assert intent_event["event_type"] == "EXIT_INTENT"
+    assert intent_event["source"] == "exit_lifecycle"
+    assert intent_event["runtime_trade_id"] == "live-exit-1"
+    assert intent_event["details"]["status"] in ("", "triggered")
+    assert intent_event["details"]["exit_reason"] == "forward edge failed"
+    assert posted_event["event_type"] == "EXIT_ORDER_POSTED"
+    assert posted_event["source"] == "exit_lifecycle"
+    assert posted_event["runtime_trade_id"] == "live-exit-1"
+    assert posted_event["order_id"] == "sell-order-1"
+    assert posted_event["details"]["last_exit_order_id"] == "sell-order-1"
     assert attempt_event["source"] == "exit_lifecycle"
     assert attempt_event["runtime_trade_id"] == "live-exit-1"
     assert attempt_event["position_state"] == "day0_window"
@@ -2090,6 +2263,7 @@ def test_materialize_position_carries_semantic_snapshot_jsons():
         "size_usd": 10.0,
         "tokens": {"market_id": "m1", "token_id": "yes123", "no_token_id": "no456"},
         "decision_snapshot_id": "snap-1",
+        "strategy_key": "center_buy",
         "selected_method": "ens_member_counting",
         "applied_validations": ["ens_fetch"],
         "edge_source": "center_buy",
@@ -2115,3 +2289,274 @@ def test_materialize_position_carries_semantic_snapshot_jsons():
     assert pos.settlement_semantics_json == '{"measurement_unit":"F"}'
     assert pos.epistemic_context_json == '{"decision_time_utc":"2026-04-01T00:00:00Z"}'
     assert pos.edge_context_json == '{"forward_edge":0.12}'
+
+
+def test_exit_intent_scaffolding_vocabulary_is_explicit():
+    assert exit_lifecycle_module.EXIT_EVENT_VOCABULARY == (
+        "EXIT_INTENT",
+        "EXIT_ORDER_POSTED",
+        "EXIT_ORDER_FILLED",
+        "EXIT_ORDER_VOIDED",
+        "EXIT_ORDER_REJECTED",
+    )
+
+
+def test_build_exit_intent_carries_boundary_fields():
+    pos = _position()
+    ctx = ExitContext(
+        fresh_prob=0.41,
+        fresh_prob_is_fresh=True,
+        current_market_price=0.46,
+        current_market_price_is_fresh=True,
+        best_bid=0.45,
+        best_ask=0.49,
+        market_vig=None,
+        hours_to_settlement=2.0,
+        position_state="day0_window",
+        day0_active=True,
+        exit_reason="forward edge failed",
+    )
+
+    intent = exit_lifecycle_module.build_exit_intent(pos, ctx, paper_mode=True)
+
+    assert intent.trade_id == pos.trade_id
+    assert intent.reason == "forward edge failed"
+    assert intent.token_id == pos.token_id
+    assert intent.shares == pytest.approx(pos.effective_shares)
+    assert intent.current_market_price == pytest.approx(0.46)
+    assert intent.best_bid == pytest.approx(0.45)
+    assert intent.paper_mode is True
+
+
+def test_execute_exit_accepts_prebuilt_exit_intent_in_paper_mode():
+    pos = _position(state="day0_window")
+    portfolio = PortfolioState(positions=[pos])
+    ctx = ExitContext(
+        fresh_prob=0.41,
+        fresh_prob_is_fresh=True,
+        current_market_price=0.46,
+        current_market_price_is_fresh=True,
+        best_bid=0.45,
+        best_ask=0.49,
+        market_vig=None,
+        hours_to_settlement=2.0,
+        position_state="day0_window",
+        day0_active=True,
+        exit_reason="forward edge failed",
+    )
+    intent = exit_lifecycle_module.build_exit_intent(pos, ctx, paper_mode=True)
+
+    outcome = exit_lifecycle_module.execute_exit(
+        portfolio=portfolio,
+        position=pos,
+        exit_context=ctx,
+        paper_mode=True,
+        exit_intent=intent,
+    )
+
+    assert outcome == "paper_exit: forward edge failed"
+    assert pos.exit_state == "sell_filled"
+
+
+def test_discovery_phase_records_observation_unavailable_as_no_trade(monkeypatch, tmp_path):
+    conn = get_connection(tmp_path / "zeus.db")
+    init_schema(conn)
+
+    artifact = CycleArtifact(mode="day0_capture", started_at="2026-04-03T00:00:00Z")
+    tracker = StrategyTracker()
+    portfolio = PortfolioState()
+    summary = {"candidates": 0, "no_trades": 0}
+
+    market = {
+        "city": NYC,
+        "target_date": "2026-04-01",
+        "outcomes": [],
+        "hours_since_open": 1.0,
+        "hours_to_resolution": 4.0,
+        "event_id": "evt1",
+        "slug": "slug1",
+    }
+
+    deps = types.SimpleNamespace(
+        MODE_PARAMS={DiscoveryMode.DAY0_CAPTURE: {}},
+        DiscoveryMode=DiscoveryMode,
+        logger=types.SimpleNamespace(warning=lambda *args, **kwargs: None),
+        NoTradeCase=NoTradeCase,
+        find_weather_markets=lambda **kwargs: [market],
+        get_current_observation=lambda *args, **kwargs: (_ for _ in ()).throw(ObservationUnavailableError("obs down")),
+        evaluate_candidate=lambda *args, **kwargs: [],
+    )
+
+    cycle_runtime.execute_discovery_phase(
+        conn,
+        clob=None,
+        portfolio=portfolio,
+        artifact=artifact,
+        tracker=tracker,
+        limits=types.SimpleNamespace(),
+        mode=DiscoveryMode.DAY0_CAPTURE,
+        summary=summary,
+        entry_bankroll=100.0,
+        decision_time=datetime(2026, 4, 3, 6, 0, tzinfo=timezone.utc),
+        deps=deps,
+    )
+
+    assert summary["no_trades"] == 1
+    case = artifact.no_trade_cases[0]
+    assert case.availability_status == "DATA_UNAVAILABLE"
+    assert case.rejection_stage == "SIGNAL_QUALITY"
+    conn.close()
+
+
+def test_learning_summary_separates_no_data_from_no_edge(tmp_path):
+    conn = get_connection(tmp_path / "zeus.db")
+    init_schema(conn)
+
+    artifact = CycleArtifact(mode="paper", started_at="2026-04-03T00:00:00Z", completed_at="2026-04-03T00:05:00Z")
+    artifact.add_no_trade(
+        NoTradeCase(
+            decision_id="d1",
+            city="NYC",
+            target_date="2026-04-01",
+            range_label="",
+            direction="unknown",
+            rejection_stage="SIGNAL_QUALITY",
+            availability_status="DATA_UNAVAILABLE",
+            rejection_reasons=["obs down"],
+            timestamp="2026-04-03T00:00:00Z",
+        )
+    )
+    artifact.add_no_trade(
+        NoTradeCase(
+            decision_id="d2",
+            city="NYC",
+            target_date="2026-04-01",
+            range_label="39-40°F",
+            direction="buy_yes",
+            rejection_stage="EDGE_INSUFFICIENT",
+            strategy_key="center_buy",
+            strategy="center_buy",
+            edge_source="center_buy",
+            rejection_reasons=["small edge"],
+            timestamp="2026-04-03T00:00:00Z",
+        )
+    )
+    store_artifact(conn, artifact, env="paper")
+
+    summary = query_learning_surface_summary(conn, env="paper")
+    conn.close()
+
+    assert summary["availability_status_counts"]["DATA_UNAVAILABLE"] == 1
+    assert summary["no_trade_stage_counts"]["EDGE_INSUFFICIENT"] == 1
+
+
+def test_availability_status_helper_maps_rate_limited_and_chain():
+    assert cycle_runtime._availability_status_for_exception(RuntimeError("429 capacity exhausted")) == "RATE_LIMITED"
+    assert cycle_runtime._availability_status_for_exception(RuntimeError("chain rpc unavailable")) == "CHAIN_UNAVAILABLE"
+
+
+def test_evaluator_ens_fetch_exception_becomes_explicit_availability_truth(monkeypatch):
+    candidate = MarketCandidate(
+        city=NYC,
+        target_date="2026-04-01",
+        outcomes=[
+            {"title": "38°F or below", "range_low": None, "range_high": 38, "token_id": "yes1", "no_token_id": "no1", "market_id": "m1", "price": 0.20},
+            {"title": "39-40°F", "range_low": 39, "range_high": 40, "token_id": "yes2", "no_token_id": "no2", "market_id": "m2", "price": 0.20},
+            {"title": "41°F or above", "range_low": 41, "range_high": None, "token_id": "yes3", "no_token_id": "no3", "market_id": "m3", "price": 0.20},
+        ],
+        hours_since_open=12.0,
+        hours_to_resolution=24.0,
+        discovery_mode=DiscoveryMode.UPDATE_REACTION.value,
+    )
+
+    monkeypatch.setattr(
+        evaluator_module,
+        "fetch_ensemble",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("429 capacity exhausted")),
+    )
+
+    decisions = evaluator_module.evaluate_candidate(
+        candidate,
+        conn=None,
+        portfolio=PortfolioState(bankroll=150.0),
+        clob=types.SimpleNamespace(),
+        limits=evaluator_module.RiskLimits(),
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].should_trade is False
+    assert decisions[0].availability_status == "RATE_LIMITED"
+    assert decisions[0].rejection_stage == "SIGNAL_QUALITY"
+
+
+def test_execute_exit_rejects_mismatched_exit_intent():
+    pos = _position(state="day0_window")
+    portfolio = PortfolioState(positions=[pos])
+    ctx = ExitContext(
+        fresh_prob=0.41,
+        fresh_prob_is_fresh=True,
+        current_market_price=0.46,
+        current_market_price_is_fresh=True,
+        best_bid=0.45,
+        best_ask=0.49,
+        market_vig=None,
+        hours_to_settlement=2.0,
+        position_state="day0_window",
+        day0_active=True,
+        exit_reason="forward edge failed",
+    )
+    intent = exit_lifecycle_module.ExitIntent(
+        trade_id="other-trade",
+        reason="forward edge failed",
+        token_id=pos.token_id,
+        shares=pos.effective_shares,
+        current_market_price=0.46,
+        best_bid=0.45,
+        paper_mode=True,
+    )
+
+    with pytest.raises(ValueError, match="trade_id mismatch"):
+        exit_lifecycle_module.execute_exit(
+            portfolio=portfolio,
+            position=pos,
+            exit_context=ctx,
+            paper_mode=True,
+            exit_intent=intent,
+        )
+
+
+def test_check_pending_exits_does_not_retry_bare_exit_intent_without_error():
+    pos = _position()
+    pos.exit_state = "exit_intent"
+    pos.last_exit_error = ""
+    portfolio = PortfolioState(positions=[pos])
+
+    stats = exit_lifecycle_module.check_pending_exits(portfolio, clob=None, conn=None)
+
+    assert stats["retried"] == 0
+    assert stats["unchanged"] == 1
+    assert pos.exit_state == "exit_intent"
+
+
+def test_check_pending_exits_emits_void_semantics_for_rejected_sell(monkeypatch, tmp_path):
+    conn = get_connection(tmp_path / "zeus.db")
+    init_schema(conn)
+
+    pos = _position(state="day0_window")
+    pos.exit_state = "sell_pending"
+    pos.last_exit_order_id = "sell-order-1"
+    pos.exit_reason = "forward edge failed"
+    pos.last_monitor_market_price = 0.46
+    portfolio = PortfolioState(positions=[pos])
+
+    class LiveClob:
+        def get_order_status(self, order_id):
+            assert order_id == "sell-order-1"
+            return {"status": "REJECTED"}
+
+    stats = exit_lifecycle_module.check_pending_exits(portfolio, clob=LiveClob(), conn=conn)
+    events = query_position_events(conn, "t1")
+    conn.close()
+
+    assert stats["retried"] == 1
+    assert any(event["event_type"] == "EXIT_ORDER_VOIDED" for event in events)

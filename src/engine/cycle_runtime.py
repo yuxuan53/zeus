@@ -15,6 +15,19 @@ from types import SimpleNamespace
 from src.engine.time_context import lead_hours_to_target
 
 
+CANONICAL_STRATEGY_KEYS = {
+    "settlement_capture",
+    "shoulder_sell",
+    "center_buy",
+    "opening_inertia",
+}
+
+
+def _resolve_strategy_key(decision) -> str:
+    strategy_key = str(getattr(decision, "strategy_key", "") or "").strip()
+    return strategy_key if strategy_key in CANONICAL_STRATEGY_KEYS else ""
+
+
 def parse_iso(value: str) -> datetime | None:
     if not value:
         return None
@@ -179,6 +192,9 @@ def materialize_position(candidate, decision, result, portfolio, city, mode, *, 
     if result.timeout_seconds:
         timeout_at = (now + timedelta(seconds=result.timeout_seconds)).isoformat()
     edge_source = decision.edge_source or deps._classify_edge_source(mode, decision.edge)
+    strategy_key = _resolve_strategy_key(decision)
+    if not strategy_key:
+        raise ValueError("missing or invalid strategy_key on decision")
 
     return deps.Position(
         trade_id=result.trade_id,
@@ -200,7 +216,8 @@ def materialize_position(candidate, decision, result, portfolio, city, mode, *, 
         unit=city.settlement_unit,
         token_id=decision.tokens["token_id"],
         no_token_id=decision.tokens["no_token_id"],
-        strategy=deps._classify_strategy(mode, decision.edge, edge_source),
+        strategy_key=strategy_key,
+        strategy=strategy_key,
         edge_source=edge_source,
         discovery_mode=mode.value,
         market_hours_open=candidate.hours_since_open,
@@ -220,6 +237,27 @@ def materialize_position(candidate, decision, result, portfolio, city, mode, *, 
         chain_state="local_only" if state == "pending_tracked" else "unknown",
         env=deps.settings.mode,
     )
+
+
+def _dual_write_canonical_entry_if_available(conn, pos, *, decision_id: str | None, deps) -> bool:
+    if conn is None:
+        return False
+
+    from src.engine.lifecycle_events import build_entry_canonical_write
+    from src.state.db import append_many_and_project
+
+    try:
+        events, projection = build_entry_canonical_write(
+            pos,
+            decision_id=decision_id,
+            source_module="src.engine.cycle_runtime",
+        )
+        append_many_and_project(conn, events, projection)
+    except RuntimeError as exc:
+        deps.logger.debug("Canonical entry dual-write skipped for %s: %s", pos.trade_id, exc)
+        return False
+
+    return True
 
 
 def reconcile_pending_positions(portfolio, clob, tracker, *, deps):
@@ -300,6 +338,7 @@ def _build_exit_context(pos, edge_ctx, *, hours_to_settlement, paper_mode, ExitC
 
 def _execution_stub(candidate, decision, result, city, mode, *, deps):
     edge_source = decision.edge_source or deps._classify_edge_source(mode, decision.edge)
+    strategy_key = _resolve_strategy_key(decision)
     return SimpleNamespace(
         trade_id=result.trade_id,
         market_id=decision.tokens["market_id"],
@@ -307,7 +346,8 @@ def _execution_stub(candidate, decision, result, city, mode, *, deps):
         target_date=candidate.target_date,
         bin_label=decision.edge.bin.label,
         direction=decision.edge.direction,
-        strategy=deps._classify_strategy(mode, decision.edge, edge_source),
+        strategy_key=strategy_key,
+        strategy=strategy_key,
         edge_source=edge_source,
         decision_snapshot_id=decision.decision_snapshot_id,
         order_id=result.order_id or "",
@@ -322,7 +362,7 @@ def _execution_stub(candidate, decision, result, city, mode, *, deps):
 
 def execute_monitoring_phase(conn, clob, portfolio, artifact, tracker, summary: dict, *, deps):
     from src.engine.monitor_refresh import refresh_position
-    from src.execution.exit_lifecycle import ExitContext, check_pending_exits, check_pending_retries, execute_exit, is_exit_cooldown_active
+    from src.execution.exit_lifecycle import ExitContext, build_exit_intent, check_pending_exits, check_pending_retries, execute_exit, is_exit_cooldown_active
     from src.state.chain_reconciliation import quarantine_resolution_reason
     exit_lifecycle_owned_states = {"exit_intent", "sell_placed", "sell_pending", "retry_pending"}
     exit_lifecycle_recovery_states = {"exit_intent", "retry_pending", "backoff_exhausted"}
@@ -474,6 +514,11 @@ def execute_monitoring_phase(conn, clob, portfolio, artifact, tracker, summary: 
                 pos.exit_divergence_score = edge_ctx.divergence_score
                 pos.exit_market_velocity_1h = edge_ctx.market_velocity_1h
                 pos.exit_forward_edge = edge_ctx.forward_edge
+                exit_intent = build_exit_intent(
+                    pos,
+                    replace(exit_context, exit_reason=exit_reason),
+                    paper_mode=paper_mode,
+                )
                 outcome = execute_exit(
                     portfolio=portfolio,
                     position=pos,
@@ -481,6 +526,7 @@ def execute_monitoring_phase(conn, clob, portfolio, artifact, tracker, summary: 
                     paper_mode=paper_mode,
                     clob=clob,
                     conn=conn,
+                    exit_intent=exit_intent,
                 )
                 if "paper_exit" in outcome or "exit_filled" in outcome:
                     tracker.record_exit(pos)
@@ -499,6 +545,20 @@ def fetch_day0_observation(city, target_date: str, decision_time, *, deps):
         return getter(city, target_date=target_date, reference_time=decision_time)
     except TypeError:
         return getter(city)
+
+
+def _availability_status_for_exception(exc: Exception) -> str:
+    name = exc.__class__.__name__
+    text = str(exc).lower()
+    if "429" in text or "rate" in text or "limit" in text:
+        return "RATE_LIMITED"
+    if name == "MissingCalibrationError":
+        return "DATA_STALE"
+    if name == "ObservationUnavailableError":
+        return "DATA_UNAVAILABLE"
+    if "chain" in text:
+        return "CHAIN_UNAVAILABLE"
+    return "DATA_UNAVAILABLE"
 
 
 def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mode, summary: dict, entry_bankroll: float, decision_time, *, deps):
@@ -537,6 +597,23 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
 
             if isinstance(e, (ObservationUnavailableError, MissingCalibrationError)):
                 deps.logger.warning("Skipping candidate for %s: %s", city.name, e)
+                artifact.add_no_trade(
+                    deps.NoTradeCase(
+                        decision_id="",
+                        city=city.name,
+                        target_date=market["target_date"],
+                        range_label="",
+                        direction="unknown",
+                        rejection_stage="SIGNAL_QUALITY",
+                        strategy_key="",
+                        strategy="",
+                        edge_source="",
+                        availability_status=_availability_status_for_exception(e),
+                        rejection_reasons=[str(e)],
+                        timestamp=decision_time.isoformat(),
+                    )
+                )
+                summary["no_trades"] += 1
                 continue
             raise
 
@@ -589,8 +666,43 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
             for d in decisions:
                 if False:
                     _ = d.calibration
+                strategy_key = _resolve_strategy_key(d) if d.edge else ""
                 if d.should_trade and d.edge and d.tokens:
-                    strategy_name = deps._classify_strategy(mode, d.edge, d.edge_source or deps._classify_edge_source(mode, d.edge))
+                    if not strategy_key:
+                        summary["no_trades"] += 1
+                        artifact.add_no_trade(
+                            deps.NoTradeCase(
+                                decision_id=d.decision_id,
+                                city=city.name,
+                                target_date=candidate.target_date,
+                                range_label=d.edge.bin.label if d.edge else "",
+                                direction=d.edge.direction if d.edge else "",
+                                rejection_stage="SIGNAL_QUALITY",
+                                strategy="",
+                                strategy_key="",
+                                edge_source=d.edge_source or deps._classify_edge_source(mode, d.edge),
+                                availability_status=getattr(d, "availability_status", ""),
+                                rejection_reasons=["invalid_or_missing_strategy_key"],
+                                best_edge=d.edge.edge if d.edge else 0.0,
+                                model_prob=d.edge.p_posterior if d.edge else 0.0,
+                                market_price=d.edge.entry_price if d.edge else 0.0,
+                                decision_snapshot_id=d.decision_snapshot_id,
+                                selected_method=d.selected_method,
+                                settlement_semantics_json=d.settlement_semantics_json,
+                                epistemic_context_json=d.epistemic_context_json,
+                                edge_context_json=d.edge_context_json,
+                                applied_validations=list(d.applied_validations),
+                                bin_labels=parseable_labels,
+                                p_raw_vector=d.p_raw.tolist() if getattr(d, "p_raw", None) is not None else [],
+                                p_cal_vector=d.p_cal.tolist() if getattr(d, "p_cal", None) is not None else [],
+                                p_market_vector=d.p_market.tolist() if getattr(d, "p_market", None) is not None else [],
+                                alpha=getattr(d, "alpha", 0.0),
+                                agreement=getattr(d, "agreement", ""),
+                                timestamp=decision_time.isoformat(),
+                            )
+                        )
+                        continue
+                    strategy_name = strategy_key
                     if not deps.is_strategy_enabled(strategy_name):
                         edge_source = d.edge_source or deps._classify_edge_source(mode, d.edge)
                         summary["no_trades"] += 1
@@ -604,7 +716,9 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
                                 direction=d.edge.direction if d.edge else "",
                                 rejection_stage="RISK_REJECTED",
                                 strategy=strategy_name,
+                                strategy_key=strategy_name,
                                 edge_source=edge_source,
+                                availability_status=getattr(d, "availability_status", ""),
                                 rejection_reasons=[f"strategy_gate_disabled:{strategy_name}"],
                                 best_edge=d.edge.edge if d.edge else 0.0,
                                 model_prob=d.edge.p_posterior if d.edge else 0.0,
@@ -652,6 +766,7 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
                             "entry_price": d.edge.entry_price,
                             "p_posterior": d.edge.p_posterior,
                             "edge": d.edge.edge,
+                            "strategy_key": strategy_name,
                             "strategy": strategy_name,
                             "edge_source": d.edge_source or deps._classify_edge_source(mode, d.edge),
                             "market_hours_open": candidate.hours_since_open,
@@ -685,6 +800,12 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
                         from src.state.db import log_execution_report, log_trade_entry
 
                         log_trade_entry(conn, pos)
+                        _dual_write_canonical_entry_if_available(
+                            conn,
+                            pos,
+                            decision_id=d.decision_id,
+                            deps=deps,
+                        )
                         log_execution_report(conn, pos, result)
                         portfolio_dirty = True
                         if result.status == "filled":
@@ -701,10 +822,14 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
                         )
                 else:
                     edge_source = ""
-                    strategy_name = ""
+                    strategy_name = strategy_key
+                    rejection_stage = d.rejection_stage
+                    rejection_reasons = list(d.rejection_reasons)
                     if d.edge:
                         edge_source = d.edge_source or deps._classify_edge_source(mode, d.edge)
-                        strategy_name = deps._classify_strategy(mode, d.edge, edge_source)
+                        if not strategy_name:
+                            rejection_stage = "SIGNAL_QUALITY"
+                            rejection_reasons = [*rejection_reasons, "invalid_or_missing_strategy_key"]
                     summary["no_trades"] += 1
                     artifact.add_no_trade(
                         deps.NoTradeCase(
@@ -713,10 +838,12 @@ def execute_discovery_phase(conn, clob, portfolio, artifact, tracker, limits, mo
                             target_date=candidate.target_date,
                             range_label=d.edge.bin.label if d.edge else "",
                             direction=d.edge.direction if d.edge else "",
-                            rejection_stage=d.rejection_stage,
+                            rejection_stage=rejection_stage,
                             strategy=strategy_name,
+                            strategy_key=strategy_name,
                             edge_source=edge_source,
-                            rejection_reasons=list(d.rejection_reasons),
+                            availability_status=getattr(d, "availability_status", ""),
+                            rejection_reasons=rejection_reasons,
                             best_edge=d.edge.edge if d.edge else 0.0,
                             model_prob=d.edge.p_posterior if d.edge else 0.0,
                             market_price=d.edge.entry_price if d.edge else 0.0,
