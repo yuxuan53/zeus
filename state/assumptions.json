@@ -3,12 +3,12 @@
   "updated_at": "2026-04-10",
   "bin_structure": {
     "fahrenheit_width": 2,
-    "fahrenheit_pattern": "range: 50-51°F (covers integer settlement values 50 and 51)",
+    "fahrenheit_pattern": "range: 50-51\u00b0F (covers integer settlement values 50 and 51)",
     "celsius_width": 1,
-    "celsius_pattern": "point: 10°C (covers integer settlement value 10)",
+    "celsius_pattern": "point: 10\u00b0C (covers integer settlement value 10)",
     "typical_bin_count": "9 center bins + 2 shoulder bins per market",
-    "shoulder_format_low": "X°F or below / X°C or below",
-    "shoulder_format_high": "X°F or higher / X°C or higher"
+    "shoulder_format_low": "X\u00b0F or below / X\u00b0C or below",
+    "shoulder_format_high": "X\u00b0F or higher / X\u00b0C or higher"
   },
   "settlement": {
     "source": "Polymarket Gamma API (canonical) + WU (calibration metadata)",
@@ -17,7 +17,7 @@
     "precision_c": 1.0,
     "precision_c_note": "Integer precision: 1.0 = whole degrees C. SettlementSemantics.round_values() supports decimal if markets change.",
     "rounding_rule": "round_half_to_even",
-    "settlement_chain": "Atmosphere → NWP → ASOS sensor → METAR (0.1°C) → WU display (integer) → Polymarket Gamma API → Settlement"
+    "settlement_chain": "Atmosphere \u2192 NWP \u2192 ASOS sensor \u2192 METAR (0.1\u00b0C) \u2192 WU display (integer) \u2192 Polymarket Gamma API \u2192 Settlement"
   },
   "signal": {
     "ens_member_count": 51,
@@ -28,8 +28,56 @@
     "instrument_noise_c": 0.28
   },
   "cities": {
-    "fahrenheit": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
-    "celsius": ["Ankara", "Auckland", "Beijing", "Buenos Aires", "Busan", "Cape Town", "Chengdu", "Chongqing", "Hong Kong", "Istanbul", "Jakarta", "Jeddah", "Kuala Lumpur", "Lagos", "London", "Lucknow", "Madrid", "Mexico City", "Milan", "Moscow", "Munich", "Panama City", "Paris", "Sao Paulo", "Seoul", "Shanghai", "Shenzhen", "Singapore", "Taipei", "Tel Aviv", "Tokyo", "Toronto", "Warsaw", "Wellington", "Wuhan"]
+    "fahrenheit": [
+      "Atlanta",
+      "Austin",
+      "Chicago",
+      "Dallas",
+      "Denver",
+      "Houston",
+      "Los Angeles",
+      "Miami",
+      "NYC",
+      "San Francisco",
+      "Seattle"
+    ],
+    "celsius": [
+      "Ankara",
+      "Auckland",
+      "Beijing",
+      "Buenos Aires",
+      "Busan",
+      "Cape Town",
+      "Chengdu",
+      "Chongqing",
+      "Hong Kong",
+      "Istanbul",
+      "Jakarta",
+      "Jeddah",
+      "Kuala Lumpur",
+      "Lagos",
+      "London",
+      "Lucknow",
+      "Madrid",
+      "Mexico City",
+      "Milan",
+      "Moscow",
+      "Munich",
+      "Panama City",
+      "Paris",
+      "Sao Paulo",
+      "Seoul",
+      "Shanghai",
+      "Shenzhen",
+      "Singapore",
+      "Taipei",
+      "Tel Aviv",
+      "Tokyo",
+      "Toronto",
+      "Warsaw",
+      "Wellington",
+      "Wuhan"
+    ]
   },
   "execution": {
     "order_type": "limit_only",
