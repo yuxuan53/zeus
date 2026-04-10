@@ -170,9 +170,66 @@
         "Asia-East-China": 0.1
       },
       "Asia-Northeast": {
-        "Asia-East-China": 0.45
+        "Asia-East-China": 0.45,
+        "China-North": 0.45,
+        "China-Central": 0.30
       },
-      "Asia-East-China": {}
+      "Asia-East-China": {
+        "China-Central": 0.50,
+        "China-North": 0.50,
+        "Asia-Subtropical": 0.45
+      },
+      "Africa-South-Maritime": {
+        "Africa-West-Tropical": 0.25
+      },
+      "Africa-West-Tropical": {},
+      "Asia-Subtropical": {
+        "Southeast-Asia-Equatorial": 0.35,
+        "China-Central": 0.35
+      },
+      "China-Central": {
+        "China-North": 0.55
+      },
+      "China-North": {},
+      "Europe-Eastern": {
+        "Europe-Continental": 0.55,
+        "Europe-Maritime": 0.30,
+        "Europe-Mediterranean": 0.40,
+        "Turkey": 0.35
+      },
+      "Europe-Mediterranean": {
+        "Turkey": 0.55,
+        "Middle-East-Levant": 0.35
+      },
+      "India-North": {
+        "Asia-Subtropical": 0.20
+      },
+      "Latin-America-Highland": {
+        "Latin-America-Tropical": 0.40
+      },
+      "Latin-America-Tropical": {
+        "South-America-Tropical": 0.55
+      },
+      "Middle-East-Arabian": {
+        "Middle-East-Levant": 0.55,
+        "Turkey": 0.30
+      },
+      "Middle-East-Levant": {
+        "Turkey": 0.40
+      },
+      "North-America-Great-Lakes": {
+        "US-GreatLakes": 0.70,
+        "US-Northeast": 0.55
+      },
+      "Oceania-Maritime": {
+        "Southeast-Asia-Equatorial": 0.20
+      },
+      "South-America-Pampas": {
+        "South-America-Tropical": 0.35
+      },
+      "South-America-Tropical": {},
+      "Southeast-Asia-Equatorial": {},
+      "Turkey": {}
     }
   },
   "exit": {
