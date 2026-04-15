@@ -1,6 +1,6 @@
 {
   "_comment": "Zeus's declared beliefs about reality. Venus verifies these against actual data. If reality changes and this file doesn't, Venus detects the mismatch.",
-  "updated_at": "2026-04-13",
+  "updated_at": "2026-04-15",
   "bin_structure": {
     "fahrenheit_width": 2,
     "fahrenheit_pattern": "range: 50-51\u00b0F (covers integer settlement values 50 and 51)",
@@ -43,6 +43,7 @@
       "Seattle"
     ],
     "celsius": [
+      "Amsterdam",
       "Ankara",
       "Auckland",
       "Beijing",
@@ -51,15 +52,19 @@
       "Cape Town",
       "Chengdu",
       "Chongqing",
+      "Guangzhou",
+      "Helsinki",
       "Hong Kong",
       "Istanbul",
       "Jakarta",
       "Jeddah",
+      "Karachi",
       "Kuala Lumpur",
       "Lagos",
       "London",
       "Lucknow",
       "Madrid",
+      "Manila",
       "Mexico City",
       "Milan",
       "Moscow",
