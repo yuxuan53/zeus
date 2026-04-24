@@ -116,7 +116,11 @@
     "divergence_hard_threshold": 0.3,
     "_divergence_hard_threshold_note": "HARDCODED. Hard divergence panic threshold. Replace after replay + live divergence audit.",
     "divergence_velocity_confirm": -0.05,
-    "_divergence_velocity_confirm_note": "HARDCODED. Minimum adverse 1h market velocity required to confirm soft divergence panic."
+    "_divergence_velocity_confirm_note": "HARDCODED. Minimum adverse 1h market velocity required to confirm soft divergence panic.",
+    "fee_rate": 0.05,
+    "_fee_rate_note": "T6.4 HoldValue fee estimate uses polymarket_fee(best_bid, fee_rate); 0.05 matches execution_price.py:130 default (calibrated against Polymarket fee schedule). HARDCODED — revisit after observed-exit-fee corpus stabilizes.",
+    "daily_hurdle_rate": 0.0001,
+    "_daily_hurdle_rate_note": "T6.4 opportunity-cost rate per day of locked capital (0.01%/day ≈ 3.65%/year conservative hurdle). HARDCODED — replace with live-readiness B3 derived value once realized-return corpus exceeds 100 settlements."
   },
   "riskguard": {
     "brier_yellow": 0.25,
@@ -139,6 +143,8 @@
   "bias_correction_enabled": false,
   "feature_flags": {
     "EXECUTION_PRICE_SHADOW": true,
-    "CANONICAL_EXIT_PATH": false
+    "CANONICAL_EXIT_PATH": false,
+    "HOLD_VALUE_EXIT_COSTS": false,
+    "_HOLD_VALUE_EXIT_COSTS_note": "T6.4 flag-gates HoldValue.compute_with_exit_costs at _buy_yes_exit + _buy_no_exit seams in src/state/portfolio.py. Default OFF to preserve pre-T6.4 zero-cost behavior during shadow validation; flip ON after operator reviews should_exit rate delta against pre-T6.4 baseline (T6.3-followup-1 replay harness is a pre-requisite). When ON, exit decisions include fee + time opportunity cost (not yet correlation — that lives in T6.4-phase2 requiring portfolio context in ExitContext)."
   }
 }
