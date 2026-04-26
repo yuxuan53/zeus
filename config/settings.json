@@ -57,8 +57,7 @@
     }
   },
   "day0": {
-    "n_mc": 5000,
-    "obs_dominates_threshold": 0.8
+    "n_mc": 5000
   },
   "edge": {
     "n_bootstrap": 500,
