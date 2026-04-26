@@ -2041,6 +2041,24 @@ entries:
   contains_volatile_metrics: false
   current_tense_allowed: false
   refresh_source: n/a
+- path: docs/to-do-list/zeus_full_data_midstream_review_2026-04-26.md
+  doc_class: checklist
+  default_read: false
+  direct_reference_allowed: false
+  current_role: full upstream/backfill plus midstream data-to-order review workbook; evidence only
+  canonical_replaced_by: []
+  next_action: retain_as_evidence
+  lifecycle_state: active
+  coverage_scope: exact
+  parent_coverage_allowed: true
+  truth_profile: checklist_evidence
+  freshness_class: historical
+  supersedes: []
+  superseded_by: []
+  may_live_in_reference: false
+  contains_volatile_metrics: true
+  current_tense_allowed: false
+  refresh_source: n/a
 - path: docs/runbooks/
   doc_class: runbook
   default_read: false

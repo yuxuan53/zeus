@@ -57,6 +57,7 @@ body or bundle.
 | `runbooks/` | Operator runbooks -> `runbooks/AGENTS.md` |
 | `reports/` | Generated diagnostic reports; evidence only -> `reports/AGENTS.md` |
 | `to-do-list/` | Active checklist workbooks; not authority -> `to-do-list/AGENTS.md` |
+| `to-do-list/zeus_full_data_midstream_review_2026-04-26.md` | Full upstream/backfill plus midstream data-to-order review workbook; evidence only |
 | `artifacts/` | Active evidence artifacts and inventories; not authority -> `artifacts/AGENTS.md` |
 | `artifacts/tigge_data_training_handoff_2026-04-23.md` | Dated TIGGE asset/training handoff for completed raw, extraction, validation, and next Zeus training steps |
 

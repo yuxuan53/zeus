@@ -55,6 +55,7 @@ Historical governance files demoted from authority live under
 - `operations/task_2026-04-25_p3_obs_v2_reader_gate/` - closed POST_AUDIT 4.5.B-lite obs_v2 reader-gate consumer-hardening packet
 - `operations/task_2026-04-25_p3_settlement_metric_linter_closeout/` - closed POST_AUDIT 4.5.A settlement metric-read linter closeout packet
 - `operations/task_2026-04-25_p3_usage_path_residual_guards/` - closed P3 residual usage-path guard packet
+- `to-do-list/zeus_full_data_midstream_review_2026-04-26.md` - full upstream/backfill plus midstream data-to-order review workbook
 - `artifacts/tigge_data_training_handoff_2026-04-23.md` - dated TIGGE asset + Zeus training handoff snapshot
 - `../workspace_map.md` - repo visibility and routing guide
 

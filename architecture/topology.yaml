@@ -506,7 +506,9 @@ docs_registry:
   rule: >
     Machine-readable docs classification and default-read registry. P0 seeds
     touched/current docs plus explicit parent entries; later packets may expand
-    toward a full census.
+    toward a full census. Active todo workbooks remain routed through
+    docs/to-do-list/AGENTS.md and exact entries here when they carry broad
+    cross-surface audit context.
 
 module_manifest:
   path: architecture/module_manifest.yaml

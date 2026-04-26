@@ -87,6 +87,7 @@ artifact_classes:
     active_paths:
       - docs/artifacts/
       - docs/to-do-list/
+      - docs/to-do-list/zeus_full_data_midstream_review_2026-04-26.md
       - docs/operations/task_YYYY-MM-DD_slug/evidence/
       - raw/oracle_shadow_snapshots/
       - .omx/context/
