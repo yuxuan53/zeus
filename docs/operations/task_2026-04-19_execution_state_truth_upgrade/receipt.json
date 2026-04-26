@@ -7,8 +7,7 @@
     "docs/operations/task_2026-04-19_execution_state_truth_upgrade/project_brief.md",
     "docs/operations/task_2026-04-19_execution_state_truth_upgrade/implementation_plan.md",
     "docs/operations/task_2026-04-19_execution_state_truth_upgrade/task_packet.md",
-    "docs/operations/task_2026-04-19_execution_state_truth_upgrade/work_log.md",
-    "docs/operations/current_state.md"
+    "docs/operations/task_2026-04-19_execution_state_truth_upgrade/work_log.md"
   ],
   "required_law": [
     "AGENTS.md",
