@@ -610,7 +610,7 @@ def hko_provisional_revision_likelihood(
     survival_probability = float(math.exp(log_survival))
     if not 0.0 < survival_probability < 1.0:
         raise ValueError("HKO_PROVISIONAL_REVISION_LIKELIHOOD_INVALID")
-    return {
+    identity = {
         "semantics": "hko_provisional_monotonic_survival_beta_jeffreys_v1",
         "lookback_start": lookback_start.isoformat(),
         "lookback_end": target.isoformat(),
@@ -618,7 +618,15 @@ def hko_provisional_revision_likelihood(
         "retraction_count": retraction_count,
         "median_update_seconds": cadence_seconds,
         "projected_remaining_updates": remaining_updates,
+    }
+    return {
+        **identity,
         "boundary_survival_probability": survival_probability,
+        "identity_hash": hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
     }
 
 

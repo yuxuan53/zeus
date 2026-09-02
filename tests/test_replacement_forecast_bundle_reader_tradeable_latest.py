@@ -1,5 +1,5 @@
 # Created: 2026-06-10
-# Last reused/audited: 2026-08-30
+# Last reused/audited: 2026-09-02
 # Authority basis: docs/authority/replacement_final_form_2026_06_09.md; 2026-08-19
 #   market-relative capital evidence retirement of stale ENS live authority.
 """Relationship tests for readiness-bound replacement posterior selection.
@@ -510,6 +510,57 @@ def test_noaa_producer_likelihood_persists_and_reader_accepts_exact_identity(
         decision_time=_dt(6, 12),
     )
     assert np.allclose(replay_q, np.asarray(carrier["q"], dtype=float))
+
+
+def test_hko_pinned_carrier_accepts_exact_revision_likelihood_identity() -> None:
+    from src.data import replacement_forecast_bundle_reader as reader
+
+    provenance = _provenance(
+        q_mode=_FUSED_FULL,
+        strict_day0=True,
+        shape_source_cycle_time=_dt(6, 0),
+    )
+    provenance["day0_provisional_observation"].update(
+        {
+            "metric": "low",
+            "source": "hko_hourly_accumulator",
+        }
+    )
+    identity = {
+        "semantics": "hko_provisional_monotonic_survival_beta_jeffreys_v1",
+        "lookback_start": "2026-05-31",
+        "lookback_end": "2026-06-07",
+        "transition_count": 1000,
+        "retraction_count": 0,
+        "median_update_seconds": 600.0,
+        "projected_remaining_updates": 24,
+    }
+    provenance["day0_preliminary_report_survival_likelihood"] = {
+        **identity,
+        "boundary_survival_probability": 0.988,
+        "identity_hash": hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    }
+
+    assert reader._held_pinned_provenance_reason(
+        provenance,
+        city="Hong Kong",
+        metric="low",
+        decision_time=_dt(7, 12),
+    ) is None
+
+    provenance["day0_preliminary_report_survival_likelihood"][
+        "transition_count"
+    ] = 999
+    assert reader._held_pinned_provenance_reason(
+        provenance,
+        city="Hong Kong",
+        metric="low",
+        decision_time=_dt(7, 12),
+    ) == "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
 
 
 def test_reader_live_eligible_q_mode_set_mirrors_live_gate() -> None:

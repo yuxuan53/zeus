@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Any, Mapping
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.config import cities_by_name
 from src.contracts.settlement_semantics import SettlementSemantics
@@ -327,49 +327,78 @@ def _held_pinned_provenance_reason(
         return "REPLACEMENT_PINNED_DAY0_UNIT_MISMATCH"
     source = str(provisional.get("source") or "").strip().lower()
     from src.events.day0_authority import day0_is_noaa_preliminary_source
+    settlement_source_type = str(
+        getattr(city_obj, "settlement_source_type", "") or ""
+    ).strip().lower()
     expected_station = str(getattr(city_obj, "wu_station", "") or "").strip().upper()
     expected_source_pair = {
         "awc": "aviationweather_metar",
         "ogimet": f"ogimet_metar_{expected_station.lower()}",
     }
-
-    if (
-        city_obj is None
-        or str(getattr(city_obj, "settlement_source_type", "") or "").strip().lower()
-        not in {"noaa", "wu_icao"}
-        or not day0_is_noaa_preliminary_source(source)
-        or not expected_station
-        or source not in expected_source_pair.values()
-    ):
-        return "REPLACEMENT_PINNED_DAY0_SOURCE_STATION_MISMATCH"
     likelihood = provenance.get("day0_preliminary_report_survival_likelihood")
     if not isinstance(likelihood, Mapping):
         return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_MISSING"
-    if str(likelihood.get("semantics") or "").strip() not in {
-        "same_station_preliminary_report_survival_likelihood_v1",
-        "same_station_preliminary_report_survival_likelihood_jeffreys_prior_only_v1",
-    }:
-        return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SEMANTICS_MISMATCH"
     if not str(likelihood.get("identity_hash") or "").strip():
         return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISSING"
-    if str(likelihood.get("station_id") or "").strip().upper() != expected_station:
-        return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_STATION_MISMATCH"
-    source_pair = likelihood.get("source_channel_pair")
-    if not isinstance(source_pair, Mapping) or dict(source_pair) != expected_source_pair:
-        return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SOURCE_PAIR_MISMATCH"
-    identity_fields = (
-        "semantics",
-        "cutoff",
-        "successes",
-        "failures",
-        "unconfirmed_awc_ids",
-        "alpha",
-        "beta",
-        "station_id",
-        "source_channel_pair",
+    hko_provisional = (
+        city_obj is not None
+        and settlement_source_type == "hko"
+        and source.startswith("hko_hourly_accumulator")
     )
-    if "evidence_basis" in likelihood:
-        identity_fields = identity_fields + ("evidence_basis",)
+    if hko_provisional:
+        if str(likelihood.get("semantics") or "").strip() != (
+            "hko_provisional_monotonic_survival_beta_jeffreys_v1"
+        ):
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SEMANTICS_MISMATCH"
+        try:
+            hko_target_date = decision_time.astimezone(
+                ZoneInfo(str(getattr(city_obj, "timezone", "") or ""))
+            ).date().isoformat()
+        except (ValueError, ZoneInfoNotFoundError):
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
+        if str(likelihood.get("lookback_end") or "") != hko_target_date:
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
+        identity_fields = (
+            "semantics",
+            "lookback_start",
+            "lookback_end",
+            "transition_count",
+            "retraction_count",
+            "median_update_seconds",
+            "projected_remaining_updates",
+        )
+    else:
+        if (
+            city_obj is None
+            or settlement_source_type not in {"noaa", "wu_icao"}
+            or not day0_is_noaa_preliminary_source(source)
+            or not expected_station
+            or source not in expected_source_pair.values()
+        ):
+            return "REPLACEMENT_PINNED_DAY0_SOURCE_STATION_MISMATCH"
+        if str(likelihood.get("semantics") or "").strip() not in {
+            "same_station_preliminary_report_survival_likelihood_v1",
+            "same_station_preliminary_report_survival_likelihood_jeffreys_prior_only_v1",
+        }:
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SEMANTICS_MISMATCH"
+        if str(likelihood.get("station_id") or "").strip().upper() != expected_station:
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_STATION_MISMATCH"
+        source_pair = likelihood.get("source_channel_pair")
+        if not isinstance(source_pair, Mapping) or dict(source_pair) != expected_source_pair:
+            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SOURCE_PAIR_MISMATCH"
+        identity_fields = (
+            "semantics",
+            "cutoff",
+            "successes",
+            "failures",
+            "unconfirmed_awc_ids",
+            "alpha",
+            "beta",
+            "station_id",
+            "source_channel_pair",
+        )
+        if "evidence_basis" in likelihood:
+            identity_fields = identity_fields + ("evidence_basis",)
     identity = {field: likelihood.get(field) for field in identity_fields}
     expected_identity_hash = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")

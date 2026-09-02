@@ -1,6 +1,6 @@
 # Created: 2026-06-10
-# Last reused or audited: 2026-09-01
-# Lifecycle: created=2026-06-10; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused or audited: 2026-09-02
+# Lifecycle: created=2026-06-10; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Protect causal Day0 remaining-window probability construction.
 # Reuse: Run before changing Day0 hourly members, state diagnostics, or bootstrap pricing.
 # Authority basis: operator green-light 2026-06-10 item B (remaining-day
@@ -630,6 +630,7 @@ def test_materialized_day0_carrier_keeps_exact_station_extreme_provider(
     )
     fusion = SimpleNamespace(
         used_models=("ecmwf_ifs", "cwa_township"),
+        predictive_sigma_c=1.4,
         current_value_serving={
             "cwa_township": {"raw_model_forecast_id": 11}
         },
@@ -645,7 +646,18 @@ def test_materialized_day0_carrier_keeps_exact_station_extreme_provider(
     )
 
     assert future == (31.0, 32.0, 33.0)
-    assert sigma == pytest.approx(float(np.std(np.asarray(future), ddof=0)))
+    from src.config import runtime_cities_by_name
+    from src.signal.ensemble_signal import sigma_instrument_for_city
+
+    center_sigma = float(np.std(np.asarray(future), ddof=0))
+    instrument_sigma = float(
+        sigma_instrument_for_city(runtime_cities_by_name()["Taipei"])
+        .to("C")
+        .value
+    )
+    assert sigma == pytest.approx(
+        np.sqrt(max(1.4**2 - center_sigma**2 - instrument_sigma**2, 0.0))
+    )
     assert cutoff == "2026-08-31T02:57:00+00:00"
     assert evidence == (
         {

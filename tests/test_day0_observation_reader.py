@@ -1,7 +1,7 @@
 # Created: 2026-05-22
-# Last reused/audited: 2026-09-01
+# Last reused/audited: 2026-09-02
 # Authority basis: docs/archive/2026-Q2/operations_historical/P0_FORECAST_EXTREMA_AUTHORITY_2026-05-22.md §PR-C
-# Lifecycle: created=2026-05-22; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Lifecycle: created=2026-05-22; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Regression antibody for Root C — high_so_far must be MAX(running_max) not latest row's value.
 # Reuse: Run when day0_observation_reader.read_day0_high_so_far or observation_instants schema changes.
 """Tests for src/data/day0_observation_reader.py — Root C regression antibody.
@@ -21,6 +21,7 @@ Concrete case: Amsterdam 2026-05-22
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -722,6 +723,24 @@ def test_hko_revision_likelihood_excludes_rollover_and_is_metric_symmetric() -> 
     assert high["retraction_count"] == 0
     assert high["median_update_seconds"] == pytest.approx(600.0)
     assert 0.0 < high["boundary_survival_probability"] < 1.0
+    assert high["identity_hash"] == hashlib.sha256(
+        json.dumps(
+            {
+                key: high[key]
+                for key in (
+                    "semantics",
+                    "lookback_start",
+                    "lookback_end",
+                    "transition_count",
+                    "retraction_count",
+                    "median_update_seconds",
+                    "projected_remaining_updates",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     assert low["boundary_survival_probability"] == pytest.approx(
         high["boundary_survival_probability"]
     )

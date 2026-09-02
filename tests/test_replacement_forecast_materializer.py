@@ -2000,15 +2000,76 @@ def test_materializer_ignores_malformed_pre_day0_frontier_ledger(
 def test_materializer_hko_provisional_observation_does_not_truncate_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import src.config as config_mod
+    import src.data.day0_observation_reader as day0_reader
+
     conn = _conn()
     _install_live_fusion(monkeypatch)
-    request = _request(
-        computed_at=_dt(18),
-        expires_at=datetime(2026, 6, 7, 2, tzinfo=UTC),
-        day0_observed_extreme_c=26.0,
-        day0_observed_extreme_source="hko_hourly_accumulator",
-        day0_observed_extreme_observation_time=_dt(17, 55).isoformat(),
-        day0_observed_extreme_sample_count=12,
+    shanghai = config_mod.runtime_cities_by_name()["Shanghai"]
+    monkeypatch.setattr(
+        config_mod,
+        "runtime_cities_by_name",
+        lambda: {
+            "Shanghai": replace(
+                shanghai,
+                settlement_source_type="hko",
+            )
+        },
+    )
+    likelihood_identity = {
+        "semantics": "hko_provisional_monotonic_survival_beta_jeffreys_v1",
+        "lookback_start": "2026-05-31",
+        "lookback_end": "2026-06-07",
+        "transition_count": 100,
+        "retraction_count": 1,
+        "median_update_seconds": 600.0,
+        "projected_remaining_updates": 36,
+    }
+    likelihood = {
+        **likelihood_identity,
+        "boundary_survival_probability": 0.91,
+        "identity_hash": materializer_mod._json_hash(likelihood_identity),
+    }
+    monkeypatch.setattr(
+        day0_reader,
+        "hko_provisional_revision_likelihood",
+        lambda *_args, **_kwargs: likelihood,
+    )
+    monkeypatch.setattr(
+        materializer_mod,
+        "_day0_noaa_carrier_future_members",
+        lambda *_args, **_kwargs: (
+            (25.2, 25.5, 28.3),
+            0.5,
+            _dt(18).isoformat(),
+            (),
+        ),
+    )
+    request = replace(
+        _request(
+            computed_at=_dt(18),
+            expires_at=datetime(2026, 6, 7, 2, tzinfo=UTC),
+            day0_observed_extreme_c=25.7,
+            day0_observed_extreme_source="hko_hourly_accumulator",
+            day0_observed_extreme_observation_time=_dt(17, 55).isoformat(),
+            day0_observed_extreme_sample_count=12,
+        ),
+        temperature_metric="low",
+        baseline_data_version="ecmwf_opendata_mn2t3_local_calendar_day_min",
+        bins=(
+            _TemperatureBin(
+                "below24", upper_c=23.0, center_c=22.0,
+                rounding_rule="oracle_truncate",
+            ),
+            _TemperatureBin(
+                "target24", lower_c=24.0, upper_c=24.0, center_c=24.0,
+                rounding_rule="oracle_truncate",
+            ),
+            _TemperatureBin(
+                "25plus", lower_c=25.0, center_c=26.0,
+                rounding_rule="oracle_truncate",
+            ),
+        ),
     )
     result = materialize_replacement_forecast_live(
         conn,
@@ -2023,15 +2084,24 @@ def test_materializer_hko_provisional_observation_does_not_truncate_support(
     q = json.loads(row["q_json"])
     q_lcb = json.loads(row["q_lcb_json"])
     provenance = json.loads(row["provenance_json"])
-    assert q["cool"] > 0.0
-    assert q_lcb["cool"] >= 0.0
+    # The revision-aware remaining path can collapse an implausible tail below
+    # the executable floor without pretending the provisional HKO boundary is
+    # deterministic settlement truth.
+    assert q["target24"] < 0.05
+    assert q["25plus"] > 0.9
+    assert q_lcb["target24"] >= 0.0
     assert provenance["day0_provisional_observation"]["support_truncation"] is False
-    assert provenance["q_shape"] == "fused_normal_direct"
+    assert provenance["q_shape"] == "day0_remaining_shared_carrier_v1"
+    assert provenance["day0_preliminary_report_survival_likelihood"] == likelihood
+    assert provenance["day0_remaining_carrier_sample_count"] == 500
+    assert provenance["day0_remaining_carrier_q"] == pytest.approx(
+        [q[item.bin_id] for item in request.bins]
+    )
     assert "day0_conditioning" not in provenance
     assert provenance["day0_provisional_observation"] == {
         "active": True,
-        "metric": "high",
-        "observed_extreme_c": 26.0,
+        "metric": "low",
+        "observed_extreme_c": 25.7,
         "source": "hko_hourly_accumulator",
         "observation_time": _dt(17, 55).isoformat(),
         "sample_count": 12,
@@ -2044,7 +2114,7 @@ def test_materializer_hko_provisional_observation_does_not_truncate_support(
         replace(
             request,
             computed_at=_dt(18, 10),
-            day0_observed_extreme_c=25.7,
+            day0_observed_extreme_c=25.6,
             day0_observed_extreme_observation_time=_dt(18, 5).isoformat(),
         ),
     )
@@ -2055,6 +2125,44 @@ def test_materializer_hko_provisional_observation_does_not_truncate_support(
         (result.posterior_id, revised.posterior_id),
     ).fetchall()
     assert len({row["posterior_config_hash"] for row in hashes}) == 2
+
+
+def test_hko_spot_request_rebinds_to_current_official_extrema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.data.replacement_forecast_current_target_plan as target_plan
+
+    conn = _conn()
+    request = _request(
+        computed_at=_dt(18),
+        day0_observed_extreme_c=26.0,
+        day0_observed_extreme_source="hko_rhrread_spot",
+        day0_observed_extreme_observation_time=_dt(17, 2).isoformat(),
+        day0_observed_extreme_sample_count=1,
+    )
+    monkeypatch.setattr(
+        target_plan,
+        "_latest_authorized_day0_fact",
+        lambda *_args, **_kwargs: {
+            "observation_source": "hko_hourly_accumulator",
+            "observation_time": _dt(17, 50).isoformat(),
+            "observed_extreme_native": 25.7,
+            "sample_count": 12,
+            "unit": "C",
+        },
+    )
+
+    rebound = materializer_mod._request_with_day0_physical_frontier(
+        conn,
+        request,
+        metric="low",
+    )
+
+    assert isinstance(rebound, ReplacementForecastMaterializeRequest)
+    assert rebound.day0_observed_extreme_source == "hko_hourly_accumulator"
+    assert rebound.day0_observed_extreme_c == pytest.approx(25.7)
+    assert rebound.day0_observed_extreme_observation_time == _dt(17, 50).isoformat()
+    assert rebound.day0_observed_extreme_sample_count == 12
 
 
 def test_wu_fast_residual_is_provisional_while_direct_noaa_fast_is_absorbing() -> None:

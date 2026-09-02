@@ -80,6 +80,10 @@ def _is_noaa_preliminary_source(source: object) -> bool:
     return day0_is_noaa_preliminary_source(source)
 
 
+def _is_hko_provisional_source(source: object) -> bool:
+    return str(source or "").strip().lower().startswith("hko_hourly_accumulator")
+
+
 # ---------------------------------------------------------------------------
 # FIX 1 (2026-06-09) — explicit replacement q-mode authority.
 #
@@ -773,6 +777,69 @@ def _request_with_day0_physical_frontier(
         target_local_date=date.fromisoformat(_date_text(request.target_date)),
     ).start_utc
 
+    # HKO publishes a rounded current-temperature spot and a separate official
+    # since-midnight extrema product. A spot-triggered materialization must not
+    # keep pricing the rounded spot after the official cumulative snapshot is
+    # already present: the latter is the source that the HKO market settles
+    # against. Rebind to the latest causal official snapshot before reducing
+    # prior posterior evidence; absence leaves the request unchanged so the
+    # source-specific provisional path can still express uncertainty.
+    if (
+        computed_at >= target_local_day_start
+        and str(request.day0_observed_extreme_source or "")
+        .strip()
+        .lower()
+        .startswith(("hko_rhrread_spot", "hko_hourly_accumulator"))
+    ):
+        try:
+            from src.data.replacement_forecast_current_target_plan import (
+                _latest_authorized_day0_fact,
+            )
+
+            current_hko = _latest_authorized_day0_fact(
+                conn,
+                city=request.city,
+                target_date=_date_text(request.target_date),
+                temperature_metric=metric,
+                decision_time=computed_at,
+                require_settlement_channel=True,
+            )
+        except (sqlite3.DatabaseError, ValueError):
+            current_hko = None
+        if (
+            isinstance(current_hko, Mapping)
+            and str(current_hko.get("observation_source") or "")
+            .strip()
+            .lower()
+            == "hko_hourly_accumulator"
+        ):
+            try:
+                current_hko_extreme = float(
+                    current_hko["observed_extreme_native"]
+                )
+                current_hko_time = _to_utc(
+                    str(current_hko["observation_time"]),
+                    field_name="hko_official_observation_time",
+                )
+            except (KeyError, TypeError, ValueError):
+                current_hko_extreme = math.nan
+                current_hko_time = computed_at + timedelta(microseconds=1)
+            if math.isfinite(current_hko_extreme) and current_hko_time <= computed_at:
+                request = replace(
+                    request,
+                    day0_observed_extreme_c=current_hko_extreme,
+                    day0_observed_extreme_source="hko_hourly_accumulator",
+                    day0_observed_extreme_observation_time=current_hko_time.isoformat(),
+                    day0_observed_extreme_sample_count=(
+                        int(current_hko["sample_count"])
+                        if current_hko.get("sample_count") is not None
+                        else None
+                    ),
+                    day0_observed_extreme_unit=str(
+                        current_hko.get("unit") or "C"
+                    ),
+                )
+
     candidates: list[
         tuple[float, datetime | None, str, int | None, str | None, bool]
     ] = []
@@ -1241,15 +1308,18 @@ def _day0_noaa_preliminary_carrier(
     bins: Sequence[object],
     path_error_sigma_c: float,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Build the NOAA preliminary shared remaining-day carrier.
+    """Build a source-specific provisional shared remaining-day carrier.
 
-    NOAA/AWC preliminary reports are a statistical boundary only.  The strict
-    same-station prior supplies the survival weight; the no-survival branch
-    leaves the future path unclamped.  Missing evidence or future members is a
-    family-scoped failure, never permission to use a full-day Normal.
+    NOAA/AWC reports and HKO intraday extrema are statistical boundaries only.
+    Their source-specific revision models supply the survival weight; the
+    no-survival branch leaves the future path unclamped. Missing evidence or
+    future members is a family-scoped failure, never permission to use a
+    full-day Normal.
     """
     source = str(request.day0_observed_extreme_source or "").strip().lower()
-    if not _is_noaa_preliminary_source(source):
+    noaa_preliminary = _is_noaa_preliminary_source(source)
+    hko_provisional = _is_hko_provisional_source(source)
+    if not noaa_preliminary and not hko_provisional:
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_INVALID")
     observed = _day0_observed_extreme_c(request)
     if observed is None:
@@ -1268,43 +1338,75 @@ def _day0_noaa_preliminary_carrier(
     from src.signal.ensemble_signal import sigma_instrument_for_city
 
     city = runtime_cities_by_name().get(request.city)
-    station = str(getattr(city, "wu_station", "") or "").strip().upper()
-    if city is None or not station:
+    if city is None:
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_STATION_MISSING")
-    likelihood = same_station_preliminary_report_survival_likelihood(
-        conn,
-        city=request.city,
-        station_id=station,
-        timezone_name=request.city_timezone,
-        target_date=_date_text(request.target_date),
-        temperature_metric=metric,
-        decision_time=_to_utc(request.computed_at, field_name="computed_at"),
-        # Materialization persists the typed prior-only carrier for held
-        # redecision; the adapter's ENTRY seam rejects that basis explicitly.
-        allow_prior_only=True,
-    )
-    expected_source_pair = {
-        "awc": "aviationweather_metar",
-        "ogimet": f"ogimet_metar_{station.lower()}",
-    }
-    if source not in expected_source_pair.values():
-        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_CHANNEL_INVALID")
-    identity_fields = (
-        "semantics",
-        "cutoff",
-        "successes",
-        "failures",
-        "unconfirmed_awc_ids",
-        "alpha",
-        "beta",
-        "station_id",
-        "source_channel_pair",
-    )
-    if "evidence_basis" in likelihood:
-        identity_fields = identity_fields + ("evidence_basis",)
-    likelihood_identity = {
-        field: likelihood.get(field) for field in identity_fields
-    }
+    if hko_provisional:
+        from src.data.day0_observation_reader import hko_provisional_revision_likelihood
+
+        if (
+            str(getattr(city, "settlement_source_type", "") or "").strip().lower()
+            != "hko"
+        ):
+            raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_CHANNEL_INVALID")
+        station = "HKO"
+        likelihood = hko_provisional_revision_likelihood(
+            conn,
+            target_date=_date_text(request.target_date),
+            temperature_metric=metric,
+            decision_time=_to_utc(request.computed_at, field_name="computed_at"),
+        )
+        identity_fields = (
+            "semantics",
+            "lookback_start",
+            "lookback_end",
+            "transition_count",
+            "retraction_count",
+            "median_update_seconds",
+            "projected_remaining_updates",
+        )
+        if (
+            str(likelihood.get("semantics") or "")
+            != "hko_provisional_monotonic_survival_beta_jeffreys_v1"
+            or str(likelihood.get("lookback_end") or "")
+            != _date_text(request.target_date)
+        ):
+            raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_LIKELIHOOD_IDENTITY_INVALID")
+    else:
+        station = str(getattr(city, "wu_station", "") or "").strip().upper()
+        if not station:
+            raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_STATION_MISSING")
+        likelihood = same_station_preliminary_report_survival_likelihood(
+            conn,
+            city=request.city,
+            station_id=station,
+            timezone_name=request.city_timezone,
+            target_date=_date_text(request.target_date),
+            temperature_metric=metric,
+            decision_time=_to_utc(request.computed_at, field_name="computed_at"),
+            # Materialization persists the typed prior-only carrier for held
+            # redecision; the adapter's ENTRY seam rejects that basis explicitly.
+            allow_prior_only=True,
+        )
+        expected_source_pair = {
+            "awc": "aviationweather_metar",
+            "ogimet": f"ogimet_metar_{station.lower()}",
+        }
+        if source not in expected_source_pair.values():
+            raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_CHANNEL_INVALID")
+        identity_fields = (
+            "semantics",
+            "cutoff",
+            "successes",
+            "failures",
+            "unconfirmed_awc_ids",
+            "alpha",
+            "beta",
+            "station_id",
+            "source_channel_pair",
+        )
+        if "evidence_basis" in likelihood:
+            identity_fields = identity_fields + ("evidence_basis",)
+    likelihood_identity = {field: likelihood.get(field) for field in identity_fields}
     expected_likelihood_hash = hashlib.sha256(
         json.dumps(
             likelihood_identity,
@@ -1312,11 +1414,11 @@ def _day0_noaa_preliminary_carrier(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    if (
+    if str(likelihood.get("identity_hash") or "").strip().lower() != expected_likelihood_hash:
+        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_LIKELIHOOD_IDENTITY_INVALID")
+    if noaa_preliminary and (
         str(likelihood.get("station_id") or "").strip().upper() != station
         or likelihood.get("source_channel_pair") != expected_source_pair
-        or str(likelihood.get("identity_hash") or "").strip().lower()
-        != expected_likelihood_hash
     ):
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_LIKELIHOOD_IDENTITY_INVALID")
     survival = float(likelihood["boundary_survival_probability"])
@@ -1431,14 +1533,19 @@ def _day0_noaa_carrier_future_members(
     metric: str,
     fusion: _BayesPrecisionFusionFusionOverride,
 ) -> tuple[tuple[float, ...], float, str, tuple[dict[str, object], ...]]:
-    """Add exact source-clock station extrema to the hourly Day0 carrier.
+    """Add station extrema and return only unresolved conditional path noise.
 
     Hourly vectors describe the remaining trajectory. Official station
     products such as CWA township forecasts describe the final daily extreme
     directly and therefore have no hourly vector. When precision fusion used
     one, the persisted Day0 carrier must retain the exact raw row named by
     ``current_value_serving`` instead of silently shrinking to the gridded
-    subset.
+    subset. The center spread across those explicit scenarios is already part
+    of the carrier distribution, so it is subtracted from the source-clock
+    predictive variance before adding per-scenario noise. Instrument noise is
+    added by ``build_day0_remaining_probability_carrier`` and is subtracted
+    here too. This is the materializer twin of
+    ``event_reactor_adapter._day0_extra_member_sigma_native``.
     """
 
     future, _vector_sigma, cutoff = _day0_noaa_future_vector_members(
@@ -1456,8 +1563,30 @@ def _day0_noaa_carrier_future_members(
         for model in fusion.used_models
         if str(model).strip() in station_models
     )
+    def unresolved_path_sigma(values: Sequence[float]) -> float:
+        from src.config import runtime_cities_by_name
+        from src.signal.ensemble_signal import sigma_instrument_for_city
+
+        city = runtime_cities_by_name().get(request.city)
+        if city is None:
+            raise ValueError("DAY0_PROVISIONAL_CARRIER_CITY_MISSING")
+        total_sigma = float(fusion.predictive_sigma_c)
+        instrument_sigma = float(sigma_instrument_for_city(city).to("C").value)
+        center_sigma = float(np.std(np.asarray(values, dtype=float), ddof=0))
+        if (
+            not math.isfinite(total_sigma)
+            or total_sigma <= 0.0
+            or not math.isfinite(instrument_sigma)
+            or instrument_sigma < 0.0
+            or not math.isfinite(center_sigma)
+        ):
+            raise ValueError("DAY0_PROVISIONAL_CARRIER_VARIANCE_INVALID")
+        unresolved_variance = max(total_sigma**2 - center_sigma**2, 0.0)
+        extra_variance = max(unresolved_variance - instrument_sigma**2, 0.0)
+        return float(math.sqrt(extra_variance))
+
     if not requested:
-        return future, float(np.std(np.asarray(future), ddof=0)), cutoff, ()
+        return future, unresolved_path_sigma(future), cutoff, ()
     serving = fusion.current_value_serving
     if not isinstance(serving, Mapping):
         raise ValueError("DAY0_STATION_CARRIER_SERVING_IDENTITY_MISSING")
@@ -1522,7 +1651,7 @@ def _day0_noaa_carrier_future_members(
     combined = tuple((*future, *station_values))
     return (
         combined,
-        float(np.std(np.asarray(combined), ddof=0)),
+        unresolved_path_sigma(combined),
         cutoff,
         tuple(evidence),
     )
@@ -6074,7 +6203,14 @@ def _compute_posterior_payload(
             )
             if (
                 _provisional_extreme_c is not None
-                and _is_noaa_preliminary_source(request.day0_observed_extreme_source)
+                and (
+                    _is_noaa_preliminary_source(
+                        request.day0_observed_extreme_source
+                    )
+                    or _is_hko_provisional_source(
+                        request.day0_observed_extreme_source
+                    )
+                )
             ):
                 (
                     _carrier_future,
@@ -6614,12 +6750,15 @@ def _compute_posterior_payload(
     if (
         _target_local_day_has_started(request)
         and _day0_observed_extreme_c(request) is not None
-        and _is_noaa_preliminary_source(request.day0_observed_extreme_source)
+        and (
+            _is_noaa_preliminary_source(request.day0_observed_extreme_source)
+            or _is_hko_provisional_source(request.day0_observed_extreme_source)
+        )
         and _day0_shared_carrier is None
     ):
         raise ValueError(
             _day0_shared_carrier_error
-            or "DAY0_NOAA_PRELIMINARY_CARRIER_UNAVAILABLE"
+            or "DAY0_PROVISIONAL_CARRIER_UNAVAILABLE"
         )
     bin_topology_payload = _bin_topology_payload(request.bins, settlement_step_c=float(request.settlement_step_c))
     bin_topology_hash = _json_hash(bin_topology_payload)
