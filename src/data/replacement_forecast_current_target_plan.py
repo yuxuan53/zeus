@@ -1565,35 +1565,14 @@ def _latest_authorized_day0_fact(
         if rollover_status != "RESET_CONFIRMED":
             return None
         latest_official = max(hko_facts, key=fact_time)
-        if require_settlement_channel:
-            return latest_official
-
-        # ``rhrread`` is HKO's latest 1-minute-mean temperature, whereas the
-        # official extrema product is the max/min of those 1-minute means since
-        # midnight.  A causal same-station spot can therefore advance the
-        # statistical physical frontier without becoming deterministic payoff
-        # truth.  Spot corrections are canonicalized per publication clock by
-        # the ledger code above; across distinct clocks the physical daily
-        # HIGH/LOW is absorbing in the corresponding direction.
-        hko_spot_facts = [
-            fact
-            for fact in facts
-            if str(fact.get("observation_source") or "").strip().lower()
-            == "hko_rhrread_spot"
-        ]
-        physical_facts = [latest_official, *hko_spot_facts]
-        best_extreme = (min if metric == "low" else max)(
-            float(fact["observed_extreme_native"])
-            for fact in physical_facts
-        )
-        return max(
-            (
-                fact
-                for fact in physical_facts
-                if float(fact["observed_extreme_native"]) == best_extreme
-            ),
-            key=fact_time,
-        )
+        # HKO's rhrread product is a rounded current 1-minute mean, not the
+        # official since-midnight extreme.  Its integer display can exceed the
+        # daily-product maximum (for example rhrread=29 while official
+        # running_max=28.7), which is decisive under HKO's truncate settlement
+        # rule.  Both statistical conditioning and settlement therefore use
+        # the 10-minute official extrema product; the spot remains telemetry,
+        # never a physical boundary.
+        return latest_official
     # ABSORBING-DIRECTION REDUCTION, not "most recent wins" (2026-07-14 Paris
     # regression): the day-so-far extreme is the max (high) / min (low) across
     # every authorized source seen so far. Picking the temporally freshest

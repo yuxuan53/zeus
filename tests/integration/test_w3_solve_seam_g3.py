@@ -1,5 +1,5 @@
 # Created: 2026-07-03
-# Last reused/audited: 2026-08-31
+# Last reused/audited: 2026-09-02
 # Authority basis: current global auction, posterior-mean Fractional Kelly,
 #                  Day0 global-cut routing, and auditable SELL holding bindings
 """Current global auction, q-kernel, and live actuation integration contracts."""
@@ -6904,7 +6904,7 @@ def test_global_day0_held_conditioning_uses_named_physical_frontier(
     conn.close()
 
 
-def test_global_day0_hko_held_conditioning_uses_spot_physical_frontier(
+def test_global_day0_hko_held_conditioning_uses_official_extreme(
     monkeypatch,
 ):
     from src.data import replacement_forecast_current_target_plan as current_plan
@@ -6920,22 +6920,10 @@ def test_global_day0_hko_held_conditioning_uses_spot_physical_frontier(
         "unit": "C",
         "raw_payload_sha256": hashlib.sha256(b"hko-settlement-fact").hexdigest(),
     }
-    physical_fact = {
-        "observed_extreme_native": 28.0,
-        "observation_time": "2026-09-01T01:02:00+00:00",
-        "observation_available_at": "2026-09-01T01:05:00+00:00",
-        "sample_count": 10,
-        "observation_source": "hko_rhrread_spot",
-        "station_id": "HKO",
-        "unit": "C",
-        "raw_payload_sha256": hashlib.sha256(b"hko-physical-fact").hexdigest(),
-    }
     monkeypatch.setattr(
         current_plan,
         "_latest_authorized_day0_fact",
-        lambda *_args, require_settlement_channel=False, **_kwargs: (
-            settlement_fact if require_settlement_channel else physical_fact
-        ),
+        lambda *_args, **_kwargs: settlement_fact,
     )
 
     rebound = era._global_day0_execution_payload(
@@ -6949,10 +6937,10 @@ def test_global_day0_hko_held_conditioning_uses_spot_physical_frontier(
         conditioning={
             "active": True,
             "metric": "high",
-            "observation_time": "2026-09-01T01:02:00+00:00",
-            "observed_extreme_c": 28.0,
-            "sample_count": 10,
-            "source": "hko_rhrread_spot",
+            "observation_time": "2026-09-01T01:40:00+00:00",
+            "observed_extreme_c": 27.8,
+            "sample_count": 58,
+            "source": "hko_hourly_accumulator",
             "unit": "C",
         },
         observation_conn=conn,
@@ -6968,12 +6956,12 @@ def test_global_day0_hko_held_conditioning_uses_spot_physical_frontier(
     )
 
     assert rebound["settlement_source"] == "hko_hourly_accumulator"
-    assert rebound["_edli_day0_probability_boundary_native"] == pytest.approx(28.0)
+    assert rebound["high_so_far"] == pytest.approx(27.8)
+    assert "_edli_day0_probability_boundary_native" not in rebound
     binding = rebound["_edli_global_day0_binding"]
     assert binding["observed_extreme_native"] == pytest.approx(27.8)
-    assert binding["statistical_physical_boundary"]["source"] == (
-        "hko_rhrread_spot"
-    )
+    assert binding["settlement_source"] == "hko_hourly_accumulator"
+    assert "statistical_physical_boundary" not in binding
     conn.close()
 
 

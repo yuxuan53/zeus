@@ -1,6 +1,6 @@
 # Created: 2026-06-06
-# Last reused/audited: 2026-08-12
-# Lifecycle: created=2026-06-06; last_reviewed=2026-08-12; last_reused=2026-08-12
+# Last reused/audited: 2026-09-02
+# Lifecycle: created=2026-06-06; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Protect current-market replacement forecast download and materialization planning.
 # Reuse: Run before changing current replacement target coverage or source-run matching.
 # Authority basis: Replacement forecast coverage must bind to the live baseline source_run, not stale city/date rows.
@@ -1727,19 +1727,18 @@ def test_hko_day0_fact_uses_latest_official_snapshot_not_cross_time_max() -> Non
 
 
 @pytest.mark.parametrize(
-    ("metric", "official", "spot", "expected_physical"),
+    ("metric", "official", "spot"),
     (
-        ("high", 31.9, 32.0, 32.0),
-        ("low", 27.1, 27.0, 27.0),
+        ("high", 31.9, 32.0),
+        ("low", 27.1, 27.0),
     ),
 )
-def test_hko_same_station_spot_advances_only_statistical_physical_frontier(
+def test_hko_rounded_spot_never_replaces_official_extreme(
     metric: str,
     official: float,
     spot: float,
-    expected_physical: float,
 ) -> None:
-    """The faster HKO 1-minute-mean print leads q but never payoff truth."""
+    """A rounded rhrread spot cannot become the HKO settlement preimage."""
 
     conn = _day0_source_switch_conn()
     conn.execute(
@@ -1825,10 +1824,10 @@ def test_hko_same_station_spot_advances_only_statistical_physical_frontier(
     )
 
     assert physical is not None
-    assert physical["observed_extreme_native"] == expected_physical
-    assert physical["observation_source"] == "hko_rhrread_spot"
-    assert physical["observation_time"] == "2026-08-28T07:02:00+00:00"
-    assert physical["observation_available_at"] == "2026-08-28T07:05:01+00:00"
+    assert physical["observed_extreme_native"] == official
+    assert physical["observation_source"] == "hko_hourly_accumulator"
+    assert physical["observation_time"] == "2026-08-28T07:00:00+00:00"
+    assert physical["observation_available_at"] == "2026-08-28T07:10:00+00:00"
     assert settlement is not None
     assert settlement["observed_extreme_native"] == official
     assert settlement["observation_source"] == "hko_hourly_accumulator"
