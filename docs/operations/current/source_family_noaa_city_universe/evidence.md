@@ -148,3 +148,13 @@ connection across those logically independent classifications while retaining
 their separate SELECTs and JIT probability-debt re-read. Against the same live
 DBs, the no-write tranche fell to 0.23 seconds and exactly two connections:
 one forecast DB and one trade DB.
+
+Live after that deployment proved seed files were in fact moved at 05:46:21,
+while the enclosing report still returned `DEFERRED` with
+`seed_processed_count=0`: the same locked call re-scanned the request universe
+after seed publication, then discarded the already-durable progress when that
+second read phase exhausted the deadline. The priority bridge now terminates
+its receipt immediately after a seed tranche publishes or fails files. The
+next one-second callback claims the prepared requests as a separate atomic
+stage. Its antibody proves the first receipt contains one seed and no posterior,
+and the second contains the committed posterior and reactor wake.

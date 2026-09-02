@@ -40,6 +40,8 @@ _See sibling scope.yaml for machine-readable scope._
   forecast and one trade read connection, batching enqueue-ownership
   classification while preserving separate current-capital/global-auction
   queries and just-in-time ownership validation before publication.
+- Commit priority seed publication and request claiming as separate atomic
+  one-second stages so a later read timeout cannot erase durable seed progress.
 - Re-run the strict current-regime capital evaluator; city coverage is not
   itself capital-advantage proof.
 

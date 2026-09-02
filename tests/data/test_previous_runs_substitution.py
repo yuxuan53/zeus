@@ -3306,8 +3306,10 @@ def test_priority_claim_progresses_while_background_queue_lock_is_held(tmp_path,
     )
 
 
-def test_priority_empty_request_queue_bridges_day0_seed(tmp_path, monkeypatch):
-    """The priority lane must publish its own seed before request claiming."""
+def test_priority_empty_request_queue_commits_seed_before_next_request_claim(
+    tmp_path, monkeypatch
+):
+    """Seed publication is durable progress, not erased by a second claim phase."""
     import src.data.replacement_forecast_live_materialization_queue as queue_mod
 
     request_dir = tmp_path / "requests"
@@ -3380,10 +3382,38 @@ def test_priority_empty_request_queue_bridges_day0_seed(tmp_path, monkeypatch):
 
     assert report.status == "PROCESSED"
     assert report.seed_processed_count == 1
-    assert report.processed_count == 1
-    assert report.committed_posterior_count == 1
-    assert report.reactor_wake_published_count == 1
+    assert report.processed_count == 0
+    assert report.committed_posterior_count == 0
+    assert report.reactor_wake_published_count == 0
     assert not seed_path.exists()
+    assert len(tuple(request_dir.glob("*.json"))) == 1
+
+    request_report = queue_mod.process_replacement_forecast_live_materialization_queue(
+        request_dir=request_dir,
+        processed_dir=tmp_path / "processed",
+        failed_dir=tmp_path / "failed",
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=tmp_path / "seed_failed",
+        forecast_db=tmp_path / "forecasts.db",
+        seed_limit=0,
+        discover=False,
+        limit=1,
+        lane=queue_mod.MATERIALIZATION_LANE_PRIORITY,
+        runner=lambda argv: subprocess.CompletedProcess(
+            list(argv),
+            0,
+            stdout=(
+                '{"committed":true,"posterior_id":42,'
+                '"reactor_wake_published":true}\n'
+            ),
+            stderr="",
+        ),
+    )
+
+    assert request_report.processed_count == 1
+    assert request_report.committed_posterior_count == 1
+    assert request_report.reactor_wake_published_count == 1
     assert not tuple(request_dir.glob("*.json"))
 
 

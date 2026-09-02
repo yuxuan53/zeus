@@ -4754,6 +4754,28 @@ def _claim_replacement_forecast_live_materialization_queue_locked(
         seed_reasons.append(
             "REPLACEMENT_LIVE_MATERIALIZATION_ORPHAN_REQUEST_STAGE_DRAINED"
         )
+    if lane == MATERIALIZATION_LANE_PRIORITY and (seed_processed or seed_failed):
+        # Seed transport is one atomic priority tranche. Once it publishes a
+        # request, return that durable progress immediately; the next one-second
+        # callback owns request claiming. Re-scanning the widened request/DB
+        # universe here can exhaust the same claim deadline and erase truthful
+        # seed progress from the receipt even though files already moved.
+        return _MaterializationQueueClaim(
+            request_path=request_path,
+            batch_path=None,
+            processed_path=processed_path,
+            failed_path=failed_path,
+            claimed_count=0,
+            skipped_count=0,
+            inflight_deferred_count=0,
+            timeout_retry_deferred_count=0,
+            processed_files=(),
+            failed_files=(),
+            seed_processed_files=tuple(seed_processed),
+            seed_failed_files=tuple(seed_failed),
+            seed_reasons=tuple(seed_reasons),
+            discovery_report=discovery_report,
+        )
 
     request_files = (
         tuple(path for path in request_path.glob("*.json") if path.is_file())
