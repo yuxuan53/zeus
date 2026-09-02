@@ -837,6 +837,68 @@ def _vectors_trailing_provider_hwm(
     return tuple(trailing)
 
 
+def _current_provider_bundle_already_persisted(
+    *,
+    city: str,
+    target_dates: Sequence[str],
+    expected_models: Sequence[str],
+    required_hwm: Mapping[str, Day0ProviderRunHwm],
+    decision_time: datetime,
+    remaining_window_starts: Mapping[str, datetime | None],
+) -> bool:
+    """Prove that shared storage already has this exact provider-run bundle."""
+
+    expected = tuple(dict.fromkeys(str(model).strip() for model in expected_models))
+    if not expected or set(required_hwm) != set(expected):
+        return False
+    try:
+        from src.state.db import get_forecasts_connection_read_only
+
+        conn = get_forecasts_connection_read_only()
+        try:
+            for target_date in target_dates:
+                window_start = remaining_window_starts.get(str(target_date))
+                if window_start is None:
+                    return False
+                vectors = read_freshest_day0_hourly_vectors(
+                    city=city,
+                    target_date=str(target_date),
+                    now=decision_time,
+                    expected_models=expected,
+                    require_expected=True,
+                    max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
+                    remaining_window_start=window_start,
+                    require_complete_remaining_window=True,
+                    conn=conn,
+                    raise_on_db_error=True,
+                )
+                by_model = {str(vector.model): vector for vector in vectors}
+                if set(by_model) != set(expected):
+                    return False
+                for model in expected:
+                    try:
+                        payload = json.loads(
+                            str(by_model[model].source_run_meta_json or "")
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return False
+                    actual = _provider_run_identity_from_meta(
+                        payload if isinstance(payload, Mapping) else None,
+                        expected_model=model,
+                    )
+                    hwm = required_hwm[model]
+                    if actual != (
+                        hwm.run_initialisation_time.astimezone(UTC),
+                        hwm.run_availability_time.astimezone(UTC),
+                    ):
+                        return False
+            return True
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, RuntimeError):
+        return False
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_TABLE_DDL)
     conn.execute(_INDEX_DDL)
@@ -1659,7 +1721,7 @@ def read_freshest_day0_hourly_vectors(
             rows = conn.execute(
                 """
                 SELECT model, city, target_date, timezone_name, captured_at,
-                       times_json, temps_c_json
+                       times_json, temps_c_json, source_run_meta_json
                 FROM day0_hourly_vectors
                 WHERE city = ? AND target_date = ?
                   AND julianday(captured_at)
@@ -1691,6 +1753,9 @@ def read_freshest_day0_hourly_vectors(
                 model=model, city=str(row[1]), target_date=str(row[2]),
                 timezone_name=str(row[3]), captured_at=str(row[4]),
                 times=times, temps_c=temps,
+                source_run_meta_json=(
+                    None if row[7] in (None, "") else str(row[7])
+                ),
             )
             candidates.append(candidate)
         return select_ready_day0_hourly_vectors(
@@ -2186,6 +2251,30 @@ def maybe_refresh_day0_hourly_vectors(
             release_due = (
                 (name, target_dates[0]) in release_due_scopes and bool(required_hwm)
             )
+            window_starts = {
+                target_date: strict_window_start(city, target_date)
+                for target_date in target_dates
+            }
+            if (
+                not release_due
+                and _current_provider_bundle_already_persisted(
+                    city=name,
+                    target_dates=target_dates,
+                    expected_models=models,
+                    required_hwm=required_hwm,
+                    decision_time=decision_time,
+                    remaining_window_starts=window_starts,
+                )
+            ):
+                # Process-local throttles cannot deduplicate concurrent daemon
+                # owners.  Shared DB + exact source identity is the no-fetch
+                # authority; any HWM advance or incomplete causal window falls
+                # through to the normal transport path.
+                with _REFRESH_LOCK:
+                    _LAST_REFRESH_MONOTONIC[refresh_key] = now_monotonic
+                    _INCOMPLETE_RETRY_NOT_BEFORE_MONOTONIC.pop(refresh_key, None)
+                    _INCOMPLETE_RETRY_STREAK.pop(refresh_key, None)
+                continue
             critical_city_count = max(0, int(quota_critical_cities))
             priority_city_count = max(0, int(quota_priority_cities))
             if city_index < critical_city_count:
@@ -2351,7 +2440,7 @@ def maybe_refresh_day0_hourly_vectors(
 
             strict_bundles: dict[str, tuple[datetime, list[Day0HourlyVector]]] = {}
             for target_date in target_dates:
-                window_start = strict_window_start(city, target_date)
+                window_start = window_starts[target_date]
                 selected = select_ready_day0_hourly_vectors(
                     vectors,
                     target_date=target_date,
@@ -2390,7 +2479,9 @@ def maybe_refresh_day0_hourly_vectors(
             if ensemble_target_dates:
                 ensemble_expected = day0_source_clock_ensemble_member_models()
                 for target_date in ensemble_target_dates:
-                    window_start = strict_window_start(city, target_date)
+                    window_start = window_starts.get(target_date)
+                    if window_start is None:
+                        window_start = strict_window_start(city, target_date)
                     selected_ensemble = (
                         select_ready_day0_hourly_vectors(
                             ensemble_vectors,

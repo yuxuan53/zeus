@@ -6348,6 +6348,69 @@ class TestRequestHashProvenance:
             conn=conn,
         ) == frozenset()
 
+    def test_refresh_skips_exact_current_provider_bundle_across_processes(
+        self, monkeypatch
+    ):
+        import src.data.day0_hourly_vectors as hv
+        import src.state.db as db_module
+
+        model = "ecmwf_ifs"
+        decision_time = datetime(2026, 6, 10, 13, 16, 20, tzinfo=UTC)
+        hwm = hv.Day0ProviderRunHwm(
+            model=model,
+            run_initialisation_time=datetime(2026, 6, 10, 6, 0, tzinfo=UTC),
+            run_availability_time=datetime(2026, 6, 10, 12, 10, tzinfo=UTC),
+        )
+        source_meta = json.dumps(
+            {
+                "model": model,
+                "provider": "openmeteo",
+                "provider_source_cycle_time_utc": (
+                    hwm.run_initialisation_time.isoformat()
+                ),
+                "provider_source_available_at_utc": (
+                    hwm.run_availability_time.isoformat()
+                ),
+            }
+        )
+        fetches = {"count": 0}
+
+        monkeypatch.setattr(hv, "day0_hourly_models_for_city", lambda _city: [model])
+        monkeypatch.setattr(
+            hv,
+            "read_freshest_day0_hourly_vectors",
+            lambda **_kwargs: [
+                replace(
+                    _refresh_vector(_paris(), model, decision_time),
+                    source_run_meta_json=source_meta,
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            db_module,
+            "get_forecasts_connection_read_only",
+            lambda: sqlite3.connect(":memory:"),
+        )
+
+        def fetch(*_args, **_kwargs):
+            fetches["count"] += 1
+            return [], ""
+
+        monkeypatch.setattr(hv, "fetch_day0_hourly_vectors", fetch)
+        hv._LAST_REFRESH_MONOTONIC.clear()
+
+        stats = hv.maybe_refresh_day0_hourly_vectors(
+            [_paris()],
+            decision_time=decision_time,
+            interval_s=0.0,
+            provider_run_hwm={model: hwm},
+            release_due_city_dates=(),
+            return_stats=True,
+        )
+
+        assert fetches["count"] == 0
+        assert stats.cities_attempted == 0
+
     def test_release_edge_bypasses_interval_but_rejects_old_exact_payload(
         self, monkeypatch
     ):
