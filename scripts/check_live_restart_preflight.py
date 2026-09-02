@@ -2165,7 +2165,7 @@ def _venue_point_order_truth_alignment_check() -> CheckResult:
     local_terminal_partial_covered: list[dict[str, Any]] = []
     venue_read_commands: list[dict[str, Any]] = []
     for command in commands:
-        if _terminal_partial_entry_has_no_resting_remainder(command):
+        if _terminal_partial_command_has_no_resting_remainder(command):
             local_terminal_partial_covered.append(
                 {
                     **command,
@@ -3177,7 +3177,7 @@ def _resting_venue_command_lifecycle_alignment_check() -> CheckResult:
     boot_recoverable: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        if _terminal_partial_entry_has_no_resting_remainder(item):
+        if _terminal_partial_command_has_no_resting_remainder(item):
             covered.append(
                 {
                     **item,
@@ -3265,10 +3265,10 @@ def _positive_float(value: object) -> float | None:
     return None
 
 
-def _terminal_partial_entry_has_no_resting_remainder(item: dict[str, Any]) -> bool:
-    """Accept a short fill only when local venue and trade quantities close exactly."""
+def _terminal_partial_command_has_no_resting_remainder(item: dict[str, Any]) -> bool:
+    """Accept an ENTRY or EXIT short fill only when quantities close exactly."""
 
-    if str(item.get("intent_kind") or "").upper() != "ENTRY":
+    if str(item.get("intent_kind") or "").upper() not in {"ENTRY", "EXIT"}:
         return False
     command_state = str(
         item.get("command_state") or item.get("state") or ""

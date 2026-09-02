@@ -4444,12 +4444,61 @@ def test_review_short_fill_requires_terminal_position_and_fact() -> None:
         "positive_trade_filled_size": 4.0,
     }
 
-    assert not preflight._terminal_partial_entry_has_no_resting_remainder(
+    assert not preflight._terminal_partial_command_has_no_resting_remainder(
         {**base, "position_phase": "active", "latest_fact_state": "EXPIRED"}
     )
-    assert not preflight._terminal_partial_entry_has_no_resting_remainder(
+    assert not preflight._terminal_partial_command_has_no_resting_remainder(
         {**base, "position_phase": "settled", "latest_fact_state": "PARTIALLY_MATCHED"}
     )
+
+
+def test_resting_alignment_treats_terminal_partial_exit_as_non_resting(
+    monkeypatch,
+    tmp_path,
+):
+    trade_db = tmp_path / "zeus_trades.db"
+    world_db = tmp_path / "zeus-world.db"
+    forecast_db = tmp_path / "zeus-forecasts.db"
+    sqlite3.connect(world_db).close()
+    sqlite3.connect(forecast_db).close()
+    _init_resting_command_trade_db(
+        trade_db,
+        phase="economically_closed",
+        intent_kind="EXIT",
+    )
+    conn = sqlite3.connect(trade_db)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE venue_commands SET state = 'PARTIAL', size = 18.25 WHERE command_id = 'cmd-1'")
+    conn.execute(
+        """
+        UPDATE venue_order_facts
+           SET state = 'PARTIALLY_MATCHED', matched_size = '10', remaining_size = '0'
+         WHERE command_id = 'cmd-1'
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE venue_trade_facts (
+            command_id TEXT, venue_order_id TEXT, state TEXT,
+            filled_size TEXT, fill_price TEXT, observed_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO venue_trade_facts VALUES ('cmd-1', '0xabc', 'CONFIRMED', '10', '0.85', ?)",
+        (now,),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(preflight, "TRADE_DB", trade_db)
+    monkeypatch.setattr(preflight, "WORLD_DB", world_db)
+    monkeypatch.setattr(preflight, "FORECAST_DB", forecast_db)
+
+    result = preflight._resting_venue_command_lifecycle_alignment_check()
+
+    assert result.ok is True
+    assert result.evidence["risky"] == []
+    assert result.evidence["terminal_partial_non_resting_count"] == 1
 
 
 def test_resting_alignment_treats_terminal_review_short_fill_as_non_resting(
