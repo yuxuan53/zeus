@@ -137,3 +137,14 @@ rotation/read-bound antibody now passes, including its one-connection and
 eight-query ceilings; 11 priority/rotation tests and two stale/superseded
 ownership tests pass. The broader targeted slice retains the same two
 pre-existing queue failures reproduced on unmodified live.
+
+Post-deploy profiling then isolated the remaining deadline loss to the trade
+truth side of the same tranche: held-capital, probability-debt, global-auction,
+and the JIT priority classifier opened `zeus_trades.db` five times. Under the
+current live writer load the first open alone took 6.13 seconds; the bounded
+no-write tranche took 6.77 seconds and could therefore lose its 10-second
+claim budget before publishing a seed. The queue now shares one trade read
+connection across those logically independent classifications while retaining
+their separate SELECTs and JIT probability-debt re-read. Against the same live
+DBs, the no-write tranche fell to 0.23 seconds and exactly two connections:
+one forecast DB and one trade DB.

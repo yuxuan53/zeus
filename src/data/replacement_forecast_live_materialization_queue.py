@@ -1531,17 +1531,22 @@ def _current_money_risk_scopes(
     fam_scopes: frozenset[tuple[str, str, str]],
     *,
     trade_db: Path | str | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> frozenset[tuple[str, str, str]]:
     """Return queued families with chain-confirmed capital currently at risk."""
 
     if not fam_scopes:
         return frozenset()
-    return _current_money_risk_families(trade_db=trade_db) & fam_scopes
+    return _current_money_risk_families(
+        trade_db=trade_db,
+        trade_conn=trade_conn,
+    ) & fam_scopes
 
 
 def _current_money_risk_families(
     *,
     trade_db: Path | str | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> frozenset[tuple[str, str, str]]:
     """Return every chain-confirmed family whose probability protects capital."""
 
@@ -1554,11 +1559,13 @@ def _current_money_risk_families(
         db_path = Path(trade_db) if trade_db is not None else _zeus_trade_db_path()
         if not db_path.exists():
             return frozenset()
-        conn = _queue_read_only_connection(db_path)
+        owns_conn = trade_conn is None
+        conn = trade_conn or _queue_read_only_connection(db_path)
         try:
             return frozenset(_held_position_families(conn))
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except _ClaimReadDeadlineExceeded:
         raise
     except Exception as exc:  # noqa: BLE001 - priority loss is loud, queue still drains
@@ -1573,6 +1580,7 @@ def _current_money_risk_families(
 def _current_global_auction_family_ids(
     *,
     trade_db: Path | str | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> frozenset[str]:
     """Return the latest complete global cut's full family-id scope."""
 
@@ -1585,7 +1593,8 @@ def _current_global_auction_family_ids(
         if not db_path.exists():
             return frozenset()
         path_identity = str(db_path.resolve())
-        conn = _queue_read_only_connection(db_path)
+        owns_conn = trade_conn is None
+        conn = trade_conn or _queue_read_only_connection(db_path)
         try:
             latest = conn.execute(
                 """
@@ -1612,7 +1621,8 @@ def _current_global_auction_family_ids(
                 """
             ).fetchall()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except _ClaimReadDeadlineExceeded:
         raise
     except Exception as exc:  # noqa: BLE001 - priority loss is loud; queue still drains
@@ -1659,10 +1669,14 @@ def _current_global_auction_scope_families(
     queue_files: Sequence[Path],
     *,
     trade_db: Path | str | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> frozenset[tuple[str, str, str]]:
     """Map queued seed/request names into the latest complete global cut."""
 
-    family_ids = _current_global_auction_family_ids(trade_db=trade_db)
+    family_ids = _current_global_auction_family_ids(
+        trade_db=trade_db,
+        trade_conn=trade_conn,
+    )
     if not family_ids or not queue_files:
         return frozenset()
     try:
@@ -1720,11 +1734,15 @@ def _current_probability_debt_families(
     *,
     trade_db: Path | str | None = None,
     held: frozenset[tuple[str, str, str]] | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> frozenset[tuple[str, str, str]]:
     """Return current-capital families whose held probability is not fresh."""
 
     held_families = (
-        _current_money_risk_families(trade_db=trade_db)
+        _current_money_risk_families(
+            trade_db=trade_db,
+            trade_conn=trade_conn,
+        )
         if held is None
         else held
     )
@@ -1734,7 +1752,8 @@ def _current_probability_debt_families(
         from src.state.db import _zeus_trade_db_path  # noqa: PLC0415
 
         db_path = Path(trade_db) if trade_db is not None else _zeus_trade_db_path()
-        conn = _queue_read_only_connection(db_path)
+        owns_conn = trade_conn is None
+        conn = trade_conn or _queue_read_only_connection(db_path)
         try:
             rows = conn.execute(
                 """
@@ -1745,7 +1764,8 @@ def _current_probability_debt_families(
                 """
             ).fetchall()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except _ClaimReadDeadlineExceeded:
         raise
     except Exception as exc:  # noqa: BLE001 - unknown debt keeps ordinary timeout law
@@ -1836,6 +1856,7 @@ def _cycle_advance_seed_priority_map(
     current_global_scope: frozenset[tuple[str, str, str]] | None = None,
     priority_names: set[str] | None = None,
     forecast_conn: sqlite3.Connection | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> dict[str, tuple[float, str]]:
     """Return filename -> priority for queued materialization work.
 
@@ -1903,12 +1924,20 @@ def _cycle_advance_seed_priority_map(
         return {}
     fam_scopes = frozenset(scope[:3] for scope in names_by_scope)
     current_money_risk = (
-        _current_money_risk_scopes(fam_scopes, trade_db=trade_db)
+        _current_money_risk_scopes(
+            fam_scopes,
+            trade_db=trade_db,
+            trade_conn=trade_conn,
+        )
         if current_money_risk is None
         else current_money_risk & fam_scopes
     )
     current_global_scope = (
-        _current_global_auction_scope_families(queue_files, trade_db=trade_db)
+        _current_global_auction_scope_families(
+            queue_files,
+            trade_db=trade_db,
+            trade_conn=trade_conn,
+        )
         if current_global_scope is None
         else current_global_scope & fam_scopes
     )
@@ -1916,7 +1945,10 @@ def _cycle_advance_seed_priority_map(
     # held family ordinary priority; only a currently stale monitor q grants
     # the retry its capital-protection tier, and a fresh q removes it.
     current_probability_debt = (
-        _current_probability_debt_families(trade_db=trade_db) & fam_scopes
+        _current_probability_debt_families(
+            trade_db=trade_db,
+            trade_conn=trade_conn,
+        ) & fam_scopes
     )
     rows: list[object] = []
     current_baseline_names: set[str] = set()
@@ -2146,6 +2178,7 @@ def _priority_map_with_names(
     current_money_risk: frozenset[tuple[str, str, str]] | None = None,
     current_global_scope: frozenset[tuple[str, str, str]] | None = None,
     forecast_conn: sqlite3.Connection | None = None,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> tuple[dict[str, tuple[float, str]], set[str]]:
     """Call the classifier while keeping compatibility with narrow test doubles."""
     priority_names: set[str] = set()
@@ -2158,6 +2191,7 @@ def _priority_map_with_names(
             current_global_scope=current_global_scope,
             priority_names=priority_names,
             forecast_conn=forecast_conn,
+            trade_conn=trade_conn,
         )
     except TypeError as exc:
         if not any(
@@ -2167,6 +2201,7 @@ def _priority_map_with_names(
                 "current_money_risk",
                 "current_global_scope",
                 "forecast_conn",
+                "trade_conn",
             )
         ):
             raise
@@ -4157,6 +4192,7 @@ def _prepare_seed_requests(
     if not any(path.is_file() for path in seed_path.glob("*.json")):
         return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_EMPTY"]
     forecast_conn: sqlite3.Connection | None = None
+    trade_conn: sqlite3.Connection | None = None
     if forecast_db is not None and Path(forecast_db).exists():
         try:
             forecast_conn = _queue_read_only_connection(Path(forecast_db))
@@ -4167,6 +4203,16 @@ def _prepare_seed_requests(
             # the shared snapshot cannot be opened. No seed is consumed.
             forecast_conn = None
     try:
+        from src.state.db import _zeus_trade_db_path  # noqa: PLC0415
+
+        trade_db = _zeus_trade_db_path()
+        if trade_db.exists():
+            trade_conn = _queue_read_only_connection(trade_db)
+    except _ClaimReadDeadlineExceeded:
+        raise
+    except (sqlite3.Error, OSError):
+        trade_conn = None
+    try:
         return _prepare_seed_requests_with_connection(
             seed_dir=seed_dir,
             seed_processed_dir=seed_processed_dir,
@@ -4174,12 +4220,15 @@ def _prepare_seed_requests(
             request_dir=request_dir,
             forecast_db=forecast_db,
             forecast_conn=forecast_conn,
+            trade_conn=trade_conn,
             limit=limit,
             lane=lane,
         )
     finally:
         if forecast_conn is not None:
             forecast_conn.close()
+        if trade_conn is not None:
+            trade_conn.close()
 
 
 def _prepare_seed_requests_with_connection(
@@ -4192,6 +4241,7 @@ def _prepare_seed_requests_with_connection(
     forecast_conn: sqlite3.Connection | None,
     limit: int,
     lane: str = MATERIALIZATION_LANE_ALL,
+    trade_conn: sqlite3.Connection | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     if seed_dir is None:
         return [], [], []
@@ -4214,15 +4264,31 @@ def _prepare_seed_requests_with_connection(
         raw_snapshot,
         _read_day0_enqueue_ownership_cursor(cursor_path),
     )
-    current_money_risk = _current_money_risk_families()
+    try:
+        current_money_risk = _current_money_risk_families(trade_conn=trade_conn)
+    except TypeError as exc:
+        if "trade_conn" not in str(exc):
+            raise
+        current_money_risk = _current_money_risk_families()
     current_probability_debt = (
-        _current_probability_debt_families(held=current_money_risk)
+        _current_probability_debt_families(
+            held=current_money_risk,
+            trade_conn=trade_conn,
+        )
         if lane == MATERIALIZATION_LANE_PRIORITY
         else frozenset()
     )
-    current_global_scope = _current_global_auction_scope_families(
-        rotated_raw_snapshot
-    )
+    try:
+        current_global_scope = _current_global_auction_scope_families(
+            rotated_raw_snapshot,
+            trade_conn=trade_conn,
+        )
+    except TypeError as exc:
+        if "trade_conn" not in str(exc):
+            raise
+        current_global_scope = _current_global_auction_scope_families(
+            rotated_raw_snapshot
+        )
     try:
         never_priced_scope = _never_priced_enqueued_seed_families(
             forecast_db,
@@ -4301,6 +4367,7 @@ def _prepare_seed_requests_with_connection(
         current_money_risk=current_money_risk,
         current_global_scope=current_global_scope,
         forecast_conn=forecast_conn,
+        trade_conn=trade_conn,
     )
     # Background excludes this scope above, so every first-price seed must
     # acquire priority ownership before the lane filter.

@@ -37,8 +37,9 @@ _See sibling scope.yaml for machine-readable scope._
 - Give held-capital, already-priced global-selection, and never-priced
   first-posterior work independent slots in the priority micro-batch.
 - Decouple bounded seed preparation from repeated cache/DB opens by sharing one
-  read-only snapshot and batching enqueue-ownership classification, while
-  preserving just-in-time ownership validation before publication.
+  forecast and one trade read connection, batching enqueue-ownership
+  classification while preserving separate current-capital/global-auction
+  queries and just-in-time ownership validation before publication.
 - Re-run the strict current-regime capital evaluator; city coverage is not
   itself capital-advantage proof.
 
