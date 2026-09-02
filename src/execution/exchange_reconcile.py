@@ -5916,6 +5916,51 @@ def _same_token_position_metadata_for_entry_fill(
     return dict(row) if row is not None else None
 
 
+def _entry_decision_metadata_for_linked_fill(
+    conn: sqlite3.Connection,
+    command: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover immutable EDLI entry metadata before projecting a linked fill.
+
+    Exchange fill truth can arrive before the normal EDLI position bridge.  The
+    position still has to become monitorable immediately, but its decision-time
+    probability must come from the same verified Actionable certificate that
+    authorized the BUY; ``0.0`` is not a probability authority.
+    """
+
+    decision_id = str(command.get("decision_id") or "").strip()
+    if not decision_id.startswith("edli_exec_cmd:"):
+        return {}
+    try:
+        from src.execution.command_recovery import (
+            _decision_log_trade_case_for_command,
+            _hydrate_command_execution_identity,
+        )
+
+        hydrated = _hydrate_command_execution_identity(conn, dict(command))
+        trade_case, _decision_log_id = _decision_log_trade_case_for_command(
+            conn,
+            hydrated,
+        )
+    except (sqlite3.Error, ValueError, TypeError):
+        logger.warning(
+            "exchange_reconcile: immutable EDLI entry metadata unavailable "
+            "command_id=%s position_id=%s",
+            command.get("command_id"),
+            command.get("position_id"),
+            exc_info=True,
+        )
+        return {}
+    posterior = _positive_decimal_or_none(trade_case.get("p_posterior"))
+    if (
+        posterior is None
+        or posterior > Decimal("1")
+        or str(trade_case.get("entry_method") or "").strip() != "qkernel_spine"
+    ):
+        return {}
+    return dict(trade_case)
+
+
 def _missing_entry_projection_from_linked_fill(
     conn: sqlite3.Connection,
     *,
@@ -5951,6 +5996,7 @@ def _missing_entry_projection_from_linked_fill(
         token_id=token_id,
         condition_id=condition_id,
     )
+    decision_metadata = _entry_decision_metadata_for_linked_fill(conn, command)
     yes_token = str(snapshot.get("yes_token_id") or "").strip()
     no_token = str(snapshot.get("no_token_id") or "").strip()
     if metadata_row is not None:
@@ -5972,6 +6018,8 @@ def _missing_entry_projection_from_linked_fill(
             and authoritative_market_metadata.get(field) not in (None, "")
         ):
             return authoritative_market_metadata.get(field)
+        if decision_metadata.get(field) not in (None, ""):
+            return decision_metadata.get(field)
         if metadata_row is not None and metadata_row.get(field) not in (None, ""):
             return metadata_row.get(field)
         if market_event is not None and market_event.get(field) not in (None, ""):
@@ -6026,7 +6074,13 @@ def _missing_entry_projection_from_linked_fill(
         "last_monitor_prob": None,
         "last_monitor_edge": None,
         "last_monitor_market_price": None,
-        "decision_snapshot_id": str(command.get("snapshot_id") or snapshot.get("snapshot_id") or ""),
+        "decision_snapshot_id": str(
+            _meta(
+                "decision_snapshot_id",
+                command.get("snapshot_id") or snapshot.get("snapshot_id") or "",
+            )
+            or ""
+        ),
         "entry_method": str(_meta("entry_method", "qkernel_spine") or ""),
         "strategy_key": str(_meta("strategy_key", "opening_inertia") or "opening_inertia"),
         "edge_source": str(_meta("edge_source", "exchange_reconcile_linked_fill") or ""),

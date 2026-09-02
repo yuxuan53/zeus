@@ -3573,6 +3573,121 @@ def test_maker_fill_materializes_missing_position_projection_after_cancel(
     ).fetchone()["state"] == "CANCELLED"
 
 
+def test_linked_edli_fill_projects_immutable_entry_probability(monkeypatch, conn):
+    """Fill recovery consumes the BUY certificate before writing the position."""
+
+    from src.execution import command_recovery
+    from src.execution.exchange_reconcile import run_reconcile_sweep
+
+    yes_token = "manila-edli-yes"
+    seed_command(
+        conn,
+        command_id="cmd-edli-missing-projection",
+        venue_order_id="ord-edli-missing-projection",
+        position_id="pos-edli-missing-projection",
+        token_id=yes_token,
+        size=20.6,
+        price=0.15,
+        snapshot_token_id=yes_token,
+        snapshot_no_token_id=f"{yes_token}-no",
+    )
+    conn.execute(
+        """
+        UPDATE venue_commands
+           SET decision_id = 'edli_exec_cmd:event-manila:intent-manila:manila-edli-yes'
+         WHERE command_id = 'cmd-edli-missing-projection'
+        """
+    )
+    monkeypatch.setattr(
+        command_recovery,
+        "_hydrate_command_execution_identity",
+        lambda _conn, command: dict(command),
+    )
+    monkeypatch.setattr(
+        command_recovery,
+        "_decision_log_trade_case_for_command",
+        lambda _conn, _command: (
+            {
+                "p_posterior": 0.593664633019502,
+                "entry_method": "qkernel_spine",
+                "strategy_key": "forecast_qkernel_entry",
+                "edge_source": "forecast_qkernel_entry",
+                "discovery_mode": "update_reaction",
+                "decision_snapshot_id": "rmf-Manila|2026-09-04|high|2026-09-02",
+            },
+            None,
+        ),
+    )
+    forecasts = sqlite3.connect(":memory:")
+    forecasts.row_factory = sqlite3.Row
+    forecasts.execute(
+        """
+        CREATE TABLE market_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_slug TEXT,
+            city TEXT,
+            target_date TEXT,
+            condition_id TEXT,
+            token_id TEXT,
+            range_label TEXT,
+            outcome TEXT
+        )
+        """
+    )
+    forecasts.execute(
+        """
+        INSERT INTO market_events (
+            market_slug, city, target_date, condition_id, token_id, range_label, outcome
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "highest-temperature-in-manila-on-september-4-2026",
+            "Manila",
+            "2026-09-04",
+            "condition-m5",
+            yes_token,
+            "Will the highest temperature in Manila be 29°C on September 4?",
+            "Yes",
+        ),
+    )
+    monkeypatch.setattr(
+        "src.state.db.get_forecasts_connection_read_only",
+        lambda: forecasts,
+    )
+    adapter = FakeM5Adapter(
+        positions=[position(token_id=yes_token, size="20.6")],
+        trades=[
+            trade(
+                trade_id="trade-edli-missing-projection",
+                order_id="ord-edli-missing-projection",
+                size="20.6",
+                price="0.15",
+                status="CONFIRMED",
+                asset_id=yes_token,
+            )
+        ],
+    )
+
+    run_reconcile_sweep(adapter, conn, context="periodic", observed_at=NOW)
+
+    projection = conn.execute(
+        """
+        SELECT p_posterior, entry_method, strategy_key, edge_source,
+               discovery_mode, decision_snapshot_id
+          FROM position_current
+         WHERE position_id = 'pos-edli-missing-projection'
+        """
+    ).fetchone()
+    assert dict(projection) == {
+        "p_posterior": pytest.approx(0.593664633019502),
+        "entry_method": "qkernel_spine",
+        "strategy_key": "forecast_qkernel_entry",
+        "edge_source": "forecast_qkernel_entry",
+        "discovery_mode": "update_reaction",
+        "decision_snapshot_id": "rmf-Manila|2026-09-04|high|2026-09-02",
+    }
+
+
 def test_fill_recovery_reads_exact_bin_from_canonical_forecasts(monkeypatch, conn):
     """The event slug is family identity, never the settlement outcome key."""
 
