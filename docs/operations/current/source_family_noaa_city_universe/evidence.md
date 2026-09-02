@@ -124,3 +124,16 @@ seed bridge closed. The callback now uses the receipt counts: a real processed,
 failed, committed, or published item retains the request slot; a zero-progress
 retry receipt permits the independent seed tranche to run. Six focused
 priority-callback tests pass.
+
+The seed bridge still failed its 10-second claim deadline after it became
+reachable. One bounded priority tranche reopened the same forecast DB up to
+ten times and repeated Day0 enqueue-ownership reads for every inspected seed.
+That cache/DB contention was accidental coupling between queue bookkeeping and
+probability materialization, not evidence that the new cities lacked source
+inputs. Seed preparation now shares one read-only connection, loads ownership
+for the bounded inspection window in one query, and retains a just-in-time
+ownership recheck before each actionable seed is published. The existing
+rotation/read-bound antibody now passes, including its one-connection and
+eight-query ceilings; 11 priority/rotation tests and two stale/superseded
+ownership tests pass. The broader targeted slice retains the same two
+pre-existing queue failures reproduced on unmodified live.

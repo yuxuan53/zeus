@@ -928,6 +928,7 @@ def _upgrade_day0_seed_has_current_enqueue_ownership(
     forecast_db: Path | str | None,
     seed_file: Path,
     seed: Mapping[str, object],
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> _Day0EnqueueOwnershipCheck:
     """Classify Day0 marker ownership without consuming a seed on read uncertainty."""
     # Day0 conditioning is probability truth, not an enqueue-owner type.  Only
@@ -955,119 +956,172 @@ def _upgrade_day0_seed_has_current_enqueue_ownership(
     db_path = Path(forecast_db)
     if not db_path.exists():
         return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE)
+    owns_conn = forecast_conn is None
     try:
-        conn = _queue_read_only_connection(db_path)
+        conn = forecast_conn or _queue_read_only_connection(db_path)
         try:
             conn.execute("PRAGMA query_only=ON")
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(cycle_advance_enqueues)").fetchall()
-            }
-            required = {
-                "enqueue_id",
-                "city",
-                "target_date",
-                "metric",
-                "target_cycle_time",
-                "seed_file",
-                "day0_conditioning_identity_json",
-            }
-            if not required.issubset(columns):
-                return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE)
-            latest_row = conn.execute(
-                """
-                SELECT seed_file
-                FROM cycle_advance_enqueues
-                WHERE city = ?
-                  AND target_date = ?
-                  AND metric = ?
-                ORDER BY enqueue_id DESC
-                LIMIT 1
-                """,
-                (
-                    str(seed.get("city") or ""),
-                    str(seed.get("target_date") or ""),
-                    str(seed.get("temperature_metric") or ""),
-                ),
-            ).fetchone()
-            owner_row = conn.execute(
-                """
-                SELECT seed_file, day0_conditioning_identity_json,
-                       target_cycle_time
-                FROM cycle_advance_enqueues
-                WHERE city = ?
-                  AND target_date = ?
-                  AND metric = ?
-                  AND seed_file = ?
-                LIMIT 1
-                """,
-                (
-                    str(seed.get("city") or ""),
-                    str(seed.get("target_date") or ""),
-                    str(seed.get("temperature_metric") or ""),
-                    str(seed_file),
-                ),
-            ).fetchone()
-            if owner_row is None:
-                return _Day0EnqueueOwnershipCheck(
-                    _Day0EnqueueOwnership.STALE
-                    if latest_row is not None
-                    else _Day0EnqueueOwnership.INDETERMINATE
-                )
-            row = conn.execute(
-                """
-                SELECT seed_file, day0_conditioning_identity_json,
-                       target_cycle_time
-                FROM cycle_advance_enqueues
-                WHERE city = ?
-                  AND target_date = ?
-                  AND metric = ?
-                  AND target_cycle_time = ?
-                ORDER BY enqueue_id DESC
-                LIMIT 1
-                """,
-                (
-                    str(seed.get("city") or ""),
-                    str(seed.get("target_date") or ""),
-                    str(seed.get("temperature_metric") or ""),
-                    str(owner_row["target_cycle_time"] or ""),
-                ),
-            ).fetchone()
-            if row is None:
-                return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE)
-            if str(row["seed_file"] or "") != str(seed_file):
-                return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.STALE)
-            recorded_identity = row["day0_conditioning_identity_json"]
-            if not isinstance(recorded_identity, str) or not recorded_identity.strip():
-                return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE)
-            if recorded_identity != identity:
-                return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.STALE)
-            return _Day0EnqueueOwnershipCheck(
-                _Day0EnqueueOwnership.CURRENT,
-                witness={
-                    "city": str(seed.get("city") or ""),
-                    "target_date": str(seed.get("target_date") or ""),
-                    "metric": str(seed.get("temperature_metric") or ""),
-                    "target_cycle_time": str(row["target_cycle_time"] or ""),
-                    "seed_file": str(seed_file),
-                    "conditioning_identity": identity,
-                },
+            return _day0_enqueue_ownership_snapshot(
+                conn,
+                (seed_file,),
+                {seed_file: seed},
+            ).get(
+                seed_file,
+                _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE),
             )
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except _ClaimReadDeadlineExceeded:
         raise
     except Exception:
         return _Day0EnqueueOwnershipCheck(_Day0EnqueueOwnership.INDETERMINATE)
 
 
-def _seed_already_covered(*, forecast_db: Path | str | None, seed: dict[str, object]) -> bool:
+def _day0_enqueue_ownership_snapshot(
+    conn: sqlite3.Connection | None,
+    paths: Sequence[Path],
+    payloads: Mapping[Path, Mapping[str, object] | None],
+) -> dict[Path, _Day0EnqueueOwnershipCheck]:
+    """Classify one bounded seed window from a single enqueue-ledger read."""
+
+    if conn is None or not paths:
+        return {}
+    from src.data.replacement_cycle_advance_trigger import (  # noqa: PLC0415
+        _day0_conditioning_identity,
+    )
+
+    identities: dict[
+        Path,
+        tuple[tuple[str, str, str], str],
+    ] = {}
+    checks: dict[Path, _Day0EnqueueOwnershipCheck] = {}
+    for path in paths:
+        seed = payloads.get(path)
+        if seed is None:
+            continue
+        if (
+            seed.get("cycle_advance_enqueue_owner") is not True
+            or seed.get("day0_observed_extreme_observation_time") is None
+        ):
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.CURRENT
+            )
+            continue
+        identity = _day0_conditioning_identity(
+            source=seed.get("day0_observed_extreme_source"),
+            observation_time=seed.get("day0_observed_extreme_observation_time"),
+            observed_extreme_c=seed.get("day0_observed_extreme_c"),
+            unit=seed.get("day0_observed_extreme_unit"),
+        )
+        if identity is None:
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.INDETERMINATE
+            )
+            continue
+        identities[path] = (
+            (
+                str(seed.get("city") or ""),
+                str(seed.get("target_date") or ""),
+                str(seed.get("temperature_metric") or ""),
+            ),
+            identity,
+        )
+    if not identities:
+        return checks
+    scopes = tuple(dict.fromkeys(scope for scope, _identity in identities.values()))
+    values = ", ".join("(?, ?, ?)" for _ in scopes)
+    try:
+        rows = conn.execute(
+            f"""
+            WITH requested(city, target_date, metric) AS (VALUES {values})
+            SELECT e.enqueue_id, e.city, e.target_date, e.metric,
+                   e.target_cycle_time, e.seed_file,
+                   e.day0_conditioning_identity_json
+              FROM cycle_advance_enqueues AS e
+              JOIN requested AS r
+                ON r.city = e.city
+               AND r.target_date = e.target_date
+               AND r.metric = e.metric
+             ORDER BY e.enqueue_id
+            """,
+            tuple(value for scope in scopes for value in scope),
+        ).fetchall()
+    except sqlite3.Error:
+        _raise_if_claim_read_expired()
+        return {}
+
+    latest_by_family: dict[tuple[str, str, str], object] = {}
+    owner_by_seed: dict[tuple[tuple[str, str, str], str], object] = {}
+    latest_by_cycle: dict[tuple[tuple[str, str, str], str], object] = {}
+    for row in rows:
+        scope = (str(row[1] or ""), str(row[2] or ""), str(row[3] or ""))
+        latest_by_family[scope] = row
+        seed_file = str(row[5] or "")
+        if seed_file:
+            owner_by_seed[(scope, seed_file)] = row
+        latest_by_cycle[(scope, str(row[4] or ""))] = row
+
+    for path, (scope, identity) in identities.items():
+        owner = owner_by_seed.get((scope, str(path)))
+        latest = latest_by_family.get(scope)
+        if owner is None:
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.STALE
+                if latest is not None
+                else _Day0EnqueueOwnership.INDETERMINATE
+            )
+            continue
+        cycle = str(owner[4] or "")
+        cycle_owner = latest_by_cycle.get((scope, cycle))
+        if cycle_owner is None:
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.INDETERMINATE
+            )
+            continue
+        if str(cycle_owner[5] or "") != str(path):
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.STALE
+            )
+            continue
+        recorded_identity = cycle_owner[6]
+        if not isinstance(recorded_identity, str) or not recorded_identity.strip():
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.INDETERMINATE
+            )
+            continue
+        if recorded_identity != identity:
+            checks[path] = _Day0EnqueueOwnershipCheck(
+                _Day0EnqueueOwnership.STALE
+            )
+            continue
+        checks[path] = _Day0EnqueueOwnershipCheck(
+            _Day0EnqueueOwnership.CURRENT,
+            witness={
+                "city": scope[0],
+                "target_date": scope[1],
+                "metric": scope[2],
+                "target_cycle_time": cycle,
+                "seed_file": str(path),
+                "conditioning_identity": identity,
+            },
+        )
+    return checks
+
+
+def _seed_already_covered(
+    *,
+    forecast_db: Path | str | None,
+    seed: dict[str, object],
+    forecast_conn: sqlite3.Connection | None = None,
+) -> bool:
     if forecast_db is None:
         return False
     db_path = Path(forecast_db)
     if not db_path.exists():
         return False
-    conn = _queue_read_only_connection(db_path)
+    owns_conn = forecast_conn is None
+    conn = forecast_conn or _queue_read_only_connection(db_path)
     try:
         conn.execute("PRAGMA query_only=ON")
         tables = {
@@ -1223,7 +1277,8 @@ def _seed_already_covered(*, forecast_db: Path | str | None, seed: dict[str, obj
                 return False
         return True
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 def _parse_utc_iso(value: object) -> datetime | None:
@@ -1243,6 +1298,7 @@ def _seed_source_cycle_boundary(
     *,
     forecast_db: Path | str | None,
     seed: dict[str, object],
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> tuple[str, str] | None:
     """Return a proven posterior/ENS cycle boundary for this seed, if any.
 
@@ -1261,8 +1317,9 @@ def _seed_source_cycle_boundary(
     db_path = Path(forecast_db)
     if not db_path.exists():
         return None
+    owns_conn = forecast_conn is None
     try:
-        conn = _queue_read_only_connection(db_path)
+        conn = forecast_conn or _queue_read_only_connection(db_path)
         try:
             conn.execute("PRAGMA query_only=ON")
             row = conn.execute(
@@ -1310,7 +1367,8 @@ def _seed_source_cycle_boundary(
                         else baseline_row[0]
                     )
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except _ClaimReadDeadlineExceeded:
         raise
     except Exception:
@@ -1425,6 +1483,8 @@ def _cycle_advance_never_priced_scopes(
 
 def _never_priced_enqueued_seed_families(
     forecast_db: Path | str | None,
+    *,
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> frozenset[tuple[str, str, str]]:
     """Return current enqueued families with no live replacement posterior."""
 
@@ -1433,8 +1493,9 @@ def _never_priced_enqueued_seed_families(
     db_path = Path(forecast_db)
     if not db_path.exists():
         return frozenset()
+    owns_conn = forecast_conn is None
     try:
-        conn = _queue_read_only_connection(db_path)
+        conn = forecast_conn or _queue_read_only_connection(db_path)
         try:
             rows = conn.execute(
                 """
@@ -1456,7 +1517,8 @@ def _never_priced_enqueued_seed_families(
                 (SOURCE_ID,),
             ).fetchall()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
     except (_ClaimReadDeadlineExceeded, sqlite3.Error, OSError):
         return frozenset()
     return frozenset(
@@ -1773,6 +1835,7 @@ def _cycle_advance_seed_priority_map(
     current_money_risk: frozenset[tuple[str, str, str]] | None = None,
     current_global_scope: frozenset[tuple[str, str, str]] | None = None,
     priority_names: set[str] | None = None,
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> dict[str, tuple[float, str]]:
     """Return filename -> priority for queued materialization work.
 
@@ -1859,8 +1922,9 @@ def _cycle_advance_seed_priority_map(
     current_baseline_names: set[str] = set()
     never_priced_scopes: frozenset[tuple[str, str, str]] = frozenset()
     if forecast_db is not None and Path(forecast_db).exists():
+        owns_conn = forecast_conn is None
         try:
-            conn = _queue_read_only_connection(Path(forecast_db))
+            conn = forecast_conn or _queue_read_only_connection(Path(forecast_db))
             try:
                 scopes = tuple(names_by_scope)
                 for offset in range(0, len(scopes), 200):
@@ -1923,7 +1987,8 @@ def _cycle_advance_seed_priority_map(
                     except sqlite3.Error:
                         pass
             finally:
-                conn.close()
+                if owns_conn:
+                    conn.close()
         except _ClaimReadDeadlineExceeded:
             raise
         except Exception:  # noqa: BLE001 - priority is best-effort; queue must still drain
@@ -2080,6 +2145,7 @@ def _priority_map_with_names(
     *,
     current_money_risk: frozenset[tuple[str, str, str]] | None = None,
     current_global_scope: frozenset[tuple[str, str, str]] | None = None,
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> tuple[dict[str, tuple[float, str]], set[str]]:
     """Call the classifier while keeping compatibility with narrow test doubles."""
     priority_names: set[str] = set()
@@ -2091,6 +2157,7 @@ def _priority_map_with_names(
             current_money_risk=current_money_risk,
             current_global_scope=current_global_scope,
             priority_names=priority_names,
+            forecast_conn=forecast_conn,
         )
     except TypeError as exc:
         if not any(
@@ -2099,6 +2166,7 @@ def _priority_map_with_names(
                 "priority_names",
                 "current_money_risk",
                 "current_global_scope",
+                "forecast_conn",
             )
         ):
             raise
@@ -3966,6 +4034,7 @@ def _coalesce_superseded_materialization_seeds(
     *,
     processed_path: Path,
     forecast_db: Path | str | None,
+    forecast_conn: sqlite3.Connection | None = None,
 ) -> tuple[
     tuple[Path, ...],
     tuple[str, ...],
@@ -3996,27 +4065,6 @@ def _coalesce_superseded_materialization_seeds(
             # still coalesce newer identities; producer-owned seeds retain the
             # existing marker recovery contract.
             continue
-        if payload.get("upgrade_trigger") or payload.get("cycle_advance_enqueue_owner") is True:
-            try:
-                cycle_boundary = _seed_source_cycle_boundary(
-                    forecast_db=forecast_db,
-                    seed=dict(payload),
-                )
-            except _ClaimReadDeadlineExceeded:
-                raise
-            except Exception:  # noqa: BLE001 - JIT boundary remains authoritative
-                cycle_boundary = None
-            cycle_boundary_cache[path] = cycle_boundary
-            if (
-                cycle_boundary is not None
-                and cycle_boundary[0] == "awaiting_current_ensemble_hwm"
-            ):
-                # The producer's durable marker owns this exact queue path. Moving
-                # it as a duplicate would make the producer believe its debt was
-                # consumed and publish it again while ENS is still unavailable.
-                # Retain every pre-existing owner during the bounded wait; after
-                # the HWM reaches equality normal coalescing/action resumes.
-                continue
         request_key = _request_coalescing_key(payload)
         if request_key is None:
             continue
@@ -4033,11 +4081,40 @@ def _coalesce_superseded_materialization_seeds(
             newest_by_key[key] = (freshness, path)
 
     keepers = {path for _freshness, path in newest_by_key.values()}
+    awaiting_ensemble: set[Path] = set()
+    for path, key in tuple(keys.items()):
+        if path in keepers:
+            continue
+        payload = payloads[path]
+        if not (
+            payload.get("upgrade_trigger")
+            or payload.get("cycle_advance_enqueue_owner") is True
+        ):
+            continue
+        try:
+            cycle_boundary = _seed_source_cycle_boundary(
+                forecast_db=forecast_db,
+                seed=dict(payload),
+                forecast_conn=forecast_conn,
+            )
+        except _ClaimReadDeadlineExceeded:
+            raise
+        except Exception:  # noqa: BLE001 - JIT boundary remains authoritative
+            cycle_boundary = None
+        cycle_boundary_cache[path] = cycle_boundary
+        if (
+            cycle_boundary is not None
+            and cycle_boundary[0] == "awaiting_current_ensemble_hwm"
+        ):
+            # Only a would-be superseded duplicate needs this eager boundary.
+            # Unique/keeper seeds defer the DB read until their actionable turn.
+            awaiting_ensemble.add(path)
+
     remaining: list[Path] = []
     superseded: list[str] = []
     for path in seeds:
         key = keys.get(path)
-        if key is None or path in keepers:
+        if key is None or path in keepers or path in awaiting_ensemble:
             remaining.append(path)
             continue
         newest_path = newest_by_key[key][1]
@@ -4077,6 +4154,50 @@ def _prepare_seed_requests(
     seed_path = Path(seed_dir)
     if not seed_path.exists():
         return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_ABSENT"]
+    if not any(path.is_file() for path in seed_path.glob("*.json")):
+        return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_EMPTY"]
+    forecast_conn: sqlite3.Connection | None = None
+    if forecast_db is not None and Path(forecast_db).exists():
+        try:
+            forecast_conn = _queue_read_only_connection(Path(forecast_db))
+        except _ClaimReadDeadlineExceeded:
+            raise
+        except (sqlite3.Error, OSError):
+            # Preserve the existing fail-closed per-seed classification when
+            # the shared snapshot cannot be opened. No seed is consumed.
+            forecast_conn = None
+    try:
+        return _prepare_seed_requests_with_connection(
+            seed_dir=seed_dir,
+            seed_processed_dir=seed_processed_dir,
+            seed_failed_dir=seed_failed_dir,
+            request_dir=request_dir,
+            forecast_db=forecast_db,
+            forecast_conn=forecast_conn,
+            limit=limit,
+            lane=lane,
+        )
+    finally:
+        if forecast_conn is not None:
+            forecast_conn.close()
+
+
+def _prepare_seed_requests_with_connection(
+    *,
+    seed_dir: Path | str | None,
+    seed_processed_dir: Path | str | None,
+    seed_failed_dir: Path | str | None,
+    request_dir: Path,
+    forecast_db: Path | str | None,
+    forecast_conn: sqlite3.Connection | None,
+    limit: int,
+    lane: str = MATERIALIZATION_LANE_ALL,
+) -> tuple[list[str], list[str], list[str]]:
+    if seed_dir is None:
+        return [], [], []
+    seed_path = Path(seed_dir)
+    if not seed_path.exists():
+        return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_ABSENT"]
     seed_files = tuple(path for path in seed_path.glob("*.json") if path.is_file())
     if not seed_files:
         return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_EMPTY"]
@@ -4102,7 +4223,15 @@ def _prepare_seed_requests(
     current_global_scope = _current_global_auction_scope_families(
         rotated_raw_snapshot
     )
-    never_priced_scope = _never_priced_enqueued_seed_families(forecast_db)
+    try:
+        never_priced_scope = _never_priced_enqueued_seed_families(
+            forecast_db,
+            forecast_conn=forecast_conn,
+        )
+    except TypeError as exc:
+        if "forecast_conn" not in str(exc):
+            raise
+        never_priced_scope = _never_priced_enqueued_seed_families(forecast_db)
     current_priority_scope = (
         current_money_risk | current_global_scope | never_priced_scope
     )
@@ -4158,6 +4287,7 @@ def _prepare_seed_requests(
         raw_window,
         processed_path=processed_path,
         forecast_db=forecast_db,
+        forecast_conn=forecast_conn,
     )
     processed.extend(superseded_seeds)
     if superseded_seeds:
@@ -4170,6 +4300,7 @@ def _prepare_seed_requests(
         seed_payloads,
         current_money_risk=current_money_risk,
         current_global_scope=current_global_scope,
+        forecast_conn=forecast_conn,
     )
     # Background excludes this scope above, so every first-price seed must
     # acquire priority ownership before the lane filter.
@@ -4201,6 +4332,11 @@ def _prepare_seed_requests(
             never_priced_scope=never_priced_scope,
             limit=actionable_limit,
         )
+    ownership_snapshot = _day0_enqueue_ownership_snapshot(
+        forecast_conn,
+        seeds[:inspection_cap],
+        seed_payloads,
+    )
     actionable_count = 0
     inspected_count = 0
     indeterminate_count = 0
@@ -4212,11 +4348,14 @@ def _prepare_seed_requests(
             seed = _load_seed_json(seed_json)
             if not _looks_like_seed(seed):
                 continue
-            ownership_check = _upgrade_day0_seed_has_current_enqueue_ownership(
-                forecast_db=forecast_db,
-                seed_file=seed_json,
-                seed=seed,
-            )
+            ownership_check = ownership_snapshot.get(seed_json)
+            if ownership_check is None:
+                ownership_check = _upgrade_day0_seed_has_current_enqueue_ownership(
+                    forecast_db=forecast_db,
+                    seed_file=seed_json,
+                    seed=seed,
+                    forecast_conn=forecast_conn,
+                )
             ownership = ownership_check.ownership
             if ownership is _Day0EnqueueOwnership.STALE:
                 moved = _move_request(seed_json, processed_path)
@@ -4272,7 +4411,9 @@ def _prepare_seed_requests(
             cycle_boundary = seed_cycle_boundaries.get(seed_json)
             if seed_json not in seed_cycle_boundaries:
                 cycle_boundary = _seed_source_cycle_boundary(
-                    forecast_db=forecast_db, seed=seed
+                    forecast_db=forecast_db,
+                    seed=seed,
+                    forecast_conn=forecast_conn,
                 )
             if (
                 cycle_boundary is not None
@@ -4321,7 +4462,9 @@ def _prepare_seed_requests(
                 actionable_count += 1
                 continue
             if not seed.get("upgrade_trigger") and _seed_already_covered(
-                forecast_db=forecast_db, seed=seed
+                forecast_db=forecast_db,
+                seed=seed,
+                forecast_conn=forecast_conn,
             ):
                 moved = _move_request(seed_json, processed_path)
                 _publish_latest_seed(moved, seed)
@@ -4383,6 +4526,7 @@ def _prepare_seed_requests(
                 forecast_db=forecast_db,
                 seed_file=seed_json,
                 seed=seed,
+                forecast_conn=forecast_conn,
             )
             if ownership_check.ownership is _Day0EnqueueOwnership.STALE:
                 moved = _move_request(seed_json, processed_path)
