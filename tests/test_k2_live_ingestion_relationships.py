@@ -1,6 +1,6 @@
 # Created: 2026-04-13
-# Last reused/audited: 2026-08-28
-# Lifecycle: created=2026-04-13; last_reviewed=2026-08-28; last_reused=2026-08-28
+# Last reused/audited: 2026-09-01
+# Lifecycle: created=2026-04-13; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Protect K2 live-ingestion and backfill relationship contracts.
 # Reuse: Keep tests fixture-backed; inspect source-routing assumptions before extending.
 # Authority basis: K2 live-ingestion packet; P1 daily observation writer provenance packet.
@@ -42,6 +42,7 @@ from src.data import (
     daily_obs_append,
     forecasts_append,
     hourly_instants_append,
+    ogimet_hourly_client,
     solar_append,
 )
 from src.data import ingestion_guard
@@ -196,6 +197,72 @@ def test_R2_daily_obs_catch_up_skips_inapplicable_source(monkeypatch) -> None:
     assert wu_calls == [("Busan", [date(2026, 8, 21)])]
     assert ogimet_calls == [("Istanbul", [date(2026, 8, 21)])]
     assert result["inapplicable_pending_skipped"] == 1
+
+
+def test_R2_ogimet_daily_shards_cover_each_city_once() -> None:
+    seen: list[str] = []
+    for hour in range(24):
+        seen.extend(
+            daily_obs_append._ogimet_city_shard_for_hour(
+                datetime(2026, 9, 2, hour, tzinfo=timezone.utc)
+            )
+        )
+    assert seen == sorted(daily_obs_append.OGIMET_CITIES)
+    assert len(seen) == len(set(seen)) == 48
+
+
+def test_R2_ogimet_catch_up_is_bounded_per_run(monkeypatch) -> None:
+    target = date.today() - timedelta(days=2)
+    rows = [
+        {
+            "city": city,
+            "target_date": target.isoformat(),
+            "data_source": daily_obs_append.daily_observation_source_for_city(
+                city, target
+            ),
+        }
+        for city in ("Atlanta", "Austin", "Beijing")
+    ]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "src.state.data_coverage.find_pending_fills",
+        lambda *args, **kwargs: rows,
+    )
+    monkeypatch.setattr(
+        daily_obs_append,
+        "append_ogimet_city",
+        lambda city, dates, conn, **kwargs: (
+            calls.append(city)
+            or {"inserted": 1, "guard_rejected": 0}
+        ),
+    )
+
+    daily_obs_append.catch_up_missing(
+        object(),
+        days_back=30,
+        max_ogimet_cities=2,
+        rebuild_run_id="test",
+    )
+
+    assert len(calls) == 2
+    assert set(calls) <= {"Atlanta", "Austin", "Beijing"}
+
+
+def test_R2_ogimet_request_starts_respect_quota_cadence(monkeypatch) -> None:
+    monotonic_values = iter((110.0, 121.0, 125.0, 142.0))
+    sleeps: list[float] = []
+    monkeypatch.setattr(ogimet_hourly_client, "_last_ogimet_request_at", 100.0)
+    monkeypatch.setattr(
+        ogimet_hourly_client.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(ogimet_hourly_client.time, "sleep", sleeps.append)
+
+    daily_obs_append._wait_for_ogimet_request_slot()
+    ogimet_hourly_client.wait_for_ogimet_request_slot()
+
+    assert sleeps == [11.0, 17.0]
 
 
 def test_R2_hole_scanner_tick_drains_observation_holes() -> None:
@@ -467,6 +534,33 @@ def test_R4_write_atom_with_coverage_rolls_back_on_failure() -> None:
         "_write_atom_with_coverage leaked an observation row after "
         "savepoint rollback — atomicity contract broken"
     )
+
+
+def test_R4_noaa_daily_atom_converts_raw_celsius_to_settlement_fahrenheit() -> None:
+    """Ogimet raw C must not be persisted as if it were the city's F value."""
+    from src.data.daily_obs_append import _build_atom_pair
+
+    atom_high, atom_low = _build_atom_pair(
+        city_name="Chicago",
+        target_d=date(2026, 8, 24),
+        high_val=20.0,
+        low_val=10.0,
+        raw_unit="C",
+        target_unit="F",
+        station_id="KORD",
+        source="ogimet_metar_kord",
+        rebuild_run_id="test-noaa-unit-conversion",
+        data_source_version="ogimet_v1",
+        api_endpoint="test://ogimet",
+        provenance={},
+    )
+
+    assert atom_high.value == pytest.approx(68.0)
+    assert atom_low.value == pytest.approx(50.0)
+    assert atom_high.raw_value == pytest.approx(20.0)
+    assert atom_low.raw_value == pytest.approx(10.0)
+    assert atom_high.raw_unit == "C"
+    assert atom_high.target_unit == "F"
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +976,8 @@ def test_R8_wu_backfill_persists_provenance_identity(monkeypatch) -> None:
         conn=conn,
         chunk_days=1,
         sleep_seconds=0,
+        start_date=date(2026, 8, 22),
+        end_date=date(2026, 8, 22),
     )
     assert stats["collected"] == 1
 

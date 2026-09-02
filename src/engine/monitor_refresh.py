@@ -3557,7 +3557,7 @@ def _day0_observed_extreme_from_canonical_surface(
         city = cities_by_name.get(city_name)
         if city is None:
             return None
-        priority = source_priority_for_city(city)
+        priority = source_priority_for_city(city, target_date)
         for table_ref in ("world.observation_instants", "observation_instants"):
             try:
                 result = read_day0_observed_extrema(

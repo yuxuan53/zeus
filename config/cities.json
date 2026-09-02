@@ -1,6 +1,6 @@
 {
-  "_coord_note": "All lat/lon coordinates correspond to the airport weather station used by Weather Underground for Polymarket settlement. These MUST match the WU station exactly — do not use downtown or approximate coordinates.",
-  "_settlement_source_discipline": "ROUTINE CHECK NEEDED. Polymarket can change a city's settlement source / station / unit at any time (verified via 2026-04-15 cross-validation: Istanbul and Moscow are NOAA, London moved to EGLC, Jakarta to WIHH, Panama City to MPMG, Taipei moved to Wunderground Songshan/RCSS (was CWA/46692), Tel Aviv moved to NOAA/LLBG (was Wunderground/LLBG), London unit transitioned F->C). Audit all active markets' description fields at least monthly and whenever a recalibration or new city onboarding is planned. Single source of truth: the market description text of the most recent active market for each city. settlement_source_type values: 'wu_icao' (default), 'hko' (Hong Kong Observatory), 'noaa' (weather.gov timeseries), 'cwa_station' (Taiwan Central Weather Administration).",
+  "_coord_note": "All lat/lon coordinates correspond to the physical station named by the current Polymarket settlement source. They MUST match the configured station exactly — do not use downtown or approximate coordinates.",
+  "_settlement_source_discipline": "ROUTINE CHECK NEEDED. Polymarket can change a city's settlement source / station / unit at any time. A 2026-09-02 live audit found a same-station provider migration from Wunderground to NOAA weather.gov across 45 active cities; station coordinates and ICAO identities remained unchanged. Earlier verified exceptions include HKO Hong Kong, WU Jinan/Taipei, and NOAA Istanbul/Moscow/Tel Aviv. Audit all active market descriptions monthly and whenever recalibration or onboarding is planned. Single source of truth: the most recent active market description. settlement_source_type values: 'wu_icao', 'hko', 'noaa', 'cwa_station'.",
   "cities": [
     {
       "name": "Amsterdam",
@@ -18,13 +18,16 @@
       "meteostat_station": null,
       "airport_name": "Amsterdam Airport Schiphol",
       "country_code": "NL",
-      "settlement_source": "https://www.wunderground.com/history/daily/nl/schiphol/EHAM",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=EHAM",
       "timezone": "Europe/Amsterdam",
       "cluster": "Amsterdam",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Ankara",
@@ -42,13 +45,16 @@
       "meteostat_station": null,
       "airport_name": "Esenboga International Airport",
       "country_code": "TR",
-      "settlement_source": "https://www.wunderground.com/history/daily/tr/%C3%A7ubuk/LTAC",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=LTAC",
       "timezone": "Europe/Istanbul",
       "cluster": "Ankara",
       "unit": "C",
       "historical_peak_hour": 15.2,
       "diurnal_amplitude_c": 11.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Atlanta",
@@ -70,7 +76,7 @@
       "meteostat_station": "72219",
       "airport_name": "Hartsfield-Jackson Atlanta International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/ga/atlanta/KATL",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KATL",
       "timezone": "America/New_York",
       "cluster": "Atlanta",
       "unit": "F",
@@ -78,7 +84,10 @@
       "diurnal_amplitude_f": 17.3,
       "weighted_low_calibration_eligible": true,
       "lat": 33.6367,
-      "lon": -84.428101
+      "lon": -84.428101,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Auckland",
@@ -124,7 +133,7 @@
       "meteostat_station": null,
       "airport_name": "Austin-Bergstrom International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/tx/austin/KAUS",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KAUS",
       "timezone": "America/Chicago",
       "cluster": "Austin",
       "unit": "F",
@@ -132,7 +141,10 @@
       "diurnal_amplitude_f": 18.0,
       "weighted_low_calibration_eligible": true,
       "lat": 30.197535,
-      "lon": -97.662015
+      "lon": -97.662015,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Beijing",
@@ -151,13 +163,16 @@
       "meteostat_station": null,
       "airport_name": "Beijing Capital International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/beijing/ZBAA",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZBAA",
       "timezone": "Asia/Shanghai",
       "cluster": "Beijing",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 10.5,
-      "weighted_low_calibration_eligible": false
+      "weighted_low_calibration_eligible": false,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Buenos Aires",
@@ -177,13 +192,16 @@
       "meteostat_station": null,
       "airport_name": "Minister Pistarini International Airport",
       "country_code": "AR",
-      "settlement_source": "https://www.wunderground.com/history/daily/ar/ezeiza/SAEZ",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=SAEZ",
       "timezone": "America/Argentina/Buenos_Aires",
       "cluster": "Buenos Aires",
       "unit": "C",
       "historical_peak_hour": 15.5,
       "diurnal_amplitude_c": 9.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Busan",
@@ -202,13 +220,16 @@
       "meteostat_station": null,
       "airport_name": "Gimhae Intl Airport",
       "country_code": "KR",
-      "settlement_source": "https://www.wunderground.com/history/daily/kr/busan/RKPK",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=RKPK",
       "timezone": "Asia/Seoul",
       "cluster": "Busan",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.5,
-      "weighted_low_calibration_eligible": false
+      "weighted_low_calibration_eligible": false,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Cape Town",
@@ -226,13 +247,16 @@
       "meteostat_station": null,
       "airport_name": "Cape Town Intl Airport",
       "country_code": "ZA",
-      "settlement_source": "https://www.wunderground.com/history/daily/za/matroosfontein/FACT",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=FACT",
       "timezone": "Africa/Johannesburg",
       "cluster": "Cape Town",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 8.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Chengdu",
@@ -250,13 +274,16 @@
       "meteostat_station": null,
       "airport_name": "Chengdu Shuangliu International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/chengdu/ZUUU",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZUUU",
       "timezone": "Asia/Shanghai",
       "cluster": "Chengdu",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 7.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Chicago",
@@ -278,7 +305,7 @@
       "meteostat_station": "72530",
       "airport_name": "O'Hare International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/il/chicago/KORD",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KORD",
       "timezone": "America/Chicago",
       "cluster": "Chicago",
       "unit": "F",
@@ -286,7 +313,10 @@
       "diurnal_amplitude_f": 15.0,
       "weighted_low_calibration_eligible": false,
       "lat": 41.9786,
-      "lon": -87.9048
+      "lon": -87.9048,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Chongqing",
@@ -304,13 +334,16 @@
       "meteostat_station": null,
       "airport_name": "Chongqing Jiangbei International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/chongqing/ZUCK",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZUCK",
       "timezone": "Asia/Shanghai",
       "cluster": "Chongqing",
       "unit": "C",
       "historical_peak_hour": 15.2,
       "diurnal_amplitude_c": 6.8,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Dallas",
@@ -332,7 +365,7 @@
       "meteostat_station": "72258",
       "airport_name": "Dallas Love Field",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/tx/dallas/KDAL",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KDAL",
       "timezone": "America/Chicago",
       "cluster": "Dallas",
       "unit": "F",
@@ -340,7 +373,10 @@
       "diurnal_amplitude_f": 18.6,
       "weighted_low_calibration_eligible": true,
       "lat": 32.844776,
-      "lon": -96.847653
+      "lon": -96.847653,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Denver",
@@ -362,7 +398,7 @@
       "meteostat_station": null,
       "airport_name": "Buckley Space Force Base Station",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/co/aurora/KBKF",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KBKF",
       "timezone": "America/Denver",
       "cluster": "Denver",
       "unit": "F",
@@ -370,7 +406,10 @@
       "diurnal_amplitude_f": 18.4,
       "weighted_low_calibration_eligible": true,
       "lat": 39.701698,
-      "lon": -104.751999
+      "lon": -104.751999,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Guangzhou",
@@ -389,13 +428,16 @@
       "meteostat_station": null,
       "airport_name": "Guangzhou Baiyun International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/guangzhou/ZGGG",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZGGG",
       "timezone": "Asia/Shanghai",
       "cluster": "Guangzhou",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.0,
-      "weighted_low_calibration_eligible": false
+      "weighted_low_calibration_eligible": false,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Helsinki",
@@ -413,13 +455,16 @@
       "meteostat_station": null,
       "airport_name": "Helsinki-Vantaa Airport",
       "country_code": "FI",
-      "settlement_source": "https://www.wunderground.com/history/daily/fi/vantaa/EFHK",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=EFHK",
       "timezone": "Europe/Helsinki",
       "cluster": "Helsinki",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 8.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Hong Kong",
@@ -470,7 +515,7 @@
       "meteostat_station": null,
       "airport_name": "William P. Hobby Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/tx/houston/KHOU",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KHOU",
       "timezone": "America/Chicago",
       "cluster": "Houston",
       "unit": "F",
@@ -478,7 +523,10 @@
       "diurnal_amplitude_f": 15.2,
       "weighted_low_calibration_eligible": false,
       "lat": 29.645336,
-      "lon": -95.276812
+      "lon": -95.276812,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Istanbul",
@@ -570,13 +618,16 @@
       "meteostat_station": null,
       "airport_name": "King Abdulaziz Intl Airport",
       "country_code": "SA",
-      "settlement_source": "https://www.wunderground.com/history/daily/sa/jeddah/OEJN",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=OEJN",
       "timezone": "Asia/Riyadh",
       "cluster": "Jeddah",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Karachi",
@@ -594,13 +645,16 @@
       "meteostat_station": null,
       "airport_name": "Jinnah International Airport",
       "country_code": "PK",
-      "settlement_source": "https://www.wunderground.com/history/daily/pk/karachi/OPKC",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=OPKC",
       "timezone": "Asia/Karachi",
       "cluster": "Karachi",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 9.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Kuala Lumpur",
@@ -619,13 +673,16 @@
       "meteostat_station": null,
       "airport_name": "Kuala Lumpur Intl Airport",
       "country_code": "MY",
-      "settlement_source": "https://www.wunderground.com/history/daily/my/sepang-district/WMKK",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=WMKK",
       "timezone": "Asia/Kuala_Lumpur",
       "cluster": "Kuala Lumpur",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 5.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Lagos",
@@ -667,13 +724,16 @@
       "meteostat_station": null,
       "airport_name": "London City Airport",
       "country_code": "GB",
-      "settlement_source": "https://www.wunderground.com/history/daily/gb/london/EGLC",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=EGLC",
       "timezone": "Europe/London",
       "cluster": "London",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 7.4,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Los Angeles",
@@ -697,7 +757,7 @@
       "meteostat_station": "72295",
       "airport_name": "Los Angeles International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/ca/los-angeles/KLAX",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KLAX",
       "timezone": "America/Los_Angeles",
       "cluster": "Los Angeles",
       "unit": "F",
@@ -705,7 +765,10 @@
       "diurnal_amplitude_f": 11.1,
       "weighted_low_calibration_eligible": true,
       "lat": 33.942501,
-      "lon": -118.407997
+      "lon": -118.407997,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Lucknow",
@@ -723,13 +786,16 @@
       "meteostat_station": null,
       "airport_name": "Chaudhary Charan Singh International Airport",
       "country_code": "IN",
-      "settlement_source": "https://www.wunderground.com/history/daily/in/lucknow/VILK",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=VILK",
       "timezone": "Asia/Kolkata",
       "cluster": "Lucknow",
       "unit": "C",
       "historical_peak_hour": 14.8,
       "diurnal_amplitude_c": 12.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Madrid",
@@ -747,13 +813,16 @@
       "meteostat_station": null,
       "airport_name": "Adolfo Suarez Madrid-Barajas Airport",
       "country_code": "ES",
-      "settlement_source": "https://www.wunderground.com/history/daily/es/madrid/LEMD",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=LEMD",
       "timezone": "Europe/Madrid",
       "cluster": "Madrid",
       "unit": "C",
       "historical_peak_hour": 16.0,
       "diurnal_amplitude_c": 12.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Manila",
@@ -771,13 +840,16 @@
       "meteostat_station": null,
       "airport_name": "Ninoy Aquino International Airport",
       "country_code": "PH",
-      "settlement_source": "https://www.wunderground.com/history/daily/ph/manila/RPLL",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=RPLL",
       "timezone": "Asia/Manila",
       "cluster": "Manila",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 6.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Mexico City",
@@ -797,13 +869,16 @@
       "meteostat_station": null,
       "airport_name": "Mexico City International Airport",
       "country_code": "MX",
-      "settlement_source": "https://www.wunderground.com/history/daily/mx/mexico-city/MMMX",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=MMMX",
       "timezone": "America/Mexico_City",
       "cluster": "Mexico City",
       "unit": "C",
       "historical_peak_hour": 15.5,
       "diurnal_amplitude_c": 11.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Miami",
@@ -825,7 +900,7 @@
       "meteostat_station": "72202",
       "airport_name": "Miami International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/fl/miami/KMIA",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KMIA",
       "timezone": "America/New_York",
       "cluster": "Miami",
       "unit": "F",
@@ -833,7 +908,10 @@
       "diurnal_amplitude_f": 12.1,
       "weighted_low_calibration_eligible": true,
       "lat": 25.796011,
-      "lon": -80.289751
+      "lon": -80.289751,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Milan",
@@ -852,13 +930,16 @@
       "meteostat_station": null,
       "airport_name": "Milan Malpensa Airport",
       "country_code": "IT",
-      "settlement_source": "https://www.wunderground.com/history/daily/it/milan/LIMC",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=LIMC",
       "timezone": "Europe/Rome",
       "cluster": "Milan",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 9.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Moscow",
@@ -902,13 +983,16 @@
       "meteostat_station": null,
       "airport_name": "Munich Airport",
       "country_code": "DE",
-      "settlement_source": "https://www.wunderground.com/history/daily/de/munich/EDDM",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=EDDM",
       "timezone": "Europe/Berlin",
       "cluster": "Munich",
       "unit": "C",
       "historical_peak_hour": 14.8,
       "diurnal_amplitude_c": 8.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "NYC",
@@ -934,7 +1018,7 @@
       "meteostat_station": "72503",
       "airport_name": "LaGuardia Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KLGA",
       "timezone": "America/New_York",
       "cluster": "NYC",
       "unit": "F",
@@ -942,7 +1026,10 @@
       "diurnal_amplitude_f": 11.0,
       "weighted_low_calibration_eligible": false,
       "lat": 40.777199,
-      "lon": -73.872597
+      "lon": -73.872597,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Panama City",
@@ -961,13 +1048,16 @@
       "meteostat_station": null,
       "airport_name": "Marcos A. Gelabert International Airport",
       "country_code": "PA",
-      "settlement_source": "https://www.wunderground.com/history/daily/pa/panama-city/MPMG",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=MPMG",
       "timezone": "America/Panama",
       "cluster": "Panama City",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 4.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Paris",
@@ -985,13 +1075,16 @@
       "meteostat_station": null,
       "airport_name": "Paris-Le Bourget Airport",
       "country_code": "FR",
-      "settlement_source": "https://www.wunderground.com/history/daily/fr/bonneuil-en-france/LFPB",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=LFPB",
       "timezone": "Europe/Paris",
       "cluster": "Paris",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Qingdao",
@@ -1010,13 +1103,16 @@
       "meteostat_station": null,
       "airport_name": "Qingdao Liuting International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/qingdao/ZSQD",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZSQD",
       "timezone": "Asia/Shanghai",
       "cluster": "Qingdao",
       "unit": "C",
       "historical_peak_hour": 14.5,
       "diurnal_amplitude_c": 7.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "San Francisco",
@@ -1042,13 +1138,16 @@
       "meteostat_station": "72494",
       "airport_name": "San Francisco International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/ca/san-francisco/KSFO",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KSFO",
       "timezone": "America/Los_Angeles",
       "cluster": "San Francisco",
       "unit": "F",
       "historical_peak_hour": 16.7,
       "diurnal_amplitude_f": 11.9,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Sao Paulo",
@@ -1068,13 +1167,16 @@
       "meteostat_station": null,
       "airport_name": "Sao Paulo/Guarulhos International Airport",
       "country_code": "BR",
-      "settlement_source": "https://www.wunderground.com/history/daily/br/guarulhos/SBGR",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=SBGR",
       "timezone": "America/Sao_Paulo",
       "cluster": "Sao Paulo",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 8.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Seattle",
@@ -1096,7 +1198,7 @@
       "meteostat_station": "72793",
       "airport_name": "Seattle-Tacoma International Airport",
       "country_code": "US",
-      "settlement_source": "https://www.wunderground.com/history/daily/us/wa/seatac/KSEA",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=KSEA",
       "timezone": "America/Los_Angeles",
       "cluster": "Seattle",
       "unit": "F",
@@ -1104,7 +1206,10 @@
       "diurnal_amplitude_f": 12.2,
       "weighted_low_calibration_eligible": true,
       "lat": 47.447943,
-      "lon": -122.310276
+      "lon": -122.310276,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Seoul",
@@ -1122,13 +1227,16 @@
       "meteostat_station": null,
       "airport_name": "Incheon Intl Airport Station",
       "country_code": "KR",
-      "settlement_source": "https://www.wunderground.com/history/daily/kr/incheon/RKSI",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=RKSI",
       "timezone": "Asia/Seoul",
       "cluster": "Seoul",
       "unit": "C",
       "historical_peak_hour": 14.8,
       "diurnal_amplitude_c": 8.2,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Shanghai",
@@ -1146,13 +1254,16 @@
       "meteostat_station": null,
       "airport_name": "Shanghai Pudong International Airport Station",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/shanghai/ZSPD",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZSPD",
       "timezone": "Asia/Shanghai",
       "cluster": "Shanghai",
       "unit": "C",
       "historical_peak_hour": 14.6,
       "diurnal_amplitude_c": 7.8,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Shenzhen",
@@ -1171,13 +1282,16 @@
       "meteostat_station": null,
       "airport_name": "Shenzhen Bao'an International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/shenzhen/ZGSZ",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZGSZ",
       "timezone": "Asia/Shanghai",
       "cluster": "Shenzhen",
       "unit": "C",
       "historical_peak_hour": 14.3,
       "diurnal_amplitude_c": 6.8,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Singapore",
@@ -1196,13 +1310,16 @@
       "meteostat_station": null,
       "airport_name": "Singapore Changi Airport",
       "country_code": "SG",
-      "settlement_source": "https://www.wunderground.com/history/daily/sg/singapore/WSSS",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=WSSS",
       "timezone": "Asia/Singapore",
       "cluster": "Singapore",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 5.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Taipei",
@@ -1273,13 +1390,16 @@
       "meteostat_station": null,
       "airport_name": "Tokyo Haneda Airport Station",
       "country_code": "JP",
-      "settlement_source": "https://www.wunderground.com/history/daily/jp/tokyo/RJTT",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=RJTT",
       "timezone": "Asia/Tokyo",
       "cluster": "Tokyo",
       "unit": "C",
       "historical_peak_hour": 14.7,
       "diurnal_amplitude_c": 7.6,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Toronto",
@@ -1298,13 +1418,16 @@
       "meteostat_station": null,
       "airport_name": "Toronto Pearson International Airport",
       "country_code": "CA",
-      "settlement_source": "https://www.wunderground.com/history/daily/ca/mississauga/CYYZ",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=CYYZ",
       "timezone": "America/Toronto",
       "cluster": "Toronto",
       "unit": "C",
       "historical_peak_hour": 15.5,
       "diurnal_amplitude_c": 9.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     },
     {
       "name": "Warsaw",
@@ -1323,13 +1446,16 @@
       "meteostat_station": null,
       "airport_name": "Warsaw Chopin Airport",
       "country_code": "PL",
-      "settlement_source": "https://www.wunderground.com/history/daily/pl/warsaw/EPWA",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=EPWA",
       "timezone": "Europe/Warsaw",
       "cluster": "Warsaw",
       "unit": "C",
       "historical_peak_hour": 14.8,
       "diurnal_amplitude_c": 8.8,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Wellington",
@@ -1347,13 +1473,16 @@
       "meteostat_station": null,
       "airport_name": "Wellington International Airport",
       "country_code": "NZ",
-      "settlement_source": "https://www.wunderground.com/history/daily/nz/wellington/NZWN",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=NZWN",
       "timezone": "Pacific/Auckland",
       "cluster": "Wellington",
       "unit": "C",
       "historical_peak_hour": 14.0,
       "diurnal_amplitude_c": 5.5,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Wuhan",
@@ -1371,13 +1500,16 @@
       "meteostat_station": null,
       "airport_name": "Wuhan Tianhe International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/wuhan/ZHHH",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZHHH",
       "timezone": "Asia/Shanghai",
       "cluster": "Wuhan",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 8.0,
-      "weighted_low_calibration_eligible": true
+      "weighted_low_calibration_eligible": true,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-24"
     },
     {
       "name": "Zhengzhou",
@@ -1395,13 +1527,16 @@
       "meteostat_station": null,
       "airport_name": "Zhengzhou Xinzheng International Airport",
       "country_code": "CN",
-      "settlement_source": "https://www.wunderground.com/history/daily/cn/zhengzhou/ZHCC",
+      "settlement_source": "https://www.weather.gov/wrh/timeseries?site=ZHCC",
       "timezone": "Asia/Shanghai",
       "cluster": "Zhengzhou",
       "unit": "C",
       "historical_peak_hour": 15.0,
       "diurnal_amplitude_c": 10.0,
-      "weighted_low_calibration_eligible": false
+      "weighted_low_calibration_eligible": false,
+      "settlement_source_type": "noaa",
+      "previous_settlement_source_type": "wu_icao",
+      "settlement_source_type_effective_date": "2026-08-23"
     }
   ],
   "_source_contract_pending_conversions": [],

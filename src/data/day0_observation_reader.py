@@ -1479,10 +1479,15 @@ def read_day0_observed_extrema(
     )
 
 
-def source_priority_for_city(city: object) -> tuple[str, ...]:
+def source_priority_for_city(
+    city: object,
+    target_date: date | str | None = None,
+) -> tuple[str, ...]:
     """Return settlement-source-specific priority for executable Day0 observations."""
 
-    source_type = str(getattr(city, "settlement_source_type", "") or "wu_icao").strip()
+    from src.config import settlement_source_type_for_city
+
+    source_type = settlement_source_type_for_city(city, target_date).strip()
     station = str(getattr(city, "wu_station", "") or "").strip().lower()
     if source_type == "hko":
         return ("hko_hourly_accumulator",)
@@ -1520,7 +1525,7 @@ def read_day0_observation_context_from_instants(
     unit = str(getattr(city, "settlement_unit", "") or "C")
     if not city_name or not timezone_name:
         return None
-    priority = tuple(source_priority or source_priority_for_city(city))
+    priority = tuple(source_priority or source_priority_for_city(city, target_date))
     result = read_day0_observed_extrema(
         conn,
         city=city_name,

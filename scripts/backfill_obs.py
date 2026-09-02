@@ -73,7 +73,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -143,6 +143,26 @@ class BackfillStats:
     empty_windows: int
 
 
+def _effective_tier_segments(
+    city_name: str,
+    start_date: date,
+    end_date: date,
+) -> list[tuple[Tier, date, date]]:
+    """Split a backfill range where the market resolver family changed."""
+
+    city = cities_by_name[city_name]
+    effective_raw = city.settlement_source_type_effective_date
+    if not effective_raw:
+        return [(tier_for_city(city_name, target_date=start_date), start_date, end_date)]
+    effective = date.fromisoformat(effective_raw)
+    if end_date < effective or start_date >= effective:
+        return [(tier_for_city(city_name, target_date=start_date), start_date, end_date)]
+    return [
+        (tier_for_city(city_name, target_date=start_date), start_date, effective - timedelta(days=1)),
+        (tier_for_city(city_name, target_date=effective), effective, end_date),
+    ]
+
+
 # ----------------------------------------------------------------------
 # Logging
 # ----------------------------------------------------------------------
@@ -190,7 +210,7 @@ def _hourly_obs_to_v2_row(
     Phase 1 HK rows will use 'ICAO_STATION_NATIVE' via a separate code
     path (accumulator, not this driver).
     """
-    source_tag = expected_source_for_city(obs.city)
+    source_tag = expected_source_for_city(obs.city, target_date=obs.target_date)
     provenance_source = _source_locator_for_hourly_obs(
         obs,
         source_tag=source_tag,
@@ -435,15 +455,14 @@ def _backfill_ogimet_city(
     dry_run: bool,
 ) -> BackfillStats:
     city = cities_by_name[city_name]
-    station_map = {
-        "Istanbul": "LTFM",
-        "Moscow": "UUWW",
-        "Tel Aviv": "LLBG",
-    }
-    station = station_map[city_name]
-    unit = city.settlement_unit  # 'C' for all three
+    station = city.wu_station
+    if not station:
+        raise RuntimeError(
+            f"NOAA/Ogimet city {city_name!r} has no configured ICAO station"
+        )
+    unit = city.settlement_unit
     tz_name = city.timezone
-    source_tag = expected_source_for_city(city_name)
+    source_tag = expected_source_for_city(city_name, target_date=start_date)
 
     from datetime import timedelta
 
@@ -675,42 +694,44 @@ def main(argv: Optional[list[str]] = None) -> int:
             all_stats: list[BackfillStats] = []
             unsupported_cities: list[str] = []
             for name in args.cities:
-                tier = tier_for_city(name)
-                if tier is Tier.WU_ICAO:
-                    stats = _backfill_wu_city(
-                        conn, name, args.start, args.end, args.data_version,
-                        args.log, args.dry_run,
+                for tier, segment_start, segment_end in _effective_tier_segments(
+                    name, args.start, args.end
+                ):
+                    if tier is Tier.WU_ICAO:
+                        stats = _backfill_wu_city(
+                            conn, name, segment_start, segment_end, args.data_version,
+                            args.log, args.dry_run,
+                        )
+                    elif tier is Tier.OGIMET_METAR:
+                        stats = _backfill_ogimet_city(
+                            conn, name, segment_start, segment_end, args.data_version,
+                            args.log, args.dry_run,
+                        )
+                    elif tier is Tier.HKO_NATIVE:
+                        unsupported_cities.append(name)
+                        print(
+                            f"SKIP: {name} is Tier HKO_NATIVE; backfill not supported "
+                            "(plan v3 Phase 0 deliberately excludes HK — accumulator-"
+                            "only from deploy forward). Use the hko accumulator path.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    else:  # pragma: no cover
+                        raise RuntimeError(f"Unknown tier {tier!r} for {name!r}")
+                    all_stats.append(stats)
+                    logger.info(
+                        "city=%s tier=%s station=%s rows_written=%d rows_raw=%d "
+                        "rows_ready=%d windows=%d/%d_failed",
+                        stats.city, stats.tier, stats.station, stats.rows_written,
+                        stats.rows_raw, stats.rows_ready, stats.windows_attempted,
+                        stats.windows_failed,
                     )
-                elif tier is Tier.OGIMET_METAR:
-                    stats = _backfill_ogimet_city(
-                        conn, name, args.start, args.end, args.data_version,
-                        args.log, args.dry_run,
-                    )
-                elif tier is Tier.HKO_NATIVE:
-                    unsupported_cities.append(name)
                     print(
-                        f"SKIP: {name} is Tier HKO_NATIVE; backfill not supported "
-                        "(plan v3 Phase 0 deliberately excludes HK — accumulator-"
-                        "only from deploy forward). Use the hko accumulator path.",
-                        file=sys.stderr,
+                        f"{stats.city:16s} tier={stats.tier:13s} station={stats.station:6s} "
+                        f"rows={stats.rows_written:7d}  ready={stats.rows_ready:7d}  "
+                        f"raw={stats.rows_raw:7d}  "
+                        f"windows={stats.windows_attempted}/{stats.windows_failed}_failed"
                     )
-                    continue
-                else:  # pragma: no cover
-                    raise RuntimeError(f"Unknown tier {tier!r} for {name!r}")
-                all_stats.append(stats)
-                logger.info(
-                    "city=%s tier=%s station=%s rows_written=%d rows_raw=%d "
-                    "rows_ready=%d windows=%d/%d_failed",
-                    stats.city, stats.tier, stats.station, stats.rows_written,
-                    stats.rows_raw, stats.rows_ready, stats.windows_attempted,
-                    stats.windows_failed,
-                )
-                print(
-                    f"{stats.city:16s} tier={stats.tier:13s} station={stats.station:6s} "
-                    f"rows={stats.rows_written:7d}  ready={stats.rows_ready:7d}  "
-                    f"raw={stats.rows_raw:7d}  "
-                    f"windows={stats.windows_attempted}/{stats.windows_failed}_failed"
-                )
 
             # Summary footer
             total_written = sum(s.rows_written for s in all_stats)

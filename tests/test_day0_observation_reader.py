@@ -1,7 +1,7 @@
 # Created: 2026-05-22
-# Last reused/audited: 2026-07-20
+# Last reused/audited: 2026-09-01
 # Authority basis: docs/archive/2026-Q2/operations_historical/P0_FORECAST_EXTREMA_AUTHORITY_2026-05-22.md §PR-C
-# Lifecycle: created=2026-05-22; last_reviewed=2026-07-20; last_reused=2026-07-20
+# Lifecycle: created=2026-05-22; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Regression antibody for Root C — high_so_far must be MAX(running_max) not latest row's value.
 # Reuse: Run when day0_observation_reader.read_day0_high_so_far or observation_instants schema changes.
 """Tests for src/data/day0_observation_reader.py — Root C regression antibody.
@@ -38,7 +38,16 @@ from src.data.day0_observation_reader import (
     read_day0_observation_context_from_instants,
     read_day0_observed_extrema,
     same_station_preliminary_report_survival_likelihood,
+    source_priority_for_city,
 )
+
+
+def test_source_priority_uses_target_date_source_family() -> None:
+    from src.config import cities_by_name
+
+    chicago = cities_by_name["Chicago"]
+    assert source_priority_for_city(chicago, "2026-08-22") == ("wu_icao_history",)
+    assert source_priority_for_city(chicago, "2026-08-23") == ("ogimet_metar_kord",)
 
 
 _HKO_OFFICIAL_PROVENANCE = (

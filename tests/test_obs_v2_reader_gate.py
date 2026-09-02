@@ -1,8 +1,8 @@
 # Created: 2026-04-25
-# Lifecycle: created=2026-04-25; last_reviewed=2026-04-25; last_reused=2026-04-25
+# Lifecycle: created=2026-04-25; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Protect P3 obs_v2 reader gates for canonical diurnal analytics.
 # Reuse: Run with tests/test_truth_surface_health.py when changing obs_v2 read predicates.
-# Last reused/audited: 2026-07-19
+# Last reused/audited: 2026-09-01
 # Authority basis: P3 4.5.B-lite observation_instants reader gate packet.
 """Regression coverage for obs_v2 reader-gate consumers."""
 from __future__ import annotations
@@ -406,10 +406,16 @@ def test_temp_persistence_binds_forecasts_reader_and_source_contract() -> None:
     assert etl_temp_persistence.get_read_connection is db_module.get_forecasts_connection_read_only
     nyc_station = etl_temp_persistence.cities_by_name["NYC"].wu_station
     assert etl_temp_persistence._is_canonical_daily_observation(
-        "NYC", "wu_icao_history_revision_2", nyc_station
+        "NYC", "ogimet_metar_klga", nyc_station
     )
     assert not etl_temp_persistence._is_canonical_daily_observation(
-        "NYC", "wu_icao_history_revision_2", "WRONG"
+        "NYC", "ogimet_metar_klga", "WRONG"
+    )
+    assert etl_temp_persistence._is_canonical_daily_observation(
+        "NYC",
+        "wu_icao_history_revision_2",
+        nyc_station,
+        target_date="2026-08-22",
     )
     assert not etl_temp_persistence._is_canonical_daily_observation(
         "NYC", "openmeteo_archive", nyc_station

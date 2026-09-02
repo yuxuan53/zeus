@@ -1,6 +1,6 @@
 # Created: 2026-05-17
-# Lifecycle: created=2026-05-17; last_reviewed=2026-07-23; last_reused=2026-07-23
-# Last reused or audited: 2026-07-23
+# Lifecycle: created=2026-05-17; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused or audited: 2026-09-01
 # Authority basis: docs/archive/2026-Q2/task_2026-05-17_post_karachi_remediation/F44_INVESTIGATION.md
 #   Antibody for F44: observation_instants writer dead since 2026-05-10.
 #   These tests catch the "dead-writer" category permanently by asserting
@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
-from datetime import date, timedelta
+import inspect
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -421,6 +422,64 @@ def test_obs_v2_live_tick_does_not_hold_writer_lock_across_city_fetch(monkeypatc
     assert [r.rows_written for r in results] == [1, 1]
     assert lock_entries == 2
     assert not lock_held
+
+
+def test_ogimet_live_tick_shards_cover_each_noaa_city_once_daily() -> None:
+    import scripts.obs_live_tick as obs_tick
+
+    names = sorted(
+        name
+        for name in obs_tick.cities_by_name
+        if obs_tick.tier_for_city(name) is obs_tick.Tier.OGIMET_METAR
+    )
+    seen: list[str] = []
+    for hour in range(24):
+        seen.extend(
+            obs_tick._ogimet_city_shard_for_hour(
+                names,
+                datetime(2026, 9, 2, hour, tzinfo=timezone.utc),
+            )
+        )
+    assert seen == names
+    assert len(seen) == len(set(seen)) == 48
+
+
+def test_fast_obs_tick_can_exclude_slow_ogimet_mirror(monkeypatch, tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    import scripts.obs_live_tick as obs_tick
+
+    monkeypatch.setattr(
+        obs_tick,
+        "cities_by_name",
+        {"Istanbul": SimpleNamespace(timezone="Europe/Istanbul")},
+    )
+    monkeypatch.setattr(
+        obs_tick,
+        "tier_for_city",
+        lambda _name: obs_tick.Tier.OGIMET_METAR,
+    )
+    monkeypatch.setattr(
+        obs_tick,
+        "_tick_ogimet_city",
+        lambda *_args, **_kwargs: pytest.fail("slow Ogimet lane must be excluded"),
+    )
+
+    results = obs_tick.run_live_tick(
+        city_filter=["Istanbul"],
+        dry_run=True,
+        log_path=tmp_path / "obs.jsonl",
+        include_ogimet=False,
+    )
+
+    assert results == []
+
+
+def test_ingest_fast_tick_uses_direct_metar_lane_not_slow_ogimet() -> None:
+    import src.ingest_main as ingest_main
+
+    source = inspect.getsource(ingest_main._k2_obs_fast_tick)
+    assert "include_ogimet=False" in source
 
 
 def test_obs_v2_live_tick_does_not_use_openmeteo_source() -> None:

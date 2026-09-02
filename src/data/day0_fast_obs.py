@@ -209,6 +209,7 @@ class FastObsSource:
     source_id: str
     station_id: str
     authority: str  # provenance authority class for the stream
+    settlement_source_type: str = ""
     notes: str = ""
     #: Settlement units a reading is shifted by, toward the absorbing
     #: direction, before it may enter the day0 running belief. 0.0 for a
@@ -696,7 +697,10 @@ def latest_fast_station_conditioning(
     )
 
 
-def fast_obs_source_for_city(city: Any) -> Optional[FastObsSource]:
+def fast_obs_source_for_city(
+    city: Any,
+    target_date: date | str | None = None,
+) -> Optional[FastObsSource]:
     """Resolve the fast-lane source for a city, or None when no free fast lane.
 
     Registry policy (operator constraint: free sources only):
@@ -711,13 +715,16 @@ def fast_obs_source_for_city(city: Any) -> Optional[FastObsSource]:
         its own client/lane (settlement_source_type='hko' settles on HKO, not
         WU; cross-source semantics differ). SPEC'd, not wired in this pass.
     """
-    source_type = str(getattr(city, "settlement_source_type", "") or "")
+    from src.config import settlement_source_type_for_city
+
+    source_type = settlement_source_type_for_city(city, target_date)
     station = str(getattr(city, "wu_station", "") or "").strip().upper()
     if source_type == "noaa" and station:
         return FastObsSource(
             source_id=FAST_OBS_SOURCE_ID,
             station_id=station,
             authority="ICAO_STATION_NATIVE",
+            settlement_source_type="noaa",
             notes="same physical NOAA settlement station; direct NOAA/NWS distribution",
         )
     if source_type == "wu_icao" and station:
@@ -759,6 +766,7 @@ def fast_obs_source_for_city(city: Any) -> Optional[FastObsSource]:
             source_id=FAST_OBS_SOURCE_ID,
             station_id=station,
             authority="ICAO_STATION_NATIVE",
+            settlement_source_type="wu_icao",
             notes="same physical settlement station as WU; NOAA/NWS distribution",
             margin_units=margin_units,
         )
@@ -1571,12 +1579,16 @@ def fast_obs_to_day0_observation(
     )
     expected_station = str(getattr(city, "wu_station", "") or "").strip().upper()
     station_match = "MATCH" if expected_station and extremes.station_id == expected_station else "MISMATCH"
-    source_type = str(getattr(city, "settlement_source_type", "") or "")
+    expected_source = fast_obs_source_for_city(city, target_date=extremes.target_date)
     source_match = (
         "MATCH"
         if (
             source.source_id == FAST_OBS_SOURCE_ID
-            and source_type in {"wu_icao", "noaa"}
+            and expected_source is not None
+            and source.station_id == expected_source.station_id
+            and source.authority == expected_source.authority
+            and source.settlement_source_type
+            == expected_source.settlement_source_type
             and station_match == "MATCH"
         )
         else "MISMATCH"
@@ -1659,13 +1671,14 @@ def read_noaa_fast_obs_context_from_ledger(
     and samples inside the settlement-local target day.
     """
 
+    from src.config import settlement_source_type_for_city
+
     if (
-        str(getattr(city, "settlement_source_type", "") or "").strip().lower()
-        != "noaa"
+        settlement_source_type_for_city(city, target_date).strip().lower() != "noaa"
         or decision_time.tzinfo is None
     ):
         return None
-    source = fast_obs_source_for_city(city)
+    source = fast_obs_source_for_city(city, target_date=target_date)
     if source is None or source.source_id != FAST_OBS_SOURCE_ID:
         return None
     city_name = str(getattr(city, "name", "") or "").strip()

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
-from src.config import runtime_cities_by_name
+from src.config import runtime_cities_by_name, settlement_source_type_for_city
 from src.contracts.settlement_semantics import SettlementSemantics
 from src.events.day0_authority import (
     day0_evidence_finality,
@@ -61,9 +61,10 @@ def build_day0_extreme_updated_event(
 
     city_name = str(observation["city"])
     city_config = runtime_cities_by_name().get(city_name)
-    settlement_source_type = str(
-        getattr(city_config, "settlement_source_type", "") or ""
-    ).strip().lower()
+    settlement_source_type = _effective_source_type(
+        city_config,
+        str(observation["target_date"]),
+    )
     raw_value = float(observation["raw_value"])
     rounded_value = int(settlement_semantics.round_single(raw_value))
     payload = Day0ExtremeUpdatedPayload(
@@ -581,7 +582,9 @@ class Day0ExtremeUpdatedTrigger:
             if city_config is None:
                 continue
             station_id = str((fact or {}).get("station_id") or "").strip().upper()
-            expected_station = _expected_station_for_city(city_config)
+            expected_station = _expected_station_for_city(
+                city_config, target_date
+            )
             unit = str((fact or {}).get("unit") or "").strip().upper()
             expected_unit = str(
                 getattr(city_config, "settlement_unit", "") or ""
@@ -599,7 +602,7 @@ class Day0ExtremeUpdatedTrigger:
                 "MATCH"
                 if _source_matches_config(
                     observation_source,
-                    str(getattr(city_config, "settlement_source_type", "") or ""),
+                    _effective_source_type(city_config, target_date),
                 )
                 else "MISMATCH"
             )
@@ -841,8 +844,8 @@ def observation_instant_row_to_day0_observation(row: dict[str, Any], *, metric: 
     trusted_native = str(row.get("authority") or "").upper() == "ICAO_STATION_NATIVE"
     source = str(row.get("source") or "")
     if city_config:
-        source_type = str(getattr(city_config, "settlement_source_type", "") or "")
-        expected_station = _expected_station_for_city(city_config)
+        source_type = _effective_source_type(city_config, target_date)
+        expected_station = _expected_station_for_city(city_config, target_date)
         source_match = "MATCH" if _source_matches_config(source, source_type) else "MISMATCH"
         station_match = "MATCH" if _station_matches(station_id, expected_station) else "MISMATCH"
         rounding_status = "MATCH" if unit == expected_unit else "MISMATCH"
@@ -929,12 +932,12 @@ def observation_context_to_live_observation(
     observation_time = str(getattr(observation, "observation_time", "") or "")
     available_at = str(getattr(observation, "observation_available_at", "") or "")
     station_id = str(getattr(observation, "station_id", "") or "").strip().upper()
-    expected_station = _expected_station_for_city(city)
+    expected_station = _expected_station_for_city(city, target_date)
     source = str(getattr(observation, "source", "") or "")
     coverage_status = str(getattr(observation, "coverage_status", "") or "").upper()
     unit = str(getattr(observation, "unit", "") or "").upper()
     city_unit = str(getattr(city, "settlement_unit", "") or "").upper()
-    city_source_type = str(getattr(city, "settlement_source_type", "") or "")
+    city_source_type = _effective_source_type(city, target_date)
 
     local_date_status, dst_status = _observation_local_date_status(
         observation_time=observation_time,
@@ -1014,10 +1017,21 @@ def _station_matches(station_id: str, expected_station: str) -> bool:
     return station_id == expected_station or station_id.startswith(f"{expected_station}:")
 
 
-def _expected_station_for_city(city: Any) -> str:
+def _effective_source_type(city: Any, target_date: str) -> str:
     if city is None:
         return ""
-    if str(getattr(city, "settlement_source_type", "") or "") == "hko":
+    return str(settlement_source_type_for_city(city, target_date) or "").strip().lower()
+
+
+def _expected_station_for_city(city: Any, target_date: str | None = None) -> str:
+    if city is None:
+        return ""
+    source_type = (
+        _effective_source_type(city, target_date)
+        if target_date is not None
+        else str(getattr(city, "settlement_source_type", "") or "").strip().lower()
+    )
+    if source_type == "hko":
         return "HKO"
     return str(getattr(city, "wu_station", "") or "").strip().upper()
 

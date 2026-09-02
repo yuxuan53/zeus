@@ -48,7 +48,7 @@ from datetime import date
 from enum import Enum
 from typing import Optional
 
-from src.config import cities_by_name
+from src.config import cities_by_name, settlement_source_type_for_city
 
 
 class Tier(Enum):
@@ -152,42 +152,43 @@ def _build_tier_schedule() -> dict[str, Tier]:
 TIER_SCHEDULE: dict[str, Tier] = _build_tier_schedule()
 
 
-# Per-tier source whitelist (antibody A2). Keep in sync with the source_tag
-# strings the hourly clients actually emit.
-TIER_ALLOWED_SOURCES: dict[Tier, frozenset[str]] = {
-    Tier.WU_ICAO: frozenset({"wu_icao_history"}),
-    Tier.OGIMET_METAR: frozenset(
-        {
-            "ogimet_metar_ltfm",  # Istanbul (NOAA-mirrored)
-            "ogimet_metar_uuww",  # Moscow (NOAA-mirrored)
-            "ogimet_metar_llbg",  # Tel Aviv (NOAA-mirrored)
-        }
-    ),
-    Tier.HKO_NATIVE: frozenset({"hko_hourly_accumulator"}),
-}
-
-
-# Per-city expected source (antibody A2-strong). The Ogimet tier has
-# three distinct source tags — one per station — so the tier-level
-# whitelist above is necessary but not sufficient. This mapping collapses
-# to a single expected source per city, catching cross-station mis-writes
-# (e.g. Moscow row with LLBG source) at write time instead of audit time.
 def _ogimet_source_for_icao(icao: str) -> str:
     """Canonical Ogimet source tag for an ICAO station."""
     return f"ogimet_metar_{icao.lower()}"
 
 
+def _configured_ogimet_sources() -> frozenset[str]:
+    sources: set[str] = set()
+    for city in cities_by_name.values():
+        if city.settlement_source_type != "noaa":
+            continue
+        station = str(city.wu_station or "").strip()
+        if not station:
+            raise UnsupportedTierError(
+                reason=f"NOAA city {city.name!r} has no settlement ICAO station"
+            )
+        sources.add(_ogimet_source_for_icao(station))
+    return frozenset(sources)
+
+
+# Per-tier source whitelist (antibody A2). Keep in sync with the source_tag
+# strings the hourly clients actually emit.
+TIER_ALLOWED_SOURCES: dict[Tier, frozenset[str]] = {
+    Tier.WU_ICAO: frozenset({"wu_icao_history"}),
+    Tier.OGIMET_METAR: _configured_ogimet_sources(),
+    Tier.HKO_NATIVE: frozenset({"hko_hourly_accumulator"}),
+}
+
+
+# Per-city expected source (antibody A2-strong). Each NOAA city has a source
+# tag derived from its configured settlement ICAO, so the tier-level whitelist
+# is necessary but not sufficient. This catches cross-station writes at the
+# writer boundary without maintaining a second city list.
 def _build_expected_source_by_city() -> dict[str, str]:
     """Primary source per city. Iterates ``TIER_SCHEDULE`` directly (not
     ``cities_in_tier``) because this helper runs at module-import time,
     before ``cities_in_tier`` is bound to a name.
     """
-    # Ogimet tier: source tag encodes the specific station.
-    _OGIMET_STATION_MAP = {
-        "Istanbul": "ogimet_metar_ltfm",
-        "Moscow": "ogimet_metar_uuww",
-        "Tel Aviv": "ogimet_metar_llbg",
-    }
     expected: dict[str, str] = {}
     for name, tier in TIER_SCHEDULE.items():
         if tier is Tier.WU_ICAO:
@@ -195,15 +196,15 @@ def _build_expected_source_by_city() -> dict[str, str]:
             # station_id disambiguates downstream queries.
             expected[name] = "wu_icao_history"
         elif tier is Tier.OGIMET_METAR:
-            if name not in _OGIMET_STATION_MAP:
+            station = str(cities_by_name[name].wu_station or "").strip()
+            if not station:
                 raise UnsupportedTierError(
                     reason=(
-                        f"Ogimet city {name!r} has no station→source "
-                        "mapping. Add to _OGIMET_STATION_MAP in "
-                        "tier_resolver.py."
+                        f"Ogimet city {name!r} has no configured settlement "
+                        "ICAO station."
                     )
                 )
-            expected[name] = _OGIMET_STATION_MAP[name]
+            expected[name] = _ogimet_source_for_icao(station)
         elif tier is Tier.HKO_NATIVE:
             expected[name] = "hko_hourly_accumulator"
         else:  # pragma: no cover - defensive, Tier enum is closed
@@ -257,7 +258,44 @@ ALLOWED_SOURCES_BY_CITY: dict[str, frozenset[str]] = (
 )
 
 
-def expected_source_for_city(city_name: str) -> str:
+def _primary_source_for_tier(city_name: str, tier: Tier) -> str:
+    city = cities_by_name[city_name]
+    if tier is Tier.WU_ICAO:
+        return "wu_icao_history"
+    if tier is Tier.OGIMET_METAR:
+        station = str(city.wu_station or "").strip()
+        if not station:
+            raise UnsupportedTierError(
+                reason=f"Ogimet city {city_name!r} has no configured ICAO station"
+            )
+        return _ogimet_source_for_icao(station)
+    if tier is Tier.HKO_NATIVE:
+        return "hko_hourly_accumulator"
+    raise UnsupportedTierError(reason=f"Tier {tier!r} has no primary source")
+
+
+def _allowed_sources_for_tier(city_name: str, tier: Tier) -> frozenset[str]:
+    city = cities_by_name[city_name]
+    if tier is Tier.WU_ICAO:
+        station = str(city.wu_station or "").strip()
+        if not station:
+            raise UnsupportedTierError(
+                reason=f"WU city {city_name!r} has no configured ICAO station"
+            )
+        return frozenset(
+            {
+                "wu_icao_history",
+                _ogimet_source_for_icao(station),
+                f"meteostat_bulk_{station.lower()}",
+            }
+        )
+    return frozenset({_primary_source_for_tier(city_name, tier)})
+
+
+def expected_source_for_city(
+    city_name: str,
+    target_date: Optional[date | str] = None,
+) -> str:
     """Return the PRIMARY source string for *city_name*.
 
     Primary is what the main-path backfill driver writes by default.
@@ -271,10 +309,18 @@ def expected_source_for_city(city_name: str) -> str:
                 "tier_resolver may be out of sync with cities.json."
             )
         )
-    return EXPECTED_SOURCE_BY_CITY[city_name]
+    if target_date is None:
+        return EXPECTED_SOURCE_BY_CITY[city_name]
+    return _primary_source_for_tier(
+        city_name,
+        tier_for_city(city_name, target_date=target_date),
+    )
 
 
-def allowed_sources_for_city(city_name: str) -> frozenset[str]:
+def allowed_sources_for_city(
+    city_name: str,
+    target_date: Optional[date | str] = None,
+) -> frozenset[str]:
     """Return every source tag the writer accepts for *city_name* (A2 set).
 
     Includes the primary source plus any documented coverage-fill source. A row whose
@@ -288,7 +334,12 @@ def allowed_sources_for_city(city_name: str) -> frozenset[str]:
                 "tier_resolver may be out of sync with cities.json."
             )
         )
-    return ALLOWED_SOURCES_BY_CITY[city_name]
+    if target_date is None:
+        return ALLOWED_SOURCES_BY_CITY[city_name]
+    return _allowed_sources_for_tier(
+        city_name,
+        tier_for_city(city_name, target_date=target_date),
+    )
 
 
 def _is_model_source_tag(source_tag: str) -> bool:
@@ -301,6 +352,7 @@ def source_role_assessment_for_city_source(
     source_tag: Optional[str],
     *,
     has_provenance: bool = False,
+    target_date: Optional[date | str] = None,
 ) -> SourceRoleAssessment:
     """Return the P1.1 source role and training flag for a city/source tag.
 
@@ -328,9 +380,9 @@ def source_role_assessment_for_city_source(
         )
 
     try:
-        tier = tier_for_city(city_name)
-        primary_source = expected_source_for_city(city_name)
-        allowed_sources = allowed_sources_for_city(city_name)
+        tier = tier_for_city(city_name, target_date=target_date)
+        primary_source = expected_source_for_city(city_name, target_date=target_date)
+        allowed_sources = allowed_sources_for_city(city_name, target_date=target_date)
     except UnsupportedTierError:
         return SourceRoleAssessment(
             source_role=SOURCE_ROLE_UNKNOWN,
@@ -386,16 +438,21 @@ def training_allowed_for_city_source(
     source_tag: Optional[str],
     *,
     has_provenance: bool = False,
+    target_date: Optional[date | str] = None,
 ) -> bool:
     """Return whether the city/source tag is training-eligible in P1.1."""
     return source_role_assessment_for_city_source(
         city_name,
         source_tag,
         has_provenance=has_provenance,
+        target_date=target_date,
     ).training_allowed
 
 
-def tier_for_city(city_name: str, target_date: Optional[date] = None) -> Tier:
+def tier_for_city(
+    city_name: str,
+    target_date: Optional[date | str] = None,
+) -> Tier:
     """Resolve *city_name* to its hourly-observation tier.
 
     Parameters
@@ -404,10 +461,7 @@ def tier_for_city(city_name: str, target_date: Optional[date] = None) -> Tier:
         Must be a key in ``src.config.cities_by_name``. Raises
         ``UnsupportedTierError`` if unknown.
     target_date:
-        Accepted for forward compatibility with future date-range
-        schedules (e.g. a city migrating mid-2025 would use the pre-
-        and post-migration tier depending on ``target_date``). Ignored
-        today; Phase 0 tier is scalar per city.
+        Selects the resolver family effective for that local target date.
 
     Returns
     -------
@@ -419,8 +473,6 @@ def tier_for_city(city_name: str, target_date: Optional[date] = None) -> Tier:
     UnsupportedTierError
         If *city_name* is unknown or its sstype lacks a tier mapping.
     """
-    # target_date intentionally unused today; documented for API stability.
-    del target_date
     if city_name not in TIER_SCHEDULE:
         raise UnsupportedTierError(
             reason=(
@@ -428,7 +480,21 @@ def tier_for_city(city_name: str, target_date: Optional[date] = None) -> Tier:
                 "config/cities.json first."
             )
         )
-    return TIER_SCHEDULE[city_name]
+    if target_date is None:
+        return TIER_SCHEDULE[city_name]
+    source_type = settlement_source_type_for_city(
+        cities_by_name[city_name],
+        target_date,
+    )
+    tier = _SSTYPE_TO_TIER.get(source_type)
+    if tier is None:
+        raise UnsupportedTierError(
+            reason=(
+                f"{city_name}: effective settlement_source_type={source_type!r} "
+                "has no tier mapping"
+            )
+        )
+    return tier
 
 
 def cities_in_tier(tier: Tier) -> frozenset[str]:

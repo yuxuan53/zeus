@@ -2222,7 +2222,17 @@ def _parse_event(
             event.get("id") or event.get("slug"),
         )
         return None
-    source_contract = _check_source_contract(event, city)
+    # Source family is target-date scoped. Provider migrations preserve old
+    # resolver truth for historical replay while current markets use the new
+    # family; station identity remains checked independently.
+    target_date = _parse_target_date(event, city)
+    if target_date is None:
+        return None
+    source_contract = _check_source_contract(
+        event,
+        city,
+        target_date=target_date,
+    )
     if source_contract.status in {"AMBIGUOUS", "MISMATCH", "UNSUPPORTED"}:
         logger.warning(
             "Rejecting Gamma market source contract mismatch: city=%s status=%s "
@@ -2233,11 +2243,6 @@ def _parse_event(
             event.get("id") or event.get("slug"),
             list(source_contract.resolution_sources),
         )
-        return None
-
-    # Parse target date from slug or end date
-    target_date = _parse_target_date(event, city)
-    if target_date is None:
         return None
 
     # Check time to resolution
@@ -2596,12 +2601,21 @@ def _extract_station_id(source: str, city: City) -> str | None:
     return None
 
 
-def _check_source_contract(event: dict, city: City) -> SourceContractCheck:
+def _check_source_contract(
+    event: dict,
+    city: City,
+    *,
+    target_date: str | None = None,
+) -> SourceContractCheck:
     """Compare Gamma resolutionSource metadata against configured settlement source."""
     structured_sources = _collect_structured_resolution_sources(event)
     sources = structured_sources or _collect_description_resolution_sources(event)
     source_label = "resolutionSource" if structured_sources else "market description"
-    expected_family = city.settlement_source_type or "wu_icao"
+    effective_target_date = target_date or _parse_target_date(event, city)
+    expected_family = runtime_config.settlement_source_type_for_city(
+        city,
+        effective_target_date,
+    )
     expected_station = _configured_station_id(city)
 
     if not sources:

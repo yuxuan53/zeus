@@ -1,4 +1,4 @@
-# Lifecycle: created=2026-04-21; last_reviewed=2026-04-24; last_reused=2026-04-24
+# Lifecycle: created=2026-04-21; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Pin tier resolver source routing and P1.1 source-role eligibility semantics.
 # Reuse: Run before changing source-tier, source-role, or training-eligibility rules.
 # Authority basis: plan v3 antibody A3 (.omc/plans/observation-instants-
@@ -14,6 +14,8 @@ The tests also pin the HK/VHHH-error lesson: Hong Kong MUST be
 ``Tier.HKO_NATIVE``, never WU, never OpenMeteo.
 """
 from __future__ import annotations
+
+from datetime import date
 
 import pytest
 
@@ -118,18 +120,29 @@ def test_allowed_sources_no_openmeteo_prefix():
             assert "openmeteo" not in s.lower(), f"{tier} accepts {s!r} (contains openmeteo)"
 
 
-def test_target_date_param_is_accepted_and_ignored():
-    """Forward-compat: the ``target_date`` parameter exists and is ignored today.
-
-    When a future migration needs date-range tiers, the signature won't
-    have to change — callers already pass ``target_date``.
-    """
+def test_target_date_does_not_change_city_without_transition():
     from datetime import date
 
-    t1 = tier_for_city("Chicago")
-    t2 = tier_for_city("Chicago", target_date=date(2024, 1, 1))
-    t3 = tier_for_city("Chicago", target_date=date(2030, 12, 31))
+    t1 = tier_for_city("Jinan")
+    t2 = tier_for_city("Jinan", target_date=date(2024, 1, 1))
+    t3 = tier_for_city("Jinan", target_date=date(2030, 12, 31))
     assert t1 == t2 == t3 == Tier.WU_ICAO
+
+
+def test_same_station_provider_transition_is_target_date_scoped():
+    assert tier_for_city("Chicago", target_date=date(2026, 8, 22)) is Tier.WU_ICAO
+    assert (
+        tier_for_city("Chicago", target_date=date(2026, 8, 23))
+        is Tier.OGIMET_METAR
+    )
+    assert (
+        expected_source_for_city("Chicago", target_date=date(2026, 8, 22))
+        == "wu_icao_history"
+    )
+    assert (
+        expected_source_for_city("Chicago", target_date=date(2026, 8, 23))
+        == "ogimet_metar_kord"
+    )
 
 
 def test_schedule_has_51_cities():
@@ -142,17 +155,22 @@ def test_schedule_has_51_cities():
     assert len(TIER_SCHEDULE) == 54, f"expected 54 cities, got {len(TIER_SCHEDULE)}"
 
 
-def test_tier_split_matches_plan_v3():
-    """Phase 0 plan v3 declares 47 WU + 3 Ogimet + 1 HKO = 51; Qingdao adds 1 WU = 52;
-    Jinan + Zhengzhou (both wu_icao per src/config.py:370) add 2 more WU = 54."""
-    assert len(cities_in_tier(Tier.WU_ICAO)) == 50
-    assert len(cities_in_tier(Tier.OGIMET_METAR)) == 3
+def test_tier_split_matches_current_source_contract():
+    """The 2026-09-02 resolver audit moved 45 same-station cities to NOAA."""
+    assert len(cities_in_tier(Tier.WU_ICAO)) == 5
+    assert len(cities_in_tier(Tier.OGIMET_METAR)) == 48
     assert len(cities_in_tier(Tier.HKO_NATIVE)) == 1
 
 
-def test_ogimet_tier_cities_are_istanbul_moscow_tel_aviv():
-    """Pins the Tier 2 membership to the three NOAA-settled cities."""
-    assert set(cities_in_tier(Tier.OGIMET_METAR)) == {"Istanbul", "Moscow", "Tel Aviv"}
+def test_non_noaa_city_set_is_explicit():
+    assert set(cities_by_name) - set(cities_in_tier(Tier.OGIMET_METAR)) == {
+        "Auckland",
+        "Hong Kong",
+        "Jakarta",
+        "Jinan",
+        "Lagos",
+        "Taipei",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -183,7 +201,7 @@ def test_wu_cities_allow_both_primary_and_ogimet_fallback():
 
 def test_ogimet_cities_have_no_fallback():
     """Tier 2 cities are already Ogimet — no secondary source defined."""
-    for city in ("Istanbul", "Moscow", "Tel Aviv"):
+    for city in cities_in_tier(Tier.OGIMET_METAR):
         allowed = allowed_sources_for_city(city)
         assert len(allowed) == 1
         assert expected_source_for_city(city) in allowed
@@ -221,7 +239,7 @@ def test_allowed_sources_never_contains_openmeteo():
 
 def test_registry_wu_primary_source_is_historical_hourly_and_training_eligible():
     assessment = source_role_assessment_for_city_source(
-        "Chicago",
+        "Jinan",
         "wu_icao_history",
         has_provenance=True,
     )
@@ -230,10 +248,10 @@ def test_registry_wu_primary_source_is_historical_hourly_and_training_eligible()
     assert assessment.training_allowed is True
 
 
-@pytest.mark.parametrize("source_tag", ["ogimet_metar_kord", "meteostat_bulk_kord"])
+@pytest.mark.parametrize("source_tag", ["ogimet_metar_zsjn", "meteostat_bulk_zsjn"])
 def test_registry_wu_coverage_fill_sources_are_not_training_eligible(source_tag):
     assessment = source_role_assessment_for_city_source(
-        "Chicago",
+        "Jinan",
         source_tag,
         has_provenance=True,
     )
@@ -268,7 +286,7 @@ def test_registry_hko_accumulator_is_runtime_monitoring_not_training():
 @pytest.mark.parametrize("source_tag", [None, "", "banana"])
 def test_registry_unknown_or_missing_source_tags_are_not_training_eligible(source_tag):
     assessment = source_role_assessment_for_city_source(
-        "Chicago",
+        "Jinan",
         source_tag,
         has_provenance=True,
     )
@@ -280,7 +298,7 @@ def test_registry_unknown_or_missing_source_tags_are_not_training_eligible(sourc
 @pytest.mark.parametrize("source_tag", ["openmeteo_archive_hourly", "model_grid_hourly"])
 def test_registry_model_tags_are_model_only_and_not_training_eligible(source_tag):
     assessment = source_role_assessment_for_city_source(
-        "Chicago",
+        "Jinan",
         source_tag,
         has_provenance=True,
     )
@@ -292,7 +310,7 @@ def test_registry_model_tags_are_model_only_and_not_training_eligible(source_tag
 @pytest.mark.parametrize(
     ("city_name", "source_tag"),
     [
-        ("Chicago", "wu_icao_history"),
+        ("Jinan", "wu_icao_history"),
         ("Moscow", "ogimet_metar_uuww"),
     ],
 )
@@ -312,18 +330,18 @@ def test_registry_primary_sources_require_provenance_for_training_eligibility(
 
 def test_registry_convenience_helpers_match_assessment():
     assessment = source_role_assessment_for_city_source(
-        "Chicago",
+        "Jinan",
         "wu_icao_history",
         has_provenance=True,
     )
 
     assert (
-        source_role_for_city_source("Chicago", "wu_icao_history")
+        source_role_for_city_source("Jinan", "wu_icao_history")
         == assessment.source_role
     )
     assert (
         training_allowed_for_city_source(
-            "Chicago",
+            "Jinan",
             "wu_icao_history",
             has_provenance=True,
         )

@@ -110,7 +110,7 @@ def _find_gaps(
     for city, td, h in rows:
         if cities_set is not None and city not in cities_set:
             continue
-        t = tier_for_city(city)
+        t = tier_for_city(city, target_date=td)
         if t in (Tier.WU_ICAO, Tier.OGIMET_METAR):
             out.append((city, td, int(h)))
     return out
@@ -134,7 +134,7 @@ def _fill_one_date(
       fetch missed UTC hours belonging to the first/last local date.
     """
     city = cities_by_name[city_name]
-    tier = tier_for_city(city_name)
+    tier = tier_for_city(city_name, target_date=target_date)
     if tier is Tier.WU_ICAO:
         icao = city.wu_station
         source_tag = f"ogimet_metar_{icao.lower()}"
@@ -142,12 +142,11 @@ def _fill_one_date(
     elif tier is Tier.OGIMET_METAR:
         # Use the primary Ogimet source; station is the same one the
         # main driver already uses.
-        _OGIMET_STATION_MAP = {
-            "Istanbul": "LTFM",
-            "Moscow": "UUWW",
-            "Tel Aviv": "LLBG",
-        }
-        icao = _OGIMET_STATION_MAP[city_name]
+        icao = city.wu_station
+        if not icao:
+            raise RuntimeError(
+                f"NOAA/Ogimet city {city_name!r} has no configured ICAO station"
+            )
         source_tag = f"ogimet_metar_{icao.lower()}"
         tier_label = "OGIMET_METAR_BOUNDARY_FILL"
     else:

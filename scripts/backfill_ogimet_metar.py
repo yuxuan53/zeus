@@ -6,32 +6,22 @@
 
 Why this exists (2026-04-14)
 ----------------------------
-Zeus has three cities whose Polymarket settlement source is NOT Weather
-Underground: Istanbul (NOAA LTFM), Moscow (NOAA UUWW), and Taipei (Taiwan
-CWA station 46692). NOAA's public `weather.gov/wrh/timeseries` endpoint is
-server-rendered HTML; CWA's open data API requires an authorization token.
-Ogimet is a free, unauthenticated public mirror of the same global METAR
-(for ICAO airports) and SYNOP (for WMO synoptic stations) streams that
-feed NOAA and CWA. For LTFM and UUWW the underlying METAR report is
-byte-identical to what NOAA serves; for Taipei 46692 the SYNOP report is
-byte-identical to what CWA archives. Using Ogimet is a provenance-chain
-shortcut, not a source change — the physical observation is the same.
+For every city whose current Polymarket resolver is NOAA weather.gov, this
+script fetches the same ICAO station's historical METAR observations from
+Ogimet. Targets come from ``config/cities.json`` so a provider migration
+cannot leave a second hardcoded city list. Ogimet is a free mirror of the
+same global METAR stream consumed by NOAA; using it is a provenance-chain
+shortcut, not a physical-station change.
 
 Limitations
 -----------
 - METAR reports come at ~30-minute cadence; daily high is the max across
   all reports in the local day. This is how NOAA and Polymarket would
   compute it too, so we match their number exactly.
-- SYNOP reports come at 3-hour cadence (00/03/06/09/12/15/18/21 UTC).
-  This is Taipei's only free option — the 3-hour gap can under-estimate
-  the true peak by a small amount if the peak fell between reports, but
-  this is inherent to SYNOP-as-source and matches what CWA station
-  46692 actually reports internally (CWA's real-time observations at
-  that station are also ~3-hourly SYNOP-derived).
 
 Usage
 -----
-    python scripts/backfill_ogimet_metar.py --cities Istanbul Moscow Taipei \
+    python scripts/backfill_ogimet_metar.py --cities Istanbul Chicago NYC \
         --start 2024-01-01 --end 2026-04-14
 
     # Dry-run (no DB writes, prints per-day summary):
@@ -40,8 +30,7 @@ Usage
 
 Contract
 --------
-- source column written as `ogimet_metar` (Istanbul/Moscow) or
-  `ogimet_synop` (Taipei). Downstream code can differentiate.
+- source column is `ogimet_metar_<icao>`; station identity remains explicit.
 - authority='VERIFIED' is written because Ogimet is a trusted mirror of
   the same upstream the settlement source uses; a cross-unit sanity check
   rejects any per-day daily-high outside plausible climatology.
@@ -67,9 +56,11 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import City, load_cities  # noqa: E402
+from src.config import City, cities_by_name, load_cities  # noqa: E402
+from src.data.ogimet_hourly_client import wait_for_ogimet_request_slot  # noqa: E402
 from src.state.db import ZEUS_WORLD_DB_PATH, get_world_connection, init_schema  # noqa: E402
 from src.state.db_writer_lock import WriteClass, db_writer_lock  # noqa: E402
+from src.types.temperature import Temperature  # noqa: E402
 from scripts.backfill_completeness import (  # noqa: E402
     add_completeness_args,
     emit_manifest_footer,
@@ -92,33 +83,27 @@ class OgimetTarget:
     source_tag: str           # value written to observations.source column
 
 
-# Built from cities.json at runtime (keyed by city_name).
-# Declaring here rather than reading cities.json makes the mapping
-# explicit and reviewable — cities.json changes still require updating
-# this dict, which is intentional.
-OGIMET_TARGETS: dict[str, OgimetTarget] = {
-    "Istanbul": OgimetTarget(
-        city_name="Istanbul",
-        station="LTFM",
-        kind="metar",
-        unit="C",
-        source_tag="ogimet_metar_ltfm",
-    ),
-    "Moscow": OgimetTarget(
-        city_name="Moscow",
-        station="UUWW",
-        kind="metar",
-        unit="C",
-        source_tag="ogimet_metar_uuww",
-    ),
-    "Tel Aviv": OgimetTarget(
-        city_name="Tel Aviv",
-        station="LLBG",
-        kind="metar",
-        unit="C",
-        source_tag="ogimet_metar_llbg",
-    ),
-}
+def _ogimet_targets_from_config() -> dict[str, OgimetTarget]:
+    targets: dict[str, OgimetTarget] = {}
+    for city_name, city in cities_by_name.items():
+        if city.settlement_source_type != "noaa":
+            continue
+        station = str(city.wu_station or "").strip().upper()
+        if not station:
+            raise RuntimeError(
+                f"{city_name}: NOAA settlement source has no ICAO station"
+            )
+        targets[city_name] = OgimetTarget(
+            city_name=city_name,
+            station=station,
+            kind="metar",
+            unit="C",
+            source_tag=f"ogimet_metar_{station.lower()}",
+        )
+    return dict(sorted(targets.items()))
+
+
+OGIMET_TARGETS: dict[str, OgimetTarget] = _ogimet_targets_from_config()
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +135,7 @@ def _fetch_window(
     url = OGIMET_METAR_URL if target.kind == "metar" else OGIMET_SYNOP_URL
     for attempt in range(MAX_RETRIES):
         try:
+            wait_for_ogimet_request_slot()
             resp = requests.get(url, params=params, headers=HEADERS, timeout=45)
             if resp.status_code == 200:
                 return resp.text
@@ -368,6 +354,8 @@ def _write_day(
     temps = bucket["temps"]
     high = max(temps)
     low = min(temps)
+    target_high = Temperature(float(high), target.unit).to(city.settlement_unit).value
+    target_low = Temperature(float(low), target.unit).to(city.settlement_unit).value
     tz = ZoneInfo(city.timezone)
     # Synthesize a representative local_time at a generic local-afternoon
     # anchor (14:00). The City dataclass does not expose historical_peak_hour
@@ -400,7 +388,7 @@ def _write_day(
     }
     conn.execute(INSERT_SQL, (
         city.name, local_date.isoformat(), target.source_tag,
-        high, low, city.settlement_unit,
+        target_high, target_low, city.settlement_unit,
         target.station, fetch_utc.isoformat(),
         # value_type CHECK constraint accepts 'high' | 'low' | 'mean' only.
         # We anchor the row on the daily high (raw_value column carries it),
@@ -412,7 +400,7 @@ def _write_day(
         city.timezone, utc_offset_minutes, int(dst_active),
         0, 0,  # is_ambiguous/is_missing local hour — N/A for daily aggregate
         hemisphere, season, local_date.month,
-        run_id, f"ogimet_v1_2026_04_14",
+        run_id, "ogimet_v1_2026_04_14",
         "VERIFIED", json.dumps(provenance),
     ))
 
@@ -447,6 +435,21 @@ def backfill_city(
     dry_run: bool,
     run_id: str,
 ) -> dict:
+    requested_start = start
+    requested_end = end
+    if (
+        city.previous_settlement_source_type == "wu_icao"
+        and city.settlement_source_type_effective_date
+    ):
+        effective = date.fromisoformat(city.settlement_source_type_effective_date)
+        start = max(start, effective)
+        if start > end:
+            requested_days = (requested_end - requested_start).days + 1
+            return {
+                "city": city.name,
+                "days_written": 0,
+                "days_skipped": requested_days,
+            }
     tz = ZoneInfo(city.timezone)
     print(f"\n[{city.name}] {target.station} ({target.kind}) {start} .. {end}")
     observations: list[tuple[datetime, float]] = []

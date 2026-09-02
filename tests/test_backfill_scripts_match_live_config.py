@@ -1,8 +1,8 @@
 # Created: 2026-04-21
-# Lifecycle: created=2026-04-21; last_reviewed=2026-07-20; last_reused=2026-07-20
+# Lifecycle: created=2026-04-21; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Keep backfill scripts aligned with live config and obs_v2 provenance identity contracts.
 # Reuse: Inspect config/cities.json, tier_resolver, script manifest, and current source-validity posture first.
-# Last reused/audited: 2026-07-20
+# Last reused/audited: 2026-09-01
 # Authority basis: plan v3 antibody A7; P1 obs_v2 provenance identity packet.
 """Antibody A7: backfill scripts must match the live config.
 
@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.config import cities_by_name
+from src.data.hole_scanner import _source_applies_to_city
 from src.data.wu_hourly_client import HourlyObservation
 from src.state.schema.v2_schema import apply_canonical_schema
 
@@ -138,22 +139,25 @@ def _hourly_observation(
 # ----------------------------------------------------------------------
 
 
-def test_wu_backfill_city_stations_matches_wu_icao_cities(wu_backfill_module):
-    """CITY_STATIONS keys == set of wu_icao cities from cities.json."""
+def test_wu_backfill_city_stations_matches_wu_history_cities(wu_backfill_module):
+    """WU backfill includes current WU cities and dated WU predecessors."""
     live_wu_icao = {
-        c.name for c in cities_by_name.values() if c.settlement_source_type == "wu_icao"
+        c.name
+        for c in cities_by_name.values()
+        if c.settlement_source_type == "wu_icao"
+        or c.previous_settlement_source_type == "wu_icao"
     }
     backfill_keys = set(wu_backfill_module.CITY_STATIONS.keys())
     missing_in_backfill = live_wu_icao - backfill_keys
     extra_in_backfill = backfill_keys - live_wu_icao
     assert not missing_in_backfill, (
-        f"cities.json has wu_icao cities not in "
+        f"cities.json has current/historical wu_icao cities not in "
         f"backfill_wu_daily_all.CITY_STATIONS: {sorted(missing_in_backfill)}. "
         "The WU backfill will skip these cities."
     )
     assert not extra_in_backfill, (
         f"backfill_wu_daily_all.CITY_STATIONS has cities not in "
-        f"cities.json (or flipped sstype): {sorted(extra_in_backfill)}. "
+        f"cities.json current/historical WU set: {sorted(extra_in_backfill)}. "
         "This is the DRIFT pattern Phase -1 (commit d9c998f) closed."
     )
 
@@ -182,10 +186,7 @@ def test_wu_backfill_icao_matches_cities_json(wu_backfill_module):
 
 
 def test_ogimet_backfill_targets_matches_noaa_cities(ogimet_backfill_module):
-    """OGIMET_TARGETS keys == set of noaa cities from cities.json.
-
-    After Phase -1 cleanup: both sides should be {Istanbul, Moscow, Tel Aviv}.
-    """
+    """OGIMET_TARGETS keys == set of NOAA cities from cities.json."""
     live_noaa = {
         c.name for c in cities_by_name.values() if c.settlement_source_type == "noaa"
     }
@@ -233,10 +234,134 @@ def test_tel_aviv_not_in_wu_backfill(wu_backfill_module):
     assert "Tel Aviv" not in wu_backfill_module.CITY_STATIONS
 
 
-@pytest.mark.parametrize("stale_city", ["Taipei", "Cape Town", "Lucknow"])
+@pytest.mark.parametrize("stale_city", ["Taipei"])
 def test_stale_cities_not_in_ogimet_backfill(ogimet_backfill_module, stale_city):
-    """Phase -1 deleted Taipei/Cape Town/Lucknow; must stay gone."""
+    """Cities whose current resolver remains WU must stay out of Ogimet."""
     assert stale_city not in ogimet_backfill_module.OGIMET_TARGETS
+
+
+@pytest.mark.parametrize("migrated_city", ["Cape Town", "Lucknow"])
+def test_migrated_noaa_cities_are_in_ogimet_backfill(
+    ogimet_backfill_module, migrated_city
+):
+    """A current Gamma NOAA resolver is executable, not a stale deny-list."""
+    assert migrated_city in ogimet_backfill_module.OGIMET_TARGETS
+
+
+def test_obs_v2_backfill_splits_provider_transition(obs_v2_backfill_module):
+    segments = obs_v2_backfill_module._effective_tier_segments(
+        "Chicago", date(2026, 8, 22), date(2026, 8, 24)
+    )
+    assert [(tier.value, start.isoformat(), end.isoformat()) for tier, start, end in segments] == [
+        ("wu_icao", "2026-08-22", "2026-08-22"),
+        ("ogimet_metar", "2026-08-23", "2026-08-24"),
+    ]
+
+
+def test_wu_backfill_refuses_post_transition_dates(wu_backfill_module):
+    result = wu_backfill_module.backfill_city(
+        "Chicago",
+        2,
+        object(),
+        start_date=date(2026, 8, 23),
+        end_date=date(2026, 8, 24),
+    )
+    assert result["collected"] == 0
+    assert result["skip"] == 2
+
+
+def test_ogimet_backfill_refuses_pre_transition_dates(ogimet_backfill_module):
+    city = cities_by_name["Chicago"]
+    result = ogimet_backfill_module.backfill_city(
+        object(),
+        city,
+        ogimet_backfill_module.OGIMET_TARGETS["Chicago"],
+        date(2026, 8, 21),
+        date(2026, 8, 22),
+        dry_run=True,
+        run_id="test",
+    )
+    assert result == {"city": "Chicago", "days_written": 0, "days_skipped": 2}
+
+
+def test_ogimet_backfill_converts_raw_celsius_to_city_unit(ogimet_backfill_module):
+    captured: list[tuple] = []
+
+    class _Connection:
+        def execute(self, _sql, params):
+            captured.append(tuple(params))
+
+    bucket = {
+        "temps": [10.0, 20.0],
+        "count": 2,
+        "first_utc": datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+        "last_utc": datetime(2026, 8, 24, 13, tzinfo=timezone.utc),
+    }
+    ogimet_backfill_module._write_day(
+        _Connection(),
+        cities_by_name["Chicago"],
+        ogimet_backfill_module.OGIMET_TARGETS["Chicago"],
+        date(2026, 8, 24),
+        bucket,
+        "test-unit-conversion",
+    )
+
+    params = captured[0]
+    assert params[3] == pytest.approx(68.0)
+    assert params[4] == pytest.approx(50.0)
+    assert params[8] == pytest.approx(20.0)
+    assert params[9:11] == ("C", "F")
+
+
+def test_ogimet_backfill_uses_shared_request_governor(
+    ogimet_backfill_module,
+    monkeypatch,
+):
+    governed: list[bool] = []
+    monkeypatch.setattr(
+        ogimet_backfill_module,
+        "wait_for_ogimet_request_slot",
+        lambda: governed.append(True),
+    )
+    monkeypatch.setattr(
+        ogimet_backfill_module.requests,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(status_code=200, text="ok"),
+    )
+
+    result = ogimet_backfill_module._fetch_window(
+        ogimet_backfill_module.OGIMET_TARGETS["Chicago"],
+        datetime(2026, 8, 24, tzinfo=timezone.utc),
+        datetime(2026, 8, 25, tzinfo=timezone.utc),
+    )
+
+    assert result == "ok"
+    assert governed == [True]
+
+
+def test_hole_scanner_expected_source_is_target_date_scoped():
+    chicago = cities_by_name["Chicago"]
+    assert _source_applies_to_city("wu_icao_history", chicago, date(2026, 8, 22))
+    assert not _source_applies_to_city("ogimet_metar_kord", chicago, date(2026, 8, 22))
+    assert _source_applies_to_city("ogimet_metar_kord", chicago, date(2026, 8, 23))
+    assert not _source_applies_to_city("wu_icao_history", chicago, date(2026, 8, 23))
+
+
+def test_persistence_etl_preserves_both_sides_of_transition():
+    from scripts.etl_temp_persistence import _is_canonical_daily_observation
+
+    assert _is_canonical_daily_observation(
+        "Chicago", "wu_icao_history", "KORD:US", target_date="2026-08-22"
+    )
+    assert not _is_canonical_daily_observation(
+        "Chicago", "ogimet_metar_kord", "KORD", target_date="2026-08-22"
+    )
+    assert _is_canonical_daily_observation(
+        "Chicago", "ogimet_metar_kord", "KORD", target_date="2026-08-23"
+    )
+    assert not _is_canonical_daily_observation(
+        "Chicago", "wu_icao_history", "KORD:US", target_date="2026-08-23"
+    )
 
 
 @pytest.mark.parametrize("path", OBS_V2_PRODUCER_PATHS, ids=lambda p: p.name)
@@ -1222,3 +1347,57 @@ def test_dst_gap_fill_row_stamps_provenance_identity(
     assert provenance["parser_version"] == "obs_v2_dst_gap_fill_ogimet_v2"
     assert provenance["station_id"] == "KORD"
     assert provenance["source_url"].startswith("https://www.ogimet.com/")
+
+
+def test_dst_gap_fill_tier_is_target_date_scoped(
+    obs_v2_dst_gap_fill_module,
+    tmp_path,
+    monkeypatch,
+):
+    captured_rows = []
+
+    def fake_fetch_ogimet_hourly(**kwargs):
+        target = kwargs["start_date"] + timedelta(days=1)
+        return SimpleNamespace(
+            failed=False,
+            failure_reason=None,
+            error=None,
+            raw_metar_count=1,
+            observations=[
+                _hourly_observation(
+                    city="Chicago",
+                    station_id="KORD",
+                    target_date=target.isoformat(),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        obs_v2_dst_gap_fill_module,
+        "fetch_ogimet_hourly",
+        fake_fetch_ogimet_hourly,
+    )
+    monkeypatch.setattr(
+        obs_v2_dst_gap_fill_module,
+        "insert_rows",
+        lambda _conn, rows: captured_rows.extend(rows) or len(rows),
+    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        for target in (date(2026, 8, 22), date(2026, 8, 23)):
+            assert obs_v2_dst_gap_fill_module._fill_one_date(
+                conn,
+                "Chicago",
+                target,
+                "v1.wu-native.pilot",
+                tmp_path / "dst-gap-transition.jsonl",
+                dry_run=False,
+            ) == 1
+    finally:
+        conn.close()
+
+    tiers = [json.loads(row.provenance_json)["tier"] for row in captured_rows]
+    assert tiers == [
+        "WU_ICAO_OGIMET_FALLBACK",
+        "OGIMET_METAR_BOUNDARY_FILL",
+    ]

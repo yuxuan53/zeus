@@ -1,0 +1,53 @@
+packet: current/source_family_noaa_city_universe
+status: active
+owner: agent
+frontier:
+- source-contract resolver audit
+- city source-family config
+- generic NOAA/Ogimet source routing
+- scanner and ingestion antibodies
+in_scope:
+- docs/operations/current/source_family_noaa_city_universe/**
+- config/cities.json
+- src/config.py
+- src/ingest_main.py
+- src/data/market_scanner.py
+- src/data/day0_fast_obs.py
+- src/data/day0_observation_reader.py
+- src/data/ogimet_hourly_client.py
+- src/data/tier_resolver.py
+- src/data/daily_obs_append.py
+- src/data/hole_scanner.py
+- src/data/observation_instants_writer.py
+- src/engine/monitor_refresh.py
+- src/events/triggers/day0_extreme_updated.py
+- scripts/fill_obs_dst_gaps.py
+- scripts/backfill_ogimet_metar.py
+- scripts/backfill_wu_daily_all.py
+- scripts/backfill_obs.py
+- scripts/obs_live_tick.py
+- scripts/etl_temp_persistence.py
+- tests/test_tier_resolver.py
+- tests/test_cities_config_authoritative.py
+- tests/test_market_scanner_provenance.py
+- tests/test_scanner_slug_pattern.py
+- tests/test_k2_live_ingestion_relationships.py
+- tests/test_backfill_scripts_match_live_config.py
+- tests/test_day0_fast_obs_lane.py
+- tests/test_day0_observation_reader.py
+- tests/test_obs_v2_reader_gate.py
+- tests/test_observation_instants_v2_freshness.py
+- tests/test_step4_wu_daily_dedup.py
+- tests/engine/test_day0_canonical_observed_extreme_fallback.py
+allow_companions: []
+out_of_scope:
+- state/zeus-world.db
+- state/zeus-world.db-*
+live_side_effects_allowed: false
+supersedes: null
+tests:
+- pytest -q tests/test_tier_resolver.py tests/test_cities_config_authoritative.py
+- pytest -q tests/test_market_scanner_provenance.py tests/test_scanner_slug_pattern.py
+- pytest -q tests/test_k2_live_ingestion_relationships.py tests/test_backfill_scripts_match_live_config.py
+- pytest -q tests/test_day0_fast_obs_lane.py tests/test_day0_observation_reader.py
+closeout_required: true

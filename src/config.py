@@ -14,6 +14,7 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Optional
@@ -164,6 +165,8 @@ class City:
     settlement_source: str = ""
     country_code: str = ""
     settlement_source_type: str = "wu_icao"  # "wu_icao" | "hko" | "noaa" | "cwa_station"
+    previous_settlement_source_type: Optional[str] = None
+    settlement_source_type_effective_date: Optional[str] = None
     diurnal_amplitude: float = 12.0
     historical_peak_hour: float = 15.0
     # Optional per-city instrument noise override (in city.settlement_unit).
@@ -380,6 +383,12 @@ def load_cities(path: Optional[Path] = None) -> list[City]:
                 settlement_source=c.get("settlement_source", ""),
                 country_code=c["country_code"],
                 settlement_source_type=c.get("settlement_source_type") or "wu_icao",
+                previous_settlement_source_type=c.get(
+                    "previous_settlement_source_type"
+                ),
+                settlement_source_type_effective_date=c.get(
+                    "settlement_source_type_effective_date"
+                ),
                 diurnal_amplitude=amp,
                 historical_peak_hour=float(c.get("historical_peak_hour", 15.0)),
                 instrument_noise_override=(
@@ -501,6 +510,28 @@ def runtime_cities_by_name() -> dict[str, City]:
     return dict(cities_by_name)
 
 
+def settlement_source_type_for_city(
+    city: City,
+    target_date: date | str | None = None,
+) -> str:
+    """Return the resolver family effective for a market target date."""
+
+    current_type = str(getattr(city, "settlement_source_type", "") or "wu_icao")
+    effective_raw = getattr(city, "settlement_source_type_effective_date", None)
+    previous_type = getattr(city, "previous_settlement_source_type", None)
+    if target_date is None or not effective_raw:
+        return current_type
+    effective = date.fromisoformat(str(effective_raw))
+    observed = (
+        target_date
+        if isinstance(target_date, date)
+        else date.fromisoformat(str(target_date)[:10])
+    )
+    if observed < effective and previous_type:
+        return str(previous_type)
+    return current_type
+
+
 def validate_cities_config(city_list: list[City] | None = None) -> list[str]:
     """Validate city configs — returns list of warning strings.
 
@@ -521,6 +552,30 @@ def validate_cities_config(city_list: list[City] | None = None) -> list[str]:
                 f"{c.name}: settlement_source_type={c.settlement_source_type!r} "
                 "is not a known type"
             )
+        transition_fields = (
+            c.previous_settlement_source_type,
+            c.settlement_source_type_effective_date,
+        )
+        if any(transition_fields) and not all(transition_fields):
+            warnings.append(
+                f"{c.name}: source transition requires previous type and effective date"
+            )
+        if c.previous_settlement_source_type and (
+            c.previous_settlement_source_type
+            not in ("wu_icao", "hko", "noaa", "cwa_station")
+        ):
+            warnings.append(
+                f"{c.name}: invalid previous_settlement_source_type="
+                f"{c.previous_settlement_source_type!r}"
+            )
+        if c.settlement_source_type_effective_date:
+            try:
+                date.fromisoformat(c.settlement_source_type_effective_date)
+            except ValueError:
+                warnings.append(
+                    f"{c.name}: invalid settlement_source_type_effective_date="
+                    f"{c.settlement_source_type_effective_date!r}"
+                )
     if warnings:
         for w in warnings:
             logger.warning("City config validation: %s", w)

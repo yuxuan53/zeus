@@ -52,6 +52,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -207,7 +208,7 @@ def _hourly_obs_to_v2_row(
     the latest source report in the bucket, never the HIGH-biased hour maximum;
     it supplies the causal current-state anchor for remaining-window Day0 q.
     """
-    source_tag = expected_source_for_city(obs.city)
+    source_tag = expected_source_for_city(obs.city, target_date=obs.target_date)
     latest_raw_ts = _latest_raw_ts(obs)
     provenance = {
         "tier": tier_name,
@@ -558,7 +559,7 @@ def _tick_ogimet_city(
 ) -> TickResult:
     city = cities_by_name[city_name]
     result = TickResult(city=city_name, tier="OGIMET_METAR")
-    source_tag = expected_source_for_city(city_name)
+    source_tag = expected_source_for_city(city_name, target_date=start_date)
 
     # Ogimet needs the ICAO station ID; use the city's wu_station field
     # which stores the ICAO for all tier types (consistent with tier_resolver).
@@ -656,6 +657,20 @@ def _run_city_with_sqlite_retry(
             raise
 
 
+def _ogimet_city_shard_for_hour(
+    city_names: list[str],
+    now_utc: datetime,
+) -> list[str]:
+    """Bound the slow Ogimet mirror to one daily sweep across hourly runs."""
+
+    names = sorted(city_names)
+    if not names:
+        return []
+    per_hour = max(1, math.ceil(len(names) / 24))
+    start_index = now_utc.hour * per_hour
+    return names[start_index:start_index + per_hour]
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -668,6 +683,8 @@ def run_live_tick(
     db_path: Path = DEFAULT_DB_PATH,
     log_path: Path = DEFAULT_LOG_PATH,
     day0_family_admission: Callable[[dict[str, object]], bool] | None = None,
+    include_ogimet: bool = True,
+    shard_ogimet: bool = True,
 ) -> list[TickResult]:
     """Run one live-tick pass over all non-HKO cities.
 
@@ -681,6 +698,10 @@ def run_live_tick(
     wu_names = [n for n in all_names if tier_for_city(n) == Tier.WU_ICAO]
     ogimet_names = [n for n in all_names if tier_for_city(n) == Tier.OGIMET_METAR]
     hko_names = [n for n in all_names if tier_for_city(n) == Tier.HKO_NATIVE]
+    if not include_ogimet:
+        ogimet_names = []
+    elif shard_ogimet:
+        ogimet_names = _ogimet_city_shard_for_hour(ogimet_names, now_utc)
 
     logger.info(
         "obs_v2_live_tick: city_local_window_policy=per_city days_back=%d wu=%d ogimet=%d hko_skipped=%d dry_run=%s",
@@ -793,6 +814,7 @@ def main() -> int:
         dry_run=args.dry_run,
         db_path=args.db_path,
         log_path=args.log_path,
+        shard_ogimet=not bool(args.cities),
     )
 
     failed = [r for r in results if r.failure_reason]

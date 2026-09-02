@@ -49,7 +49,7 @@ import math
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Iterable, Optional
 
 from src.data.tier_resolver import (
@@ -216,8 +216,12 @@ class ObsV2Row:
         # (primary) or ``ogimet_metar_<icao>`` (DST-gap fallback). Tier 2
         # / Tier 3 are single-source sets.
         try:
-            tier = tier_for_city(self.city)
-            allowed = allowed_sources_for_city(self.city)
+            row_target_date = date.fromisoformat(self.target_date)
+            tier = tier_for_city(self.city, target_date=row_target_date)
+            allowed = allowed_sources_for_city(
+                self.city,
+                target_date=row_target_date,
+            )
         except Exception as exc:
             raise InvalidObsV2RowError(
                 f"A2 violation: city={self.city!r} has no tier mapping: {exc}"
@@ -508,6 +512,7 @@ def _derive_insert_source_fields(row: ObsV2Row) -> tuple[int, str, str]:
         row.city,
         row.source,
         has_provenance=True,
+        target_date=row.target_date,
     )
 
     if assessment.training_allowed:

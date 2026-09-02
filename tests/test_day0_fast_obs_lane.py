@@ -1,6 +1,6 @@
 # Created: 2026-06-10
-# Last reused/audited: 2026-08-21
-# Lifecycle: created=2026-06-10; last_reviewed=2026-08-21; last_reused=2026-08-21
+# Last reused/audited: 2026-09-01
+# Lifecycle: created=2026-06-10; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Authority basis: operator green-light 2026-06-10 items A/C/E (free METAR fast
 #   lane, live-obs hook wiring, WU-vs-METAR oracle anomaly guard); day0
 #   first-principles review /tmp/day0_first_principles_review.md §6.2;
@@ -31,7 +31,7 @@ import json
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -1553,7 +1553,47 @@ class TestObservationStatuses:
         )
         assert obs["source_match_status"] == "MATCH"
         assert obs["source_authorized_status"] == "AUTHORIZED"
-        assert obs["live_authority_status"] == "live"
+
+    def test_transitioned_city_rejects_current_source_for_historical_target(self):
+        from src.config import cities_by_name
+
+        city = cities_by_name["Chicago"]
+        historical_source = fast_obs_source_for_city(city, target_date="2026-08-22")
+        current_source = fast_obs_source_for_city(city, target_date="2026-08-23")
+        assert historical_source is not None
+        assert current_source is not None
+        assert historical_source != current_source
+
+        reports = [
+            _report(
+                "KORD",
+                datetime(2026, 8, 22, 20, 0, tzinfo=UTC),
+                20.0,
+                t_group=True,
+            )
+        ]
+        extremes = running_extremes_for_local_day(
+            reports,
+            city=city,
+            target_date="2026-08-22",
+        )
+        rejected = fast_obs_to_day0_observation(
+            city=city,
+            extremes=extremes,
+            metric="high",
+            source=current_source,
+        )
+        accepted = fast_obs_to_day0_observation(
+            city=city,
+            extremes=extremes,
+            metric="high",
+            source=historical_source,
+        )
+
+        assert rejected["source_match_status"] == "MISMATCH"
+        assert rejected["live_authority_status"] == "blocked"
+        assert accepted["source_match_status"] == "MATCH"
+        assert accepted["live_authority_status"] == "live"
 
 
 # ===========================================================================
@@ -1951,10 +1991,19 @@ class TestEmpiricalThresholds:
             row["name"]: row
             for row in json.loads((root / "config" / "cities.json").read_text())["cities"]
         }
+        measurement_date = datetime.fromisoformat(model["window"][1]).date()
         wu_cities = {
             name
             for name, city in cities.items()
-            if (city.get("settlement_source_type") or "wu_icao") == "wu_icao"
+            if (
+                (city.get("settlement_source_type") or "wu_icao") == "wu_icao"
+                or (
+                    city.get("previous_settlement_source_type") == "wu_icao"
+                    and city.get("settlement_source_type_effective_date")
+                    and measurement_date
+                    < date.fromisoformat(city["settlement_source_type_effective_date"])
+                )
+            )
         }
         assert set(divergence) == wu_cities
         assert model["window_days"] == 7
@@ -2123,6 +2172,7 @@ class TestMetarMarginAbsorption:
             source_id=source.source_id,
             station_id=source.station_id,
             authority=source.authority,
+            settlement_source_type=source.settlement_source_type,
             notes=source.notes,
             margin_units=2.0,
         )
@@ -2785,6 +2835,7 @@ class TestMutexNoHttpSplit:
                         source_id=fast_obs.FAST_OBS_SOURCE_ID,
                         station_id="RJTT",
                         authority="ICAO_STATION_NATIVE",
+                        settlement_source_type="wu_icao",
                     ),
                     "2026-06-10",
                 ),
@@ -2794,6 +2845,7 @@ class TestMutexNoHttpSplit:
                         source_id=fast_obs.FAST_OBS_SOURCE_ID,
                         station_id="RJOO",
                         authority="ICAO_STATION_NATIVE",
+                        settlement_source_type="wu_icao",
                     ),
                     "2026-06-10",
                 ),

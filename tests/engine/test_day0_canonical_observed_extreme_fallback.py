@@ -1,5 +1,5 @@
 # Created: 2026-06-23
-# Last reused/audited: 2026-07-19
+# Last reused/audited: 2026-09-01
 # Authority basis: docs/evidence/same_day_exit_blindness/2026-06-23_toronto_total_loss.md
 #   (Toronto NO@24 -98.94% total loss) + consult REQ-20260623-174044-18fe71. Fix (B): the canonical
 #   world.observation_instants WU-hourly surface is the AUTHORITATIVE settlement-grade day0 observed
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from src.engine import monitor_refresh
 
@@ -99,6 +100,56 @@ def test_canonical_reader_returns_running_max_and_observation_version():
     assert obs_time == "2026-06-23T21:00:00+00:00"
     assert source == "wu_icao_history"
     assert n_rows == 2
+
+
+def test_canonical_reader_passes_target_date_to_source_priority(monkeypatch):
+    """A current NOAA config cannot redirect a pre-transition monitor read."""
+    from src.data import day0_observation_reader
+
+    calls: list[tuple[str, str | None]] = []
+
+    def source_priority(city, target_date=None):
+        calls.append((city.name, target_date))
+        return ("wu_icao_history",)
+
+    def read_extrema(*_args, **kwargs):
+        assert kwargs["target_date"] == "2026-08-22"
+        assert kwargs["source_priority"] == ("wu_icao_history",)
+        return SimpleNamespace(
+            coverage_status="OK",
+            high_so_far=20.0,
+            low_so_far=10.0,
+            last_observation_time_utc="2026-08-22T20:00:00+00:00",
+            chosen_source="wu_icao_history",
+            row_count=1,
+        )
+
+    monkeypatch.setattr(
+        day0_observation_reader,
+        "source_priority_for_city",
+        source_priority,
+    )
+    monkeypatch.setattr(
+        day0_observation_reader,
+        "read_day0_observed_extrema",
+        read_extrema,
+    )
+
+    out = monitor_refresh._day0_observed_extreme_from_canonical_surface(
+        city_name="Chicago",
+        target_date="2026-08-22",
+        metric_is_low=False,
+        now=datetime(2026, 8, 23, 4, 0, tzinfo=UTC),
+        world_conn=object(),
+    )
+
+    assert calls == [("Chicago", "2026-08-22")]
+    assert out == (
+        20.0,
+        "2026-08-22T20:00:00+00:00",
+        "wu_icao_history",
+        1,
+    )
 
 
 def test_canonical_reader_rejects_non_verified_non_wu_rows():

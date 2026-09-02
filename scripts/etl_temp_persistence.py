@@ -21,7 +21,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import cities_by_name  # noqa: E402
+from src.config import cities_by_name, settlement_source_type_for_city  # noqa: E402
 
 
 def season_from_date(date_str: str, city_name: str = "") -> str:
@@ -65,19 +65,22 @@ def _is_canonical_daily_observation(
     city_name: str,
     source: str,
     station_id: str | None,
+    *,
+    target_date: str | None = None,
 ) -> bool:
     """Match the executable harvester's finalized source-family contract."""
     city = cities_by_name.get(city_name)
     if city is None:
         return False
     src = source.strip().lower()
-    if city.settlement_source_type == "wu_icao":
+    source_type = settlement_source_type_for_city(city, target_date)
+    if source_type == "wu_icao":
         family_match = src == "wu_icao_history" or src.startswith("wu_icao_history_")
         expected_station = str(city.wu_station or "").strip().upper()
-    elif city.settlement_source_type == "noaa":
+    elif source_type == "noaa":
         family_match = src.startswith("ogimet_metar_")
         expected_station = str(city.wu_station or "").strip().upper()
-    elif city.settlement_source_type == "hko":
+    elif source_type == "hko":
         family_match = src == "hko_daily_api" or src.startswith("hko_daily_api_")
         expected_station = "HKO"
     else:
@@ -110,6 +113,7 @@ def run_etl() -> dict:
             str(r["city"]),
             str(r["source"]),
             r["station_id"],
+            target_date=str(r["target_date"]),
         ):
             continue
         key = (r["city"], r["target_date"])

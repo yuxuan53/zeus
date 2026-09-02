@@ -9,7 +9,7 @@
 #   §9 (the regression CATEGORY — here DUPLICATE-WRITE / surface bloat — made UNCONSTRUCTABLE,
 #     not just the instance patched: the fail-closed E gate catches any re-added 2nd live owner),
 #   §7 I-class (every cross-program seam is a DB table the producer writes + consumer reads).
-# Lifecycle: created=2026-06-08; last_reviewed=2026-06-08; last_reused=never
+# Lifecycle: created=2026-06-08; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: RELATIONSHIP TESTS for process-topology refactor STEP 4 — remove the
 #   verified-duplicate `wu_daily` dispatch from the order daemon (src.main). The WU
 #   daily-observation concern is OWNED by data-ingest (`_k2_daily_obs_tick` ->
@@ -125,33 +125,21 @@ def test_no_regression_data_ingest_collector_uses_sanctioned_inv37_attach_path()
     )
 
 
-def test_no_regression_wu_collection_slice_is_set_equivalent_across_modules():
-    """THE CORE RELATIONSHIP TEST (re-verifies the plan's §8 Step 4 set-equivalence claim
-    against the ACTUAL source — does not assume it).
-
-    The WU slice of data-ingest's `daily_obs_append.daily_tick` and src.main's removed
-    `wu_scheduler.run_wu_daily_dispatch` must collect the IDENTICAL city set each tick. Both:
-      (1) iterate the SAME source: `cities_by_name.values()`,
-      (2) apply the SAME filter:   `settlement_source_type != "wu_icao": continue`,
-      (3) apply the SAME per-city gate: `WuDailyScheduler().should_collect_now(city, now_utc)`,
-      (4) compute the SAME target date: `local_today - timedelta(days=1)` in the city tz,
-      (5) call the SAME writer: `append_wu_city(name, [local_yesterday], conn, ...)`.
-    `daily_tick` additionally covers HKO -> a STRICT SUPERSET of the daily-obs concern, so the
-    wu_icao slice of daily_tick is == the removed path's set. Coverage loss is therefore zero.
-    """
+def test_no_regression_wu_collection_slice_uses_target_date_source_contract():
+    """The surviving path preserves historical WU dates across migrations."""
     from src.data import daily_obs_append, wu_scheduler
 
     daily_src = inspect.getsource(daily_obs_append.daily_tick)
     removed_src = inspect.getsource(wu_scheduler.run_wu_daily_dispatch)
 
     for needle in (
-        'settlement_source_type != "wu_icao"',  # identical filter
-        "should_collect_now",                    # identical per-city gate
-        "timedelta(days=1)",                     # identical target-date math
-        "append_wu_city",                        # identical writer
+        "should_collect_now",
+        "timedelta(days=1)",
+        "append_wu_city",
     ):
         assert needle in daily_src, f"data-ingest daily_tick WU slice missing {needle!r}"
         assert needle in removed_src, f"removed run_wu_daily_dispatch missing {needle!r}"
+    assert "settlement_source_type_for_city(city_cfg, local_yesterday)" in daily_src
 
     # Both iterate cities_by_name (the same universe) — neither sub-selects a different set.
     assert "cities_by_name" in daily_src and "cities_by_name" in removed_src
@@ -164,19 +152,24 @@ def test_no_regression_wu_collection_slice_fires_same_city_set_behaviorally():
     gate + same filter -> same fired set, hour by hour. (No DB/HTTP needed — we recompute the
     gate predicate directly, exactly as both modules do.)"""
     from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
 
-    from src.config import cities_by_name
+    from src.config import cities_by_name, settlement_source_type_for_city
     from src.data.wu_scheduler import WuDailyScheduler
 
     scheduler = WuDailyScheduler()
     base = datetime(2026, 6, 8, 0, 0, tzinfo=timezone.utc)
 
     def _fired_set(now_utc):
-        # The IDENTICAL predicate both daily_tick and run_wu_daily_dispatch apply.
         return {
             c.name
             for c in cities_by_name.values()
-            if c.settlement_source_type == "wu_icao"
+            if settlement_source_type_for_city(
+                c,
+                now_utc.astimezone(ZoneInfo(c.timezone)).date()
+                - timedelta(days=1),
+            )
+            == "wu_icao"
             and scheduler.should_collect_now(c, now_utc)
         }
 
@@ -191,7 +184,11 @@ def test_no_regression_wu_collection_slice_fires_same_city_set_behaviorally():
         assert fired == _fired_set(now)
         union |= fired
 
-    all_wu = {c.name for c in cities_by_name.values() if c.settlement_source_type == "wu_icao"}
+    all_wu = {
+        c.name
+        for c in cities_by_name.values()
+        if settlement_source_type_for_city(c, base.date()) == "wu_icao"
+    }
     assert all_wu, "expected at least one wu_icao city in the config"
     missing = all_wu - union
     assert not missing, (

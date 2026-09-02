@@ -5,7 +5,7 @@
 """K2 live daily-observation appender (WU ICAO + HKO + Ogimet METAR/SYNOP).
 
 Replaces the broken `src/data/wu_daily_collector.py` for live ingestion of
-daily high/low temperatures into the `observations` table. Handles the two
+daily high/low temperatures into the `observations` table. Handles the three
 distinct daily-obs source lanes Zeus uses:
 
 1. WU ICAO history for cities whose settlement_source_type == "wu_icao" in
@@ -19,6 +19,10 @@ distinct daily-obs source lanes Zeus uses:
    Polymarket settlement source for HK; VHHH airport (which WU would hit
    under the ICAO key) differs from HKO HQ by 1-3°C due to urban heat
    island, so HK must never go through the WU lane.
+
+3. Ogimet's same-station METAR mirror for target dates whose configured
+   resolver family is NOAA. These slow requests are quota-governed and spread
+   across hourly shards; direct NOAA METAR remains the live Day0 source clock.
 
 Contract:
 - Every successful insert writes TWO rows: the observations INSERT and a
@@ -46,9 +50,8 @@ Public API:
 - `append_hko_months(year_months, conn, *, rebuild_run_id)` — fetch one
   or more HKO months (each is a CLMMAXT + CLMMINT pair) and write.
 - `daily_tick(conn, *, now_utc)` — daemon-facing per-hour entrypoint:
-  uses `WuDailyScheduler` to find WU cities whose local peak+4h window
-  is active, fetches them for today, plus HKO current+prior month on
-  every call (idempotent).
+  schedules WU by local peak, HKO on its own cadence, and a bounded NOAA
+  mirror shard.
 - `catch_up_missing(conn, *, days_back, max_cities)` — bounded repair
   entrypoint: queries data_coverage for MISSING / retry-ready FAILED
   rows within `days_back` and fills them via the same write path.
@@ -72,11 +75,12 @@ import httpx
 # canonical location to avoid transitively pulling src.calibration into the
 # ingest lane (FORBIDDEN per tests/test_ingest_isolation.py post-fix).
 from src.contracts.season import season_from_date
-from src.config import cities_by_name
+from src.config import cities_by_name, settlement_source_type_for_city
 from src.data.daily_observation_writer import (
     write_daily_observation_with_revision,
 )
 from src.data.ingestion_guard import IngestionGuard, IngestionRejected
+from src.types.temperature import Temperature
 # G10 helper-extraction (2026-04-26, con-nyx MAJOR #1): import from canonical
 # location to avoid transitively pulling src.signal into the ingest lane.
 from src.contracts.dst_semantics import _is_missing_local_hour
@@ -1316,11 +1320,13 @@ def _build_atom_pair(
         validation_pass=True,
         provenance_metadata=provenance,
     )
+    target_high = Temperature(float(high_val), raw_unit).to(target_unit).value
+    target_low = Temperature(float(low_val), raw_unit).to(target_unit).value
     atom_high = ObservationAtom(
-        value_type="high", value=high_val, raw_value=high_val, **common,
+        value_type="high", value=target_high, raw_value=high_val, **common,
     )
     atom_low = ObservationAtom(
-        value_type="low", value=low_val, raw_value=low_val, **common,
+        value_type="low", value=target_low, raw_value=low_val, **common,
     )
     return atom_high, atom_low
 
@@ -1640,35 +1646,58 @@ class _OgimetTarget:
     source_tag: str           # value written to observations.source column
 
 
-#: Cities whose Polymarket settlement source is NOAA weather.gov but
-#: have no programmatic NOAA API — we fetch the same underlying METAR
-#: stream via Ogimet (free, unauthenticated).
-OGIMET_CITIES: dict[str, _OgimetTarget] = {
-    "Istanbul": _OgimetTarget(
-        city_name="Istanbul", station="LTFM", kind="metar",
-        source_tag="ogimet_metar_ltfm",
-    ),
-    "Moscow": _OgimetTarget(
-        city_name="Moscow", station="UUWW", kind="metar",
-        source_tag="ogimet_metar_uuww",
-    ),
-    "Tel Aviv": _OgimetTarget(
-        city_name="Tel Aviv", station="LLBG", kind="metar",
-        source_tag="ogimet_metar_llbg",
-    ),
-}
+def _build_ogimet_cities() -> dict[str, _OgimetTarget]:
+    """Build NOAA settlement targets from the canonical city registry."""
+
+    targets: dict[str, _OgimetTarget] = {}
+    for city_name, city in cities_by_name.items():
+        if city.settlement_source_type != "noaa":
+            continue
+        station = str(city.wu_station or "").strip().upper()
+        if not station:
+            raise RuntimeError(
+                f"{city_name}: NOAA settlement source has no ICAO station"
+            )
+        targets[city_name] = _OgimetTarget(
+            city_name=city_name,
+            station=station,
+            kind="metar",
+            source_tag=f"ogimet_metar_{station.lower()}",
+        )
+    return dict(sorted(targets.items()))
 
 
-def daily_observation_source_for_city(city_name: str) -> str | None:
-    """Return the canonical daily-settlement observation source for a city."""
+# NOAA weather.gov settlement pages expose station METAR observations but no
+# stable bulk API. Ogimet is the canonical hourly/history mirror; the mapping is
+# config-derived so a resolver migration cannot leave a second three-city list.
+OGIMET_CITIES: dict[str, _OgimetTarget] = _build_ogimet_cities()
+
+
+def _ogimet_city_shard_for_hour(now_utc: datetime) -> tuple[str, ...]:
+    """Return this UTC hour's bounded slice of the daily NOAA city sweep."""
+
+    names = sorted(OGIMET_CITIES)
+    if not names:
+        return ()
+    per_hour = max(1, math.ceil(len(names) / 24))
+    start_index = now_utc.hour * per_hour
+    return tuple(names[start_index:start_index + per_hour])
+
+
+def daily_observation_source_for_city(
+    city_name: str,
+    target_date: date | str | None = None,
+) -> str | None:
+    """Return the daily observation source effective for a target date."""
     city_cfg = cities_by_name.get(city_name)
     if city_cfg is None:
         return None
-    if city_cfg.settlement_source_type == "wu_icao":
+    source_type = settlement_source_type_for_city(city_cfg, target_date)
+    if source_type == "wu_icao":
         return WU_SOURCE
-    if city_cfg.settlement_source_type == "hko":
+    if source_type == "hko":
         return HKO_SOURCE
-    if city_cfg.settlement_source_type == "noaa":
+    if source_type == "noaa":
         target = OGIMET_CITIES.get(city_name)
         if target is None:
             raise RuntimeError(
@@ -1700,6 +1729,14 @@ def _parse_metar_temp(metar_body: str) -> float | None:
     return float(-v if negative else v)
 
 
+def _wait_for_ogimet_request_slot() -> None:
+    """Use the hourly mirror's shared in-process provider governor."""
+
+    from src.data.ogimet_hourly_client import wait_for_ogimet_request_slot
+
+    wait_for_ogimet_request_slot()
+
+
 def _fetch_ogimet_day(
     target: _OgimetTarget,
     target_date: date,
@@ -1725,6 +1762,7 @@ def _fetch_ogimet_day(
     body = ""
     for attempt in range(_OGIMET_RETRY_COUNT + 1):
         try:
+            _wait_for_ogimet_request_slot()
             resp = httpx.get(url, params=params, headers=_OGIMET_HEADERS, timeout=45)
             if resp.status_code == 200:
                 body = resp.text
@@ -1925,8 +1963,6 @@ def daily_tick(
     scheduler = WuDailyScheduler()
     wu_totals = {"inserted": 0, "guard_rejected": 0, "fetch_errors": 0, "missing_from_api": 0}
     for city_cfg in cities_by_name.values():
-        if city_cfg.settlement_source_type != "wu_icao":
-            continue
         city_name = city_cfg.name
         if not scheduler.should_collect_now(city_cfg, now_utc):
             continue
@@ -1940,6 +1976,8 @@ def daily_tick(
         # collector this replaces) used the same `date.today() - 1` default.
         local_today = now_utc.astimezone(ZoneInfo(city_cfg.timezone)).date()
         local_yesterday = local_today - timedelta(days=1)
+        if settlement_source_type_for_city(city_cfg, local_yesterday) != "wu_icao":
+            continue
         stats = append_wu_city(
             city_name, [local_yesterday], conn, rebuild_run_id=rebuild_run_id,
         )
@@ -1984,22 +2022,23 @@ def daily_tick(
             accumulator_schema=hko_accumulator_schema,
         )
 
-    # Ogimet refresh: once per day at UTC hour 6. Istanbul (UTC+3) and
-    # Moscow (UTC+3) have their previous local day completed by then.
-    ogimet_stats = None
-    if now_utc.hour == 6:
-        ogimet_stats = {"inserted": 0, "guard_rejected": 0, "fetch_errors": 0}
-        for city_name, target in OGIMET_CITIES.items():
-            city_cfg = cities_by_name.get(city_name)
-            if city_cfg is None:
-                continue
-            local_today = now_utc.astimezone(ZoneInfo(city_cfg.timezone)).date()
-            local_yesterday = local_today - timedelta(days=1)
-            stats = append_ogimet_city(
-                city_name, [local_yesterday], conn, rebuild_run_id=rebuild_run_id,
-            )
-            for k in ogimet_stats:
-                ogimet_stats[k] += stats.get(k, 0)
+    # Ogimet documents a slow-query cadence. Shard current NOAA cities across
+    # the 24 hourly ticks so every station is refreshed daily without one
+    # 48-city request burst monopolizing the ingest worker or tripping quota.
+    ogimet_stats = {"inserted": 0, "guard_rejected": 0, "fetch_errors": 0}
+    for city_name in _ogimet_city_shard_for_hour(now_utc):
+        city_cfg = cities_by_name.get(city_name)
+        if city_cfg is None:
+            continue
+        local_today = now_utc.astimezone(ZoneInfo(city_cfg.timezone)).date()
+        local_yesterday = local_today - timedelta(days=1)
+        if settlement_source_type_for_city(city_cfg, local_yesterday) != "noaa":
+            continue
+        stats = append_ogimet_city(
+            city_name, [local_yesterday], conn, rebuild_run_id=rebuild_run_id,
+        )
+        for k in ogimet_stats:
+            ogimet_stats[k] += stats.get(k, 0)
 
     return {
         "wu": wu_totals,
@@ -2015,6 +2054,7 @@ def catch_up_missing(
     *,
     days_back: int = 30,
     max_cities: int | None = None,
+    max_ogimet_cities: int = 2,
     rebuild_run_id: Optional[str] = None,
 ) -> dict:
     """Fill source-applicable data_coverage MISSING rows within N days.
@@ -2042,7 +2082,9 @@ def catch_up_missing(
         target = date.fromisoformat(r["target_date"])
         if target < cutoff:
             continue
-        if r["data_source"] != daily_observation_source_for_city(r["city"]):
+        if r["data_source"] != daily_observation_source_for_city(
+            r["city"], target
+        ):
             inapplicable_pending += 1
             continue
         if r["data_source"] == WU_SOURCE:
@@ -2071,7 +2113,13 @@ def catch_up_missing(
         totals["hko_inserted"] = stats["inserted"]
         totals["hko_incomplete"] = stats["incomplete"]
 
-    for city_name, dates in ogimet_by_city.items():
+    ogimet_items = list(ogimet_by_city.items())
+    if ogimet_items:
+        offset = datetime.now(timezone.utc).date().toordinal() % len(ogimet_items)
+        ogimet_items = ogimet_items[offset:] + ogimet_items[:offset]
+    for i, (city_name, dates) in enumerate(ogimet_items):
+        if i >= max_ogimet_cities:
+            break
         stats = append_ogimet_city(city_name, dates, conn, rebuild_run_id=rebuild_run_id)
         totals["ogimet_cities_touched"] += 1
         totals["ogimet_inserted"] += stats["inserted"]

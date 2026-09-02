@@ -7,9 +7,8 @@
 
 Wraps ``https://www.ogimet.com/cgi-bin/getmetar`` which mirrors NOAA METAR
 bulletins (including off-hour SPECI at extremes) for any ICAO station.
-Phase 0 uses this only for the three cities whose
-``settlement_source_type == 'noaa'``: Istanbul (LTFM), Moscow (UUWW),
-Tel Aviv (LLBG).
+The config-derived NOAA tier uses this as its slow canonical hourly/history
+mirror for every configured settlement ICAO.
 
 **Extremum-preserving semantics (critical)**. Same aggregation contract
 as ``wu_hourly_client``: each UTC hour bucket emits one
@@ -19,10 +18,8 @@ raw timestamps across ALL raw reports in the bucket, never a single
 docstring — picking a snap-point erases intra-hour SPECI peaks and
 poisons both Platt calibration and Day-0 stop-loss monitoring.
 
-METAR's native unit is °C; all three current consumers
-(cities.json settlement_unit=='C' for Istanbul/Moscow/Tel Aviv) match
-natively with no conversion. An F conversion path exists for future
-use.
+METAR's native unit is °C; the client converts only when a city's configured
+settlement unit is Fahrenheit.
 
 Public API
 ----------
@@ -36,6 +33,8 @@ from __future__ import annotations
 import errno
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -76,6 +75,20 @@ OGIMET_MIN_INTERVAL_SECONDS = 21.0
 # multiple fetch_ogimet_hourly calls within one driver run (e.g. one
 # city's multiple 30-day chunks, or multiple Ogimet cities in sequence).
 _last_ogimet_request_at: float = 0.0
+_OGIMET_REQUEST_LOCK = threading.Lock()
+
+
+def wait_for_ogimet_request_slot() -> None:
+    """Serialize every in-process Ogimet request at the provider cadence."""
+
+    global _last_ogimet_request_at
+    with _OGIMET_REQUEST_LOCK:
+        remaining = OGIMET_MIN_INTERVAL_SECONDS - (
+            time.monotonic() - _last_ogimet_request_at
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+        _last_ogimet_request_at = time.monotonic()
 
 # METAR temp/dewpoint group regex. Copied from
 # scripts/backfill_ogimet_metar.py::_METAR_TEMP_RE so a single-file change
@@ -336,13 +349,7 @@ def _request_ogimet(
 def _fetch_one_chunk(
     station: str, begin: datetime, end: datetime, timeout_seconds: float
 ) -> _ChunkResult:
-    global _last_ogimet_request_at
-    # Enforce Ogimet's documented 20s rate limit per remote IP.
-    import time as _time
-
-    elapsed = _time.monotonic() - _last_ogimet_request_at
-    if elapsed < OGIMET_MIN_INTERVAL_SECONDS:
-        _time.sleep(OGIMET_MIN_INTERVAL_SECONDS - elapsed)
+    wait_for_ogimet_request_slot()
     params = {
         "icao": station,
         "begin": begin.strftime("%Y%m%d%H%M"),
@@ -353,7 +360,6 @@ def _fetch_one_chunk(
             params=params,
             timeout_seconds=timeout_seconds,
         )
-        _last_ogimet_request_at = _time.monotonic()
     except (httpx.HTTPError, httpx.RequestError) as exc:
         logger.warning(
             "Ogimet fetch raised %s for %s %s..%s: %s",

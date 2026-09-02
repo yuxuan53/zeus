@@ -1,7 +1,7 @@
 # Created: 2026-04-17
-# Last reused or audited: 2026-08-11
+# Last reused or audited: 2026-09-01
 # Authority basis: AGENTS.md money path; S1 market source-proof persistence via market_topology_state.
-# Lifecycle: created=2026-04-17; last_reviewed=2026-08-11; last_reused=2026-08-11
+# Lifecycle: created=2026-04-17; last_reviewed=2026-09-01; last_reused=2026-09-01
 # Purpose: Lock market_scanner provenance, source-contract drift behavior, and Venus diagnostic authority labels.
 # Reuse: Inspect src/data/market_scanner.py and scripts/watch_source_contract.py before relying on these assertions.
 # Authority basis: audit bug B017 (STILL_OPEN P1 SD-H), Fitz methodology constraint #4 "Data Provenance > Code Correctness"; Wave16 object-meaning diagnostic authority repair.
@@ -1184,6 +1184,48 @@ class TestSourceContractGate:
         assert parsed["source_contract"]["source_family"] == "wu_icao"
         assert parsed["source_contract"]["station_id"] == "KLAX"
         assert parsed["resolution_source"].endswith("/KLAX")
+
+    def test_post_transition_noaa_station_enters_current_universe(self):
+        event = _gamma_temperature_event(
+            title="Highest temperature in NYC on September 3?",
+            slug="highest-temperature-in-nyc-on-september-3-2026",
+            question="Will the high temperature in NYC be 80°F or higher?",
+            resolution_source=(
+                "https://www.weather.gov/wrh/timeseries?site=KLGA"
+            ),
+        )
+
+        parsed = _parse_event(
+            event,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            min_hours=0.0,
+        )
+
+        assert parsed is not None
+        assert parsed["city"].name == "NYC"
+        assert parsed["source_contract"]["status"] == "MATCH"
+        assert parsed["source_contract"]["source_family"] == "noaa"
+        assert parsed["source_contract"]["station_id"] == "KLGA"
+
+    def test_post_transition_wu_family_is_rejected(self):
+        event = _gamma_temperature_event(
+            title="Highest temperature in NYC on September 3?",
+            slug="highest-temperature-in-nyc-on-september-3-2026",
+            question="Will the high temperature in NYC be 80°F or higher?",
+            resolution_source=(
+                "https://www.wunderground.com/history/daily/us/ny/"
+                "new-york-city/KLGA"
+            ),
+        )
+
+        assert (
+            _parse_event(
+                event,
+                datetime(2026, 9, 1, tzinfo=timezone.utc),
+                min_hours=0.0,
+            )
+            is None
+        )
 
     def test_contract_support_retains_closed_non_executable_shoulder(self):
         event = _gamma_support_event_with_closed_low_shoulder()

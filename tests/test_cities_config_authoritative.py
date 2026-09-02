@@ -1,3 +1,6 @@
+# Created: 2026-04-13
+# Last reused/audited: 2026-09-01
+# Authority basis: K0 city configuration packet; current NOAA source-family migration.
 """Authoritative city config + hemisphere/season invariants (K0 packet).
 
 These tests pin the K0 freeze: every city metadata field is correct,
@@ -241,13 +244,30 @@ def test_hong_kong_is_hko_source_type():
     assert hk.settlement_source_type == "hko"
 
 
-def test_all_non_special_cities_are_wu_icao():
-    special_types = {"Hong Kong": "hko", "Istanbul": "noaa", "Moscow": "noaa", "Tel Aviv": "noaa"}
+def test_current_source_family_partition_is_explicit():
+    non_noaa = {
+        "Auckland": "wu_icao",
+        "Hong Kong": "hko",
+        "Jakarta": "wu_icao",
+        "Jinan": "wu_icao",
+        "Lagos": "wu_icao",
+        "Taipei": "wu_icao",
+    }
     for name, city in cities_by_name.items():
-        if name in special_types:
-            assert city.settlement_source_type == special_types[name], f"{name}: expected {special_types[name]!r}, got {city.settlement_source_type!r}"
-        else:
-            assert city.settlement_source_type == "wu_icao", f"{name}: {city.settlement_source_type}"
+        expected = non_noaa.get(name, "noaa")
+        assert city.settlement_source_type == expected, (
+            f"{name}: expected {expected!r}, got {city.settlement_source_type!r}"
+        )
+        if expected == "noaa":
+            assert city.settlement_source == (
+                f"https://www.weather.gov/wrh/timeseries?site={city.wu_station}"
+            )
+            if city.previous_settlement_source_type is not None:
+                assert city.previous_settlement_source_type == "wu_icao"
+                assert city.settlement_source_type_effective_date in {
+                    "2026-08-23",
+                    "2026-08-24",
+                }
 
 
 # ==================== Route-to-bucket smoke test ====================

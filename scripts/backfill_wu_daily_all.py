@@ -131,7 +131,10 @@ def _city_stations_from_config() -> dict[str, tuple[str, str, str]]:
 
     stations: dict[str, tuple[str, str, str]] = {}
     for city in cities_by_name.values():
-        if city.settlement_source_type != "wu_icao":
+        if (
+            city.settlement_source_type != "wu_icao"
+            and city.previous_settlement_source_type != "wu_icao"
+        ):
             continue
         if not city.wu_station:
             continue
@@ -460,6 +463,22 @@ def backfill_city(
     start_date = start_date or (end_date - timedelta(days=days_back - 1))
     if start_date > end_date:
         raise ValueError(f"start_date {start_date} is after end_date {end_date}")
+    requested_end_date = end_date
+    if (
+        city_cfg is not None
+        and city_cfg.previous_settlement_source_type == "wu_icao"
+        and city_cfg.settlement_source_type_effective_date
+    ):
+        effective = date.fromisoformat(city_cfg.settlement_source_type_effective_date)
+        end_date = min(end_date, effective - timedelta(days=1))
+        if start_date > end_date:
+            return {
+                "city": city_name,
+                "collected": 0,
+                "skip": (requested_end_date - start_date).days + 1,
+                "err": 0,
+                "guard_rejected": 0,
+            }
     station_mismatch_rows = 0
     if replace_station_mismatch:
         station_mismatch_rows = _delete_station_mismatch_rows(

@@ -1821,6 +1821,7 @@ def _k2_obs_fast_tick():
             city_filter=city_filter,
             db_path=STATE_DIR / "zeus-world.db",
             day0_family_admission=family_admission,
+            include_ogimet=False,
         )
         _bridge_obs_tick_day0_results(
             source="k2_obs_fast_tick",

@@ -90,7 +90,11 @@ SOURCES_BY_TABLE: dict[DataTable, tuple[str, ...]] = {
 }
 
 
-def _source_applies_to_city(data_source: str, city: City) -> bool:
+def _source_applies_to_city(
+    data_source: str,
+    city: City,
+    target_date: date | str | None = None,
+) -> bool:
     """Return True if this data_source is the one Zeus uses for this city.
 
     For observations, the split is derived from ``city.settlement_source_type``:
@@ -98,7 +102,9 @@ def _source_applies_to_city(data_source: str, city: City) -> bool:
     ``hko_daily_api``.  For every other table, all cities share the same source.
     """
     if data_source in SOURCES_BY_TABLE[DataTable.OBSERVATIONS]:
-        return data_source == daily_observation_source_for_city(city.name)
+        return data_source == daily_observation_source_for_city(
+            city.name, target_date
+        )
     return True
 
 
@@ -243,9 +249,9 @@ def build_expected_set(
         if src_upper < window_start:
             continue
         for city in cities:
-            if not _source_applies_to_city(source, city):
-                continue
             for d in _iter_dates(window_start, src_upper):
+                if not _source_applies_to_city(source, city, d):
+                    continue
                 expected.append(
                     ExpectedRow(
                         city=city.name,
