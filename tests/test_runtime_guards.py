@@ -1846,6 +1846,13 @@ def test_held_monitor_uses_causal_market_channel_depth_after_snapshot_invalidati
 
     insert_quote("causal-quote", quote_at, 0.07, 0.12)
     insert_quote("future-quote", future_quote_at, 0.01, 0.03, update_latest=False)
+    record_snapshot_invalidation(
+        conn,
+        condition_id="condition-market-channel-depth",
+        token_id="yes123",
+        reason="held_rest_refresh",
+        invalidated_at=quote_at + timedelta(milliseconds=250),
+    )
 
     _insert_executable_snapshot(
         conn,
@@ -1854,7 +1861,7 @@ def test_held_monitor_uses_causal_market_channel_depth_after_snapshot_invalidati
         yes_token_id="one-sided-token",
         no_token_id="one-sided-no",
         condition_id="one-sided-condition",
-        captured_at=quote_at,
+        captured_at=quote_at + timedelta(milliseconds=500),
         executable_allowed=True,
     )
     conn.execute(

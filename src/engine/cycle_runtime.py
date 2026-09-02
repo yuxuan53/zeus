@@ -5467,7 +5467,7 @@ def _fresh_local_held_monitor_orderbooks(
                 VALUES {quote_values_sql}
             )
             SELECT latest.token_id,
-                   quote.depth_before_json,
+                   COALESCE(depth.depth_before_json, quote.depth_before_json),
                    latest.quote_seen_at,
                    metadata.active,
                    metadata.closed,
@@ -5480,21 +5480,31 @@ def _fresh_local_held_monitor_orderbooks(
                 ON latest.condition_id = requested.condition_id
                AND latest.token_id = requested.token_id
                AND latest.direction = requested.direction
-              JOIN execution_feasibility_evidence AS quote
+              LEFT JOIN execution_feasibility_latest AS depth
+                ON depth.condition_id = latest.condition_id
+               AND depth.token_id = latest.token_id
+               AND depth.direction = CASE requested.direction
+                   WHEN 'sell_yes' THEN 'buy_yes'
+                   ELSE 'buy_no'
+               END
+               AND depth.event_id = latest.event_id
+               AND depth.quote_seen_at = latest.quote_seen_at
+               AND depth.book_hash_before IS latest.book_hash_before
+              LEFT JOIN execution_feasibility_evidence AS quote
                 ON quote.evidence_id = latest.evidence_id
                AND quote.condition_id = latest.condition_id
                AND quote.token_id = latest.token_id
                AND quote.direction = latest.direction
                AND quote.quote_seen_at = latest.quote_seen_at
                AND quote.created_at = latest.created_at
-               AND quote.depth_before_json IS NOT NULL
               JOIN executable_market_snapshot_latest AS metadata
                 ON metadata.condition_id = latest.condition_id
                AND metadata.selected_outcome_token_id = latest.token_id
-               AND julianday(metadata.captured_at) <=
-                   julianday(latest.quote_seen_at)
+               AND julianday(metadata.captured_at) <= julianday(?)
                AND julianday(metadata.freshness_deadline) >= julianday(?)
              WHERE julianday(latest.quote_seen_at) IS NOT NULL
+               AND COALESCE(depth.depth_before_json, quote.depth_before_json)
+                   IS NOT NULL
                AND julianday(latest.quote_seen_at) >= julianday(?)
                AND julianday(latest.quote_seen_at) <= julianday(?)
                AND julianday(latest.created_at) <= julianday(?)
@@ -5509,12 +5519,15 @@ def _fresh_local_held_monitor_orderbooks(
                                metadata.no_token_id
                            )
                       )
+                      AND invalidation.reason != 'held_rest_refresh'
                       AND julianday(invalidation.invalidated_at) >=
                           julianday(latest.quote_seen_at)
+                      AND julianday(invalidation.invalidated_at) >=
+                          julianday(metadata.captured_at)
                       AND julianday(invalidation.invalidated_at) <= julianday(?)
                )
                 """,
-                (*quote_scope_params, checked_at, *quote_time_params),
+                (*quote_scope_params, checked_at, checked_at, *quote_time_params),
             ).fetchall()
     except Exception as exc:  # noqa: BLE001 - network remains the fallback.
         if (
