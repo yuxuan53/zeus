@@ -1,8 +1,8 @@
 # Created: 2026-06-11
-# Lifecycle: created=2026-06-11; last_reviewed=2026-08-28; last_reused=2026-08-28
+# Lifecycle: created=2026-06-11; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Lock provider-set and exact-input revision reseeding for replacement posteriors.
 # Reuse: Run for fusion upgrade, current-value serving, source callback, or station source changes.
-# Last reused or audited: 2026-08-28
+# Last reused or audited: 2026-09-02
 # Authority basis: Task #32 (operator 2026-06-11) — PARTIAL-fusion upgrade trigger. Relationship
 #   pins for the SINGLE instrument-set comparison + the idempotency bound:
 #     - a posterior fused from {A,B} with capture later containing {A,B,C} for the SAME cycle ⇒
@@ -182,6 +182,50 @@ def test_equal_set_signals_no_upgrade() -> None:
         conn, city="Testville", target_date="2026-06-13", metric="high"
     )
     assert verdict["is_upgrade"] is False
+    assert verdict["new_families"] == []
+
+
+def test_source_clock_scheme_excludes_possessed_unselected_family() -> None:
+    """A provider outside the fitted live basket cannot cause endless re-materialization."""
+    conn = _conn()
+    cyc = "2026-06-12T06:00:00+00:00"
+    _insert_single_runs(
+        conn,
+        city="Testville",
+        target_date="2026-06-13",
+        metric="high",
+        cycle_iso=cyc,
+        models=[_DWD, _UKMO],
+    )
+    dwd_id = int(
+        conn.execute(
+            "SELECT MAX(raw_model_forecast_id) FROM raw_model_forecasts WHERE model = ?",
+            (_DWD,),
+        ).fetchone()[0]
+    )
+    _insert_posterior(
+        conn,
+        city="Testville",
+        target_date="2026-06-13",
+        metric="high",
+        cycle_iso=cyc,
+        used_models=["ecmwf_ifs", _DWD],
+        computed_at="2026-06-12T10:00:00+00:00",
+        current_value_ids={_DWD: dwd_id},
+        configured_sources=["ecmwf_ifs", _DWD],
+    )
+
+    verdict = scope_capture_offers_larger_provider_set(
+        conn,
+        city="Testville",
+        target_date="2026-06-13",
+        metric="high",
+    )
+
+    assert verdict["is_upgrade"] is False
+    assert verdict["family_upgrade"] is False
+    assert verdict["served_families"] == ["DWD"]
+    assert verdict["capturable_families"] == ["DWD"]
     assert verdict["new_families"] == []
 
 
@@ -1071,12 +1115,9 @@ def test_station_input_revision_enqueue_is_idempotent_until_raw_id_changes(
         """
     ).fetchall()
     conn.close()
-    assert len(markers) == 3
-    assert markers[0][0] == "DWD,UKMO"
-    assert all(
-        "|input_revision=hko_fnd:" in marker[0] for marker in markers[1:]
-    )
-    assert len({marker[0] for marker in markers}) == 3
+    assert len(markers) == 2
+    assert all("DWD|input_revision=hko_fnd:" in marker[0] for marker in markers)
+    assert len({marker[0] for marker in markers}) == 2
 
 
 def _revision_upgrade_verdict(

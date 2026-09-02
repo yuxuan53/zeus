@@ -1,5 +1,5 @@
 # Created: 2026-06-11
-# Last reused or audited: 2026-07-28
+# Last reused or audited: 2026-09-02
 # Authority basis: Task #32 (operator 2026-06-11) — PARTIAL fusions never upgrade when late
 #   instruments publish. The materializer reads CURRENT values from the persisted single_runs
 #   capture (gem via previous_runs exception) at the OM9 anchor cycle; a provider whose
@@ -331,8 +331,9 @@ def _latest_posterior_inputs(
     str | None,
     tuple[str, ...],
     bool,
+    bool,
 ]:
-    """Return cycle, provider inputs, and committed Day0 successor state."""
+    """Return cycle, provider inputs, and committed Day0/source-clock state."""
     try:
         row = conn.execute(
             """
@@ -345,14 +346,14 @@ def _latest_posterior_inputs(
             (SOURCE_ID, city, target_date, metric),
         ).fetchone()
     except Exception:
-        return None, frozenset(), {}, frozenset(), None, (), False
+        return None, frozenset(), {}, frozenset(), None, (), False, False
     if row is None:
-        return None, frozenset(), {}, frozenset(), None, (), False
+        return None, frozenset(), {}, frozenset(), None, (), False, False
     source_cycle_iso = str(row[0]) if row[0] is not None else None
     try:
         prov = json.loads(row[1]) if row[1] else {}
     except Exception:
-        return source_cycle_iso, frozenset(), {}, frozenset(), None, (), False
+        return source_cycle_iso, frozenset(), {}, frozenset(), None, (), False, False
     fusion = prov.get("bayes_precision_fusion", {}) or {}
     used = fusion.get("used_models") or []
     if not isinstance(used, (list, tuple)):
@@ -375,6 +376,9 @@ def _latest_posterior_inputs(
     )
     if not isinstance(configured, (list, tuple)):
         configured = []
+    source_clock_scheme_bound = bool(configured) and str(
+        source_clock.get("fallback_to") or ""
+    ) != "current_precision_fusion"
     day0_revision, day0_expected_models = _canonical_day0_vector_revision(
         prov.get("day0_remaining_vector_witness")
     )
@@ -402,6 +406,7 @@ def _latest_posterior_inputs(
         day0_revision,
         day0_expected_models,
         day0_bundle_valid,
+        source_clock_scheme_bound,
     )
 
 
@@ -470,6 +475,7 @@ def scope_capture_offers_larger_provider_set(
         consumed_day0_vector_revision,
         day0_expected_models,
         day0_causal_bundle_valid,
+        source_clock_scheme_bound,
     ) = _latest_posterior_inputs(conn, city=city, target_date=target_date, metric=metric)
     if source_cycle_iso is None:
         return {
@@ -491,7 +497,25 @@ def scope_capture_offers_larger_provider_set(
         source_cycle_iso=source_cycle_iso,
         decision_time=decision_time,
     )
-    capturable = decorrelated_provider_families_of(set(capturable_inputs))
+    station_sources = frozenset(
+        source
+        for source in capturable_inputs
+        if source.startswith(("cwa_", "hko_"))
+    )
+    # A source-clock one-scheme posterior intentionally consumes only its fitted,
+    # walk-forward-selected basket.  A possessed provider outside that basket is
+    # data, but it is not a materializable family expansion: recomputing the same
+    # request will select the same basket again.  Count all providers only when
+    # the latest posterior explicitly fell back to current precision fusion (or
+    # carries no source-clock scheme); station sources remain exact-revision
+    # triggers because their arrival deliberately moves the materializer off the
+    # frozen basket.
+    family_candidate_sources = (
+        set(capturable_inputs)
+        if not source_clock_scheme_bound
+        else set(capturable_inputs) & set(configured_sources)
+    )
+    capturable = decorrelated_provider_families_of(family_candidate_sources)
     # DOMAIN-AWARE gate (2026-06-17 coarse-global removal): a family that is STRUCTURALLY ABSENT
     # for this city (NCEP/CMC outside their nest domains, now that the global fallbacks are gone)
     # must NEVER trigger an upgrade re-enqueue — there is no provider that can ever land, so the
@@ -512,11 +536,6 @@ def scope_capture_offers_larger_provider_set(
     # served set with no fusion (empty) is NOT upgraded here — there is no smaller-set posterior
     # to grow (the single-anchor fallback is a separate concern handled by the missing-capture gate).
     family_upgrade = bool(served) and bool(new_families) and served.issubset(capturable_expected)
-    station_sources = frozenset(
-        source
-        for source in capturable_inputs
-        if source.startswith(("cwa_", "hko_"))
-    )
     relevant_sources = (configured_sources or frozenset(consumed_inputs)) | station_sources
     requested_sources = None
     if changed_sources is not None:
