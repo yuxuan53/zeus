@@ -3676,9 +3676,10 @@ def _interleave_current_priority_seed_files_by_name(
     *,
     current_money_risk: frozenset[tuple[str, str, str]],
     current_global_scope: frozenset[tuple[str, str, str]],
+    never_priced_scope: frozenset[tuple[str, str, str]] = frozenset(),
     limit: int,
 ) -> tuple[Path, ...]:
-    """Keep held and global-only work visible before the raw inspection bound."""
+    """Keep held, global, and first-q work visible before the raw bound."""
 
     ordered = tuple(paths)
     if limit < 2:
@@ -3686,6 +3687,9 @@ def _interleave_current_priority_seed_files_by_name(
     held_prefixes = _current_money_risk_seed_prefixes(current_money_risk)
     global_only_prefixes = _current_money_risk_seed_prefixes(
         current_global_scope - current_money_risk
+    )
+    first_q_prefixes = _current_money_risk_seed_prefixes(
+        never_priced_scope - current_money_risk - current_global_scope
     )
     held = next(
         (
@@ -3723,10 +3727,21 @@ def _interleave_current_priority_seed_files_by_name(
             break
     if not global_witnesses:
         global_witnesses.append(global_path)
-    selected = {held, *global_witnesses}
+    first_q = next(
+        (
+            path
+            for path in ordered
+            if any(path.name.startswith(prefix) for prefix in first_q_prefixes)
+        ),
+        None,
+    )
+    if limit >= 3 and first_q is not None:
+        head = (held, global_witnesses[0], first_q, *global_witnesses[1:])
+    else:
+        head = (held, *global_witnesses)
+    selected = set(head)
     return (
-        held,
-        *global_witnesses,
+        *head,
         *(path for path in ordered if path not in selected),
     )
 
@@ -3790,9 +3805,10 @@ def _interleave_current_priority_seed_files(
     *,
     current_money_risk: frozenset[tuple[str, str, str]],
     current_global_scope: frozenset[tuple[str, str, str]],
+    never_priced_scope: frozenset[tuple[str, str, str]] = frozenset(),
     limit: int,
 ) -> tuple[Path, ...]:
-    """Reserve one bounded priority slot for current global selection truth."""
+    """Reserve bounded held, global, and first-q priority slots."""
 
     ordered = tuple(paths)
     if limit < 2:
@@ -3814,10 +3830,27 @@ def _interleave_current_priority_seed_files(
         ),
         None,
     )
-    if held is None or global_path is None:
+    first_q_path = next(
+        (
+            path
+            for path in ordered
+            if _request_family_scope(payloads.get(path))
+            in (never_priced_scope - current_money_risk - current_global_scope)
+        ),
+        None,
+    )
+    if held is None:
         return ordered
-    selected = {held, global_path}
-    return (held, global_path, *(path for path in ordered if path not in selected))
+    if global_path is None and first_q_path is None:
+        return ordered
+    if global_path is None:
+        head = (held, first_q_path)
+    elif limit >= 3 and first_q_path is not None:
+        head = (held, global_path, first_q_path)
+    else:
+        head = (held, global_path)
+    selected = set(head)
+    return (*head, *(path for path in ordered if path not in selected))
 
 
 def _interleave_current_priority_request_files(
@@ -3850,6 +3883,15 @@ def _interleave_current_priority_request_files(
         ),
         None,
     )
+    expansion_path = next(
+        (
+            path
+            for path in ordered
+            if _request_family_scope(payloads.get(path))
+            not in (current_money_risk | current_global_scope)
+        ),
+        None,
+    )
     if global_path is None:
         # ``paths`` is already filtered to the priority lane. A never-priced
         # family cannot enter the global auction until its first posterior is
@@ -3866,8 +3908,13 @@ def _interleave_current_priority_request_files(
         )
     if held is None or global_path is None:
         return ordered
-    selected = {held, global_path}
-    return (held, global_path, *(path for path in ordered if path not in selected))
+    head = (
+        (held, global_path, expansion_path)
+        if limit >= 3 and expansion_path is not None
+        else (held, global_path)
+    )
+    selected = set(head)
+    return (*head, *(path for path in ordered if path not in selected))
 
 
 def _read_day0_enqueue_ownership_cursor(cursor_path: Path) -> str | None:
@@ -4075,7 +4122,8 @@ def _prepare_seed_requests(
         prioritized_raw_snapshot = _interleave_current_priority_seed_files_by_name(
             prioritized_raw_snapshot,
             current_money_risk=current_money_risk,
-            current_global_scope=current_global_scope | never_priced_scope,
+            current_global_scope=current_global_scope,
+            never_priced_scope=never_priced_scope,
             limit=max(int(limit), 0),
         )
     else:
@@ -4149,7 +4197,8 @@ def _prepare_seed_requests(
             seeds,
             seed_payloads,
             current_money_risk=current_money_risk,
-            current_global_scope=current_global_scope | never_priced_scope,
+            current_global_scope=current_global_scope,
+            never_priced_scope=never_priced_scope,
             limit=actionable_limit,
         )
     actionable_count = 0

@@ -109,3 +109,11 @@ path truthfully returns `NO_REQUESTS`. This preserves bounded seed progress
 while preventing seed planning from becoming a mutex in front of complete q
 requests. Seven focused scheduler/interleave tests pass; the wider scheduler
 slice's single failure reproduces unchanged on live.
+
+Once the stale prepared-request backlog drained, a final two-slot coupling was
+visible: held capital and already-priced global families continuously occupied
+both seed slots while 204 never-priced current families waited behind them.
+The priority micro-batch is now three slots and its interleavers preserve one
+slot for each independent capital role: held-capital refresh, current global-q
+refresh, and first-posterior expansion. Nine focused scheduler/request/seed
+tests plus three existing seed-fairness tests pass.

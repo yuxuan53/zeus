@@ -2798,8 +2798,8 @@ def test_priority_job_bridges_seeds_after_request_lane_is_empty(
 
     receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
 
-    assert calls == [0, 2]
-    assert receipt == {"status": "PROCESSED", "seed_limit": 2}
+    assert calls == [0, 3]
+    assert receipt == {"status": "PROCESSED", "seed_limit": 3}
 
 
 def test_priority_request_tranche_reserves_global_q_slot(tmp_path) -> None:
@@ -2883,6 +2883,64 @@ def test_priority_request_tranche_reserves_first_q_before_global_auction(
     )
 
     assert ordered[:2] == (held, first_q)
+
+
+def test_priority_request_tranche_keeps_held_global_and_first_q(
+    tmp_path,
+) -> None:
+    """The three capital roles cannot consume one another's bounded slot."""
+    from src.data import replacement_forecast_live_materialization_queue as queue
+
+    held = tmp_path / "held.json"
+    global_q = tmp_path / "global.json"
+    first_q = tmp_path / "first-q.json"
+    held_scope = ("Istanbul", "2026-09-02", "high")
+    global_scope = ("Taipei", "2026-09-03", "low")
+    first_q_scope = ("Austin", "2026-09-02", "high")
+    payloads = {
+        path: {
+            "city": scope[0],
+            "target_date": scope[1],
+            "temperature_metric": scope[2],
+        }
+        for path, scope in (
+            (held, held_scope),
+            (global_q, global_scope),
+            (first_q, first_q_scope),
+        )
+    }
+
+    ordered = queue._interleave_current_priority_request_files(
+        (held, global_q, first_q),
+        payloads,
+        current_money_risk=frozenset({held_scope}),
+        current_global_scope=frozenset({held_scope, global_scope}),
+        limit=3,
+    )
+
+    assert ordered[:3] == (held, global_q, first_q)
+
+
+def test_priority_seed_tranche_keeps_held_global_and_first_q(tmp_path) -> None:
+    """Raw seed inspection exposes all three capital roles in one tranche."""
+    from src.data import replacement_forecast_live_materialization_queue as queue
+
+    held = tmp_path / "Istanbul.2026-09-02.high.json"
+    global_q = tmp_path / "Taipei.2026-09-03.low.json"
+    first_q = tmp_path / "Austin.2026-09-02.high.json"
+    held_scope = ("Istanbul", "2026-09-02", "high")
+    global_scope = ("Taipei", "2026-09-03", "low")
+    first_q_scope = ("Austin", "2026-09-02", "high")
+
+    ordered = queue._interleave_current_priority_seed_files_by_name(
+        (held, global_q, first_q),
+        current_money_risk=frozenset({held_scope}),
+        current_global_scope=frozenset({held_scope, global_scope}),
+        never_priced_scope=frozenset({first_q_scope}),
+        limit=3,
+    )
+
+    assert ordered[:3] == (held, global_q, first_q)
 
 
 def test_materialize_callbacks_return_lane_receipts_and_truthful_status_health(

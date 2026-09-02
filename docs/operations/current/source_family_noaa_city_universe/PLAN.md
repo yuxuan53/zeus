@@ -34,6 +34,8 @@ _See sibling scope.yaml for machine-readable scope._
   first-posterior work even while held Day0 revisions continuously arrive.
 - Claim prepared priority requests before scanning the expanded seed backlog;
   bridge a bounded seed tranche only when no actionable request remains.
+- Give held-capital, already-priced global-selection, and never-priced
+  first-posterior work independent slots in the priority micro-batch.
 - Re-run the strict current-regime capital evaluator; city coverage is not
   itself capital-advantage proof.
 

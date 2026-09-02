@@ -1357,7 +1357,7 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
     return _replacement_forecast_materialize_lane(
         cfg,
         lane="priority",
-        seed_limit=2,
+        seed_limit=3,
     )
 
 
@@ -1383,7 +1383,7 @@ def _replacement_forecast_materialize_lane(
         raw_manifest_dir=cfg["raw_manifest_dir"],
         seed_discovery_limit=1,
         seed_limit=seed_limit,
-        limit=2 if lane == "priority" else 1,
+        limit=3 if lane == "priority" else 1,
         discover=False,
         lane=lane,
     )
