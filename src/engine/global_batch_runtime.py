@@ -6391,6 +6391,24 @@ def _current_held_weather_families(
     return tuple(sorted(families))
 
 
+def _current_selection_portfolio_state(
+    trade_conn: object,
+    portfolio_state_provider: Callable[[], object] | None,
+) -> object | None:
+    """Bind holdings to the same canonical snapshot as selection wealth."""
+
+    if isinstance(trade_conn, sqlite3.Connection):
+        table = trade_conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='position_current'"
+        ).fetchone()
+        if table is not None:
+            from src.state.portfolio import load_runtime_open_portfolio
+
+            return load_runtime_open_portfolio(trade_conn)
+    return portfolio_state_provider() if portfolio_state_provider else None
+
+
 def _no_trade_rejection_log_summary(
     decision: object,
     *,
@@ -7717,13 +7735,10 @@ def process_current_global_batch(
                 trade_conn,
                 "wealth_capture",
             ) as wealth_conn:
-                state = (
-                    portfolio_state_provider() if portfolio_state_provider else None
+                state = _current_selection_portfolio_state(
+                    wealth_conn,
+                    portfolio_state_provider,
                 )
-                if state is None and hasattr(wealth_conn, "execute"):
-                    from src.state.portfolio import load_runtime_open_portfolio
-
-                    state = load_runtime_open_portfolio(wealth_conn)
                 witness = current_portfolio_wealth_witness(
                     wealth_conn,
                     decision_at_utc=current_time(),

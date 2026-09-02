@@ -24365,6 +24365,29 @@ def _wealth_test_conn(
     return conn
 
 
+def test_global_selection_uses_cut_snapshot_not_cycle_cached_portfolio(monkeypatch):
+    from src.engine import global_batch_runtime
+    from src.state import portfolio
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE position_current (position_id TEXT PRIMARY KEY)")
+    current = object()
+    monkeypatch.setattr(
+        portfolio,
+        "load_runtime_open_portfolio",
+        lambda read_conn: current if read_conn is conn else pytest.fail(
+            "selection must use its own canonical connection"
+        ),
+    )
+
+    selected = global_batch_runtime._current_selection_portfolio_state(
+        conn,
+        lambda: pytest.fail("cycle-cached portfolio must not override DB truth"),
+    )
+
+    assert selected is current
+
+
 def test_current_portfolio_wealth_witness_uses_one_chain_generation():
     decision_at = _dt.datetime(2026, 7, 10, 8, 0, tzinfo=_dt.timezone.utc)
     conn = _wealth_test_conn(captured_at=decision_at)
