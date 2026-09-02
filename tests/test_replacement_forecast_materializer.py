@@ -1,6 +1,6 @@
 # Created: 2026-06-06
-# Last reused/audited: 2026-08-30
-# Lifecycle: created=2026-06-06; last_reviewed=2026-08-30; last_reused=2026-08-30
+# Last reused/audited: 2026-09-02
+# Lifecycle: created=2026-06-06; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Protect DB materialization for Open-Meteo ECMWF IFS 9km + Bayes-fusion replacement live layer.
 # Reuse: Run before changing replacement forecast live/experiment write path.
 # Authority basis: Operator-directed replacement forecast simple-switch readiness.
@@ -898,16 +898,14 @@ def test_forecast_posteriors_runtime_layer_migration_does_not_write_when_already
         sql
         for sql in traced
         if sql.lstrip().upper().startswith("SELECT 1")
-        and "FORECAST_POSTERIORS" in sql.upper()
+        and "FROM FORECAST_POSTERIORS" in sql.upper()
     ]
     assert compatibility_reads
-    indexed_reads = [
-        sql
+    assert all(
+        "INDEXED BY idx_forecast_posteriors_runtime_layer_target" in sql
         for sql in compatibility_reads
-        if "INDEXED BY idx_forecast_posteriors_runtime_layer_target" in sql
-    ]
-    assert indexed_reads
-    assert all("!=" not in sql for sql in indexed_reads)
+    )
+    assert all("!=" not in sql for sql in compatibility_reads)
 
 
 def test_forecast_posteriors_runtime_layer_migration_repairs_invalid_observation_view() -> None:

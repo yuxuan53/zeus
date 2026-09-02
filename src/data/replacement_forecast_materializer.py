@@ -429,15 +429,29 @@ def _ensure_forecast_posteriors_runtime_layer(conn: sqlite3.Connection) -> None:
             """
         )
         columns.add("runtime_layer")
-    has_non_live_rows = conn.execute(
+    runtime_layer_index_exists = conn.execute(
         """
         SELECT 1
-          FROM forecast_posteriors
+          FROM sqlite_master
+         WHERE type = 'index'
+           AND name = 'idx_forecast_posteriors_runtime_layer_target'
+        """
+    ).fetchone() is not None
+    indexed_by = (
+        "INDEXED BY idx_forecast_posteriors_runtime_layer_target"
+        if runtime_layer_index_exists
+        else ""
+    )
+    has_non_live_rows = conn.execute(
+        f"""
+        SELECT 1
+          FROM forecast_posteriors {indexed_by}
          WHERE runtime_layer IS NULL
-            OR runtime_layer != ?
+            OR runtime_layer < ?
+            OR runtime_layer > ?
          LIMIT 1
         """,
-        (LIVE_RUNTIME_LAYER,),
+        (LIVE_RUNTIME_LAYER, LIVE_RUNTIME_LAYER),
     ).fetchone()
     if has_non_live_rows is not None:
         conn.execute(
