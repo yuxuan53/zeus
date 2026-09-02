@@ -13400,6 +13400,66 @@ def test_local_monitor_prefetch_interrupt_preserves_completed_books(monkeypatch)
     assert conn.progress_handler_calls[-1][0] is None
 
 
+def test_local_monitor_prefetch_miss_does_not_scan_snapshot_history(monkeypatch):
+    """A current-projection miss must immediately admit bounded CLOB fallback."""
+    from src.engine import cycle_runtime
+
+    position = _make_position(
+        trade_id="local-current-miss",
+        condition_id="local-current-miss-condition",
+        token_id="local-current-miss-token",
+        direction="buy_yes",
+    )
+
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = tuple(rows)
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def __iter__(self):
+            return iter(self.rows)
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class CurrentOnlyConnection:
+        def __init__(self):
+            self.sql = []
+
+        def set_progress_handler(self, *_args):
+            pass
+
+        def execute(self, sql, _params=()):
+            self.sql.append(sql)
+            if "sqlite_master" in sql:
+                return Result(((1,),))
+            if "executable_market_snapshot_latest" in sql:
+                return Result()
+            if "execution_feasibility_latest" in sql:
+                return Result()
+            raise AssertionError("current miss must not open historical fallback SQL")
+
+    conn = CurrentOnlyConnection()
+    monkeypatch.setattr(cycle_runtime.time, "monotonic", lambda: 10.0)
+
+    books = cycle_runtime._fresh_local_held_monitor_orderbooks(
+        conn,
+        [position],
+        now_utc=datetime(2026, 9, 2, 5, 0, tzinfo=timezone.utc),
+        summary={},
+        deps=_monitor_test_deps("local_current_miss"),
+        deadline_monotonic=20.0,
+    )
+
+    assert books == {}
+    assert len(conn.sql) == 4
+    assert all(
+        "SELECT DISTINCT requested.condition_id" not in sql for sql in conn.sql
+    )
+
+
 def test_local_monitor_prefetch_import_failure_is_fail_soft_and_cleans_handler(
     monkeypatch,
 ):

@@ -5440,48 +5440,13 @@ def _fresh_local_held_monitor_orderbooks(
                     candidates[token_id] = (captured_at, book)
 
         snapshot_row_tokens = {str(row[0] or "").strip() for row in snapshot_rows}
-        fallback_candidates = [
+        # A miss in the current projection may still use a newer causal market-
+        # channel quote, but it must not first scan historical snapshots merely
+        # to decide whether that lookup is allowed.  The quote query below
+        # independently binds exact metadata and invalidation time.
+        fallback_scope = [
             triple for triple in scope if triple[1] not in snapshot_row_tokens
         ]
-        fallback_scope = []
-        if fallback_candidates:
-            fallback_values_sql = ",".join("(?, ?, ?)" for _ in fallback_candidates)
-            fallback_params = [
-                part for triple in fallback_candidates for part in triple
-            ]
-            fallback_params.extend((checked_at, checked_at))
-            fallback_rows = conn.execute(
-                f"""
-            WITH requested(condition_id, token_id, direction) AS (
-                VALUES {fallback_values_sql}
-            )
-            SELECT DISTINCT requested.condition_id,
-                            requested.token_id,
-                            requested.direction
-              FROM requested
-              JOIN executable_market_snapshots AS snapshot
-                ON snapshot.condition_id = requested.condition_id
-               AND snapshot.selected_outcome_token_id = requested.token_id
-             WHERE julianday(snapshot.captured_at) <= julianday(?)
-               AND EXISTS (
-                    SELECT 1
-                      FROM executable_market_snapshot_invalidations AS invalidation
-                     WHERE (
-                            invalidation.condition_id = snapshot.condition_id
-                            OR invalidation.token_id IN (
-                                snapshot.selected_outcome_token_id,
-                                snapshot.yes_token_id,
-                                snapshot.no_token_id
-                            )
-                       )
-                       AND julianday(invalidation.invalidated_at) >=
-                           julianday(snapshot.captured_at)
-                       AND julianday(invalidation.invalidated_at) <= julianday(?)
-               )
-            """,
-                fallback_params,
-            ).fetchall()
-            fallback_scope = [tuple(row) for row in fallback_rows]
         quote_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='execution_feasibility_latest' LIMIT 1"
@@ -5489,14 +5454,9 @@ def _fresh_local_held_monitor_orderbooks(
         quote_rows = []
         if quote_table is not None and fallback_scope:
             quote_values_sql = ",".join("(?, ?, ?)" for _ in fallback_scope)
-            quote_scope_params = [
-                part for triple in fallback_scope for part in triple
-            ]
+            quote_scope_params = [part for triple in fallback_scope for part in triple]
             quote_time_params = (
-                (
-                    now_utc.astimezone(timezone.utc)
-                    - FRESHNESS_WINDOW_DEFAULT
-                ).isoformat(),
+                (now_utc.astimezone(timezone.utc) - FRESHNESS_WINDOW_DEFAULT).isoformat(),
                 checked_at,
                 checked_at,
                 checked_at,
@@ -5615,20 +5575,24 @@ def _fresh_local_held_monitor_orderbooks(
                 bid, _bid_size = _top_book_level_decimal(book, "bids")
             except ExecutableSnapshotCaptureError:
                 bid = None
-            if row[7] is not None:
-                if bid is None or not math.isclose(
+            if row[7] is not None and (
+                bid is None
+                or not math.isclose(
                     float(bid), float(row[7]), rel_tol=0.0, abs_tol=1e-9
-                ):
-                    continue
+                )
+            ):
+                continue
             try:
                 ask, _ask_size = _top_book_level_decimal(book, "asks")
             except ExecutableSnapshotCaptureError:
                 ask = None
-            if row[8] is not None:
-                if ask is None or not math.isclose(
+            if row[8] is not None and (
+                ask is None
+                or not math.isclose(
                     float(ask), float(row[8]), rel_tol=0.0, abs_tol=1e-9
-                ):
-                    continue
+                )
+            ):
+                continue
             if bid is None and ask is None:
                 continue
         except (
