@@ -12281,7 +12281,86 @@ def test_reactor_poll_defers_ordinary_work_after_exact_debt_read(monkeypatch) ->
     monkeypatch.setattr(wake_module, "read_reactor_wake", lambda **kwargs: reads.append(kwargs))
 
     assert main_module._edli_reactor_wake_poll_once() is False
-    assert reads == []
+    assert reads == [{"fail_on_error": True}]
+
+
+def test_held_day0_wake_bypasses_monitor_fairness_before_floor_crossing(
+    monkeypatch,
+) -> None:
+    import src.main as main_module
+    import src.runtime.reactor_wake as wake_module
+
+    family = ("Manila", "2026-09-03", "high")
+    wake = wake_module.ReactorWake(
+        "day0-held-before-floor",
+        "2026-09-02T16:01:37+00:00",
+        "day0_fast_obs",
+        "day0_extreme_event_committed",
+        forecast_families=(family,),
+    )
+    fairness_debt = type(
+        main_module._periodic_held_position_monitor_fairness_debt
+    )()
+    fairness_debt.set()
+    reads: list[dict] = []
+    monkeypatch.setattr(
+        main_module,
+        "_periodic_held_position_monitor_fairness_debt",
+        fairness_debt,
+    )
+    monkeypatch.setattr(
+        wake_module,
+        "exact_held_sell_completion_wake_ids",
+        lambda **kwargs: (
+            frozenset()
+            if kwargs == {"fail_on_error": True}
+            else pytest.fail("exact debt discovery used the wrong failure policy")
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_defer_for_held_position_monitor",
+        lambda job: job == "edli_event_reactor",
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_day0_wake_requires_exit_monitor",
+        lambda families: families == frozenset({family}),
+    )
+    monkeypatch.setattr(
+        wake_module,
+        "read_reactor_wake",
+        lambda **kwargs: reads.append(kwargs)
+        or (wake if len(reads) == 1 else None),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_exit_monitor_excluded_wake_ids",
+        lambda: frozenset(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_collateral_authority_wake_backoff_ids",
+        lambda: frozenset(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_paused_forecast_carrier_priority_allowed",
+        lambda **_kwargs: False,
+    )
+
+    main_module._day0_exit_monitor_attempts.clear()
+    try:
+        assert main_module._edli_reactor_wake_poll_once() is False
+        assert reads == [
+            {"fail_on_error": True},
+            {
+                "prefer_forecast_carrier_progress": False,
+                "fail_on_error": False,
+            },
+        ]
+    finally:
+        main_module._day0_exit_monitor_attempts.clear()
 
 
 def test_reactor_wrapper_preexisting_canonical_debt_scopes_buy_without_preemption(

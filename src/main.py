@@ -6720,6 +6720,33 @@ def _edli_reactor_wake_poll_once() -> bool:
         read_reactor_wake,
     )
 
+    def _unowned_day0_monitor_wake_pending() -> bool:
+        """Preserve the shortest alpha clock without admitting entry-only work."""
+
+        # SCOPE: the newest unowned Day0 wake only when its family has held or
+        # resting capital. DRAIN: its existing targeted monitor absorbs overdue
+        # families under the single monitor claim. RESET: attempt ownership,
+        # acknowledgement, or proof of no capital restores ordinary fairness.
+        try:
+            pending = read_reactor_wake(fail_on_error=True)
+        except (OSError, ValueError):
+            logger.warning(
+                "urgent Day0 wake selection unreadable; retaining monitor fairness",
+                exc_info=True,
+            )
+            return False
+        if pending is None or pending.reason != "day0_extreme_event_committed":
+            return False
+        with _day0_exit_monitor_attempts_lock:
+            if pending.wake_id in _day0_exit_monitor_attempts:
+                return False
+        families = (
+            frozenset(pending.forecast_families)
+            if pending.forecast_families
+            else _day0_wake_target_families(tuple(pending.event_ids))
+        )
+        return _day0_wake_requires_exit_monitor(families)
+
     reactor_blocked_by_monitor_fairness = (
         _periodic_held_position_monitor_fairness_debt.is_set()
     )
@@ -6733,13 +6760,12 @@ def _edli_reactor_wake_poll_once() -> bool:
             exc_info=True,
         )
         return False
-    if (
-        not exact_held_sell_wake_ids
-        and _defer_for_held_position_monitor("edli_event_reactor")
-    ):
-        return False
-    if reactor_blocked_by_monitor_fairness and not exact_held_sell_wake_ids:
-        return False
+    if not exact_held_sell_wake_ids:
+        monitor_deferred = _defer_for_held_position_monitor("edli_event_reactor")
+        if (monitor_deferred or reactor_blocked_by_monitor_fairness) and not (
+            _unowned_day0_monitor_wake_pending()
+        ):
+            return False
     prefer_exact_held_sell = bool(exact_held_sell_wake_ids)
 
     excluded_wake_ids = frozenset(
