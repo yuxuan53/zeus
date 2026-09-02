@@ -6501,6 +6501,67 @@ def test_preflight_tolerates_pre_submit_exit_retry_without_exit_command(monkeypa
     assert tolerated["repair_evidence"]["event_type"] == "EXIT_ORDER_REJECTED"
 
 
+def test_stranded_exit_intent_probe_starts_from_pending_positions(monkeypatch, tmp_path):
+    trade_db, forecast_db, _state_dir = _patch_paths(monkeypatch, tmp_path)
+    trade = _init_trade_db(trade_db)
+    _init_forecast_db(forecast_db).close()
+    trade.execute(
+        """
+        CREATE TABLE venue_commands (
+            command_id TEXT PRIMARY KEY,
+            position_id TEXT,
+            intent_kind TEXT
+        )
+        """
+    )
+    trade.execute(
+        """
+        CREATE TABLE position_events (
+            event_id TEXT PRIMARY KEY,
+            position_id TEXT,
+            sequence_no INTEGER,
+            event_type TEXT,
+            occurred_at TEXT,
+            venue_status TEXT
+        )
+        """
+    )
+    trade.execute(
+        """
+        INSERT INTO position_current VALUES (
+            'stranded-pos', 'pending_exit', 'Manila', '2026-09-03', 'high',
+            '29C', 'buy_yes', 12.2, 12.2, 'exit_intent',
+            'DAY0_HARD_FACT_BIN_DEAD', 0, NULL, 0.0, 1, 0.05, 1,
+            '2026-09-02T16:01:37+00:00'
+        )
+        """
+    )
+    trade.execute(
+        """
+        INSERT INTO position_events VALUES (
+            'stranded-pos:exit:1', 'stranded-pos', 1, 'EXIT_INTENT',
+            '2026-09-02T16:01:37+00:00', 'exit_intent'
+        )
+        """
+    )
+    trade.commit()
+    trade.close()
+
+    recoverable = preflight._stranded_exit_intent_recoverable_by_position()
+
+    assert recoverable == {
+        "stranded-pos": {
+            "event_id": "stranded-pos:exit:1",
+            "event_type": "EXIT_INTENT",
+            "venue_status": "exit_intent",
+            "event_occurred_at": "2026-09-02T16:01:37+00:00",
+            "order_status": "exit_intent",
+            "exit_retry_count": 0,
+            "next_exit_retry_at": None,
+        }
+    }
+
+
 def test_preflight_tolerates_pre_submit_backoff_for_global_redecision(
     monkeypatch,
     tmp_path,
@@ -7769,6 +7830,53 @@ def test_execution_feasibility_freshness_uses_observation_time_not_venue_book_ti
     assert covered["latest_quote_seen_at"] == stale_book_time.isoformat()
 
 
+def test_execution_feasibility_never_substitutes_fresh_sibling_token():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(minutes=10)
+    conn.execute(
+        """
+        CREATE TABLE execution_feasibility_evidence (
+            condition_id TEXT,
+            token_id TEXT,
+            quote_seen_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO execution_feasibility_evidence VALUES (?, ?, ?, ?)",
+        (
+            ("cond-target", "tok-yes-target", now.isoformat(), now.isoformat()),
+            ("cond-target", "tok-no-target", stale.isoformat(), stale.isoformat()),
+        ),
+    )
+
+    result = preflight._execution_feasibility_exposure_freshness(
+        conn,
+        columns={"condition_id", "token_id", "quote_seen_at", "created_at"},
+        exposures=[
+            {
+                "position_id": "active-pos",
+                "phase": "active",
+                "city": "London",
+                "target_date": "2026-09-03",
+                "temperature_metric": "high",
+                "bin_label": "29C",
+                "direction": "buy_no",
+                "condition_id": "cond-target",
+                "tokens": ["tok-yes-target", "tok-no-target"],
+                "held_token_id": "tok-no-target",
+            }
+        ],
+        now=now,
+    )
+
+    assert result["risky"][0]["risk"] == "stale_execution_feasibility_evidence"
+    assert result["covered"][0]["latest_observed_at"] == stale.isoformat()
+
+
 def test_execution_feasibility_freshness_tolerates_small_writer_clock_skew():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -8027,6 +8135,7 @@ def test_execution_feasibility_freshness_uses_fresh_executable_snapshot_quote():
                 "direction": "buy_no",
                 "condition_id": "cond-target",
                 "tokens": ["tok-no-target", "tok-yes-target"],
+                "held_token_id": "tok-no-target",
             }
         ],
         now=now,
@@ -8037,6 +8146,53 @@ def test_execution_feasibility_freshness_uses_fresh_executable_snapshot_quote():
     assert covered["freshness_basis"] == "executable_market_snapshots.captured_at"
     assert covered["snapshot_id"] == "snap-fresh"
     assert covered["execution_feasibility_age_seconds"] > 3600
+
+
+def test_executable_snapshot_never_substitutes_fresh_sibling_token():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        """
+        CREATE TABLE executable_market_snapshots (
+            snapshot_id TEXT,
+            condition_id TEXT,
+            yes_token_id TEXT,
+            no_token_id TEXT,
+            selected_outcome_token_id TEXT,
+            outcome_label TEXT,
+            closed INTEGER,
+            accepting_orders INTEGER,
+            orderbook_top_bid TEXT,
+            orderbook_top_ask TEXT,
+            captured_at TEXT NOT NULL,
+            freshness_deadline TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO executable_market_snapshots VALUES (
+            'snap-wrong-side', 'cond-target', 'tok-yes-target', 'tok-no-target',
+            'tok-yes-target', 'YES', 0, 1, '0.80', '0.82', ?, ?
+        )
+        """,
+        (now.isoformat(), (now + timedelta(minutes=2)).isoformat()),
+    )
+
+    evidence = preflight._fresh_executable_snapshot_quote_for_exposure(
+        conn,
+        exposure={
+            "position_id": "active-pos",
+            "direction": "buy_no",
+            "condition_id": "cond-target",
+            "tokens": ["tok-yes-target", "tok-no-target"],
+            "held_token_id": "tok-no-target",
+        },
+        now=now,
+    )
+
+    assert evidence is None
 
 
 def test_execution_feasibility_freshness_accepts_negrisk_child_snapshot_active_false():

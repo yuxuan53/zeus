@@ -695,11 +695,23 @@ def _table_columns(conn: sqlite3.Connection, schema: str, table: str) -> set[str
 
 
 def _open_exposure_identity(row: sqlite3.Row) -> dict[str, Any]:
-    tokens = {
-        str(row[key] or "").strip()
-        for key in ("token_id", "no_token_id")
-        if key in row.keys()
-    }
+    yes_token = (
+        str(row["token_id"] or "").strip() if "token_id" in row.keys() else ""
+    )
+    no_token = (
+        str(row["no_token_id"] or "").strip()
+        if "no_token_id" in row.keys()
+        else ""
+    )
+    direction = str(row["direction"] or "").strip().lower()
+    held_token = (
+        yes_token
+        if direction == "buy_yes"
+        else no_token
+        if direction == "buy_no"
+        else ""
+    )
+    tokens = {yes_token, no_token}
     tokens.discard("")
     return {
         "position_id": row["position_id"],
@@ -711,7 +723,22 @@ def _open_exposure_identity(row: sqlite3.Row) -> dict[str, Any]:
         "direction": row["direction"],
         "condition_id": str(row["condition_id"] or "").strip() if "condition_id" in row.keys() else "",
         "tokens": sorted(tokens),
+        "held_token_id": held_token,
     }
+
+
+def _held_side_exposure(exposure: dict[str, Any]) -> dict[str, Any]:
+    """Return one exact held-token identity; never substitute its sibling."""
+
+    held_token = str(exposure.get("held_token_id") or "").strip()
+    tokens = [
+        str(token).strip()
+        for token in exposure.get("tokens", [])
+        if str(token).strip()
+    ]
+    if not held_token and len(tokens) == 1:
+        held_token = tokens[0]
+    return {**exposure, "tokens": [held_token] if held_token else []}
 
 
 def _freshness_predicate_for_exposure(
@@ -750,6 +777,7 @@ def _exposure_stub(exposure: dict[str, Any]) -> dict[str, Any]:
         "direction": exposure.get("direction"),
         "condition_id": exposure.get("condition_id"),
         "tokens": exposure.get("tokens", []),
+        "held_token_id": exposure.get("held_token_id"),
     }
 
 
@@ -3930,9 +3958,10 @@ def _execution_feasibility_exposure_freshness(
     risky: list[dict[str, Any]] = []
     covered: list[dict[str, Any]] = []
     for exposure in exposures:
+        held_exposure = _held_side_exposure(exposure)
         predicate = _freshness_predicate_for_exposure(
             columns=columns,
-            exposure=exposure,
+            exposure=held_exposure,
             token_columns=("token_id",),
             include_condition_id=False,
         )
@@ -4110,8 +4139,9 @@ def _fresh_executable_snapshot_quote_for_exposure(
     columns = _table_columns(conn, "main", "executable_market_snapshots")
     predicate = _freshness_predicate_for_exposure(
         columns=columns,
-        exposure=exposure,
-        token_columns=("token_id", "yes_token_id", "no_token_id", "selected_outcome_token_id"),
+        exposure=_held_side_exposure(exposure),
+        token_columns=("selected_outcome_token_id",),
+        include_condition_id=False,
     )
     if predicate is None:
         return None
@@ -6074,50 +6104,40 @@ def _stranded_exit_intent_recoverable_by_position() -> dict[str, dict[str, Any]]
             return {}
         rows = conn.execute(
             """
-            WITH latest_exit AS (
-                SELECT cmd.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY cmd.position_id
-                           ORDER BY datetime(cmd.updated_at) DESC, cmd.command_id DESC
-                       ) AS rn
-                  FROM venue_commands cmd
-                 WHERE cmd.intent_kind = 'EXIT'
-            ),
-            latest_exit_event AS (
-                SELECT pe.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY pe.position_id
-                           ORDER BY pe.sequence_no DESC, datetime(pe.occurred_at) DESC
-                       ) AS rn
-                  FROM position_events pe
-                 WHERE pe.event_type IN (
-                       'EXIT_INTENT',
-                       'EXIT_ORDER_POSTED',
-                       'EXIT_ORDER_REJECTED',
-                       'EXIT_ORDER_FILLED',
-                       'EXIT_ORDER_VOIDED',
-                       'EXIT_RETRY_SCHEDULED',
-                       'EXIT_BACKOFF_EXHAUSTED'
-                 )
-            )
             SELECT pc.position_id,
                    pc.order_status,
                    pc.exit_retry_count,
                    pc.next_exit_retry_at,
-                   latest_exit_event.event_id,
-                   latest_exit_event.event_type,
-                   latest_exit_event.venue_status,
-                   latest_exit_event.occurred_at
+                   latest_event.event_id,
+                   latest_event.event_type,
+                   latest_event.venue_status,
+                   latest_event.occurred_at
               FROM position_current pc
-              LEFT JOIN latest_exit
-                ON latest_exit.position_id = pc.position_id
-               AND latest_exit.rn = 1
-              JOIN latest_exit_event
-                ON latest_exit_event.position_id = pc.position_id
-               AND latest_exit_event.rn = 1
+              JOIN position_events latest_event
+                ON latest_event.event_id = (
+                    SELECT pe.event_id
+                      FROM position_events pe
+                     WHERE pe.position_id = pc.position_id
+                       AND pe.event_type IN (
+                           'EXIT_INTENT',
+                           'EXIT_ORDER_POSTED',
+                           'EXIT_ORDER_REJECTED',
+                           'EXIT_ORDER_FILLED',
+                           'EXIT_ORDER_VOIDED',
+                           'EXIT_RETRY_SCHEDULED',
+                           'EXIT_BACKOFF_EXHAUSTED'
+                       )
+                     ORDER BY pe.sequence_no DESC
+                     LIMIT 1
+                )
              WHERE pc.phase = 'pending_exit'
-               AND latest_exit.command_id IS NULL
-               AND latest_exit_event.event_type = 'EXIT_INTENT'
+               AND latest_event.event_type = 'EXIT_INTENT'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM venue_commands cmd
+                    WHERE cmd.position_id = pc.position_id
+                      AND cmd.intent_kind = 'EXIT'
+               )
             """
         ).fetchall()
     recoverable: dict[str, dict[str, Any]] = {}
