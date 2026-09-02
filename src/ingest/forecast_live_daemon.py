@@ -1348,7 +1348,24 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
         lane="priority",
         seed_limit=0,
     )
-    if request_report.get("status") != "NO_REQUESTS":
+    request_made_progress = any(
+        int(request_report.get(field) or 0) > 0
+        for field in (
+            "processed_count",
+            "failed_count",
+            "committed_posterior_count",
+            "reactor_wake_published_count",
+        )
+    )
+    zero_progress_retry = (
+        request_report.get("status") == "PROCESSED"
+        and request_report.get("processed_count") == 0
+        and request_report.get("failed_count") == 0
+    )
+    if (
+        request_report.get("status") != "NO_REQUESTS"
+        and not zero_progress_retry
+    ) or request_made_progress:
         return request_report
     # Prepared requests are the exact handoff into q. Only bridge another
     # bounded seed tranche when that handoff has no actionable work; otherwise

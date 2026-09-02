@@ -2802,6 +2802,46 @@ def test_priority_job_bridges_seeds_after_request_lane_is_empty(
     assert receipt == {"status": "PROCESSED", "seed_limit": 3}
 
 
+def test_priority_job_bridges_seeds_after_zero_progress_request_retry(
+    monkeypatch, tmp_path
+) -> None:
+    """A retry-only request receipt cannot become a seed-bridge ratchet."""
+    from src.data import replacement_forecast_production
+    from src.ingest import forecast_live_daemon
+
+    cfg = {"request_dir": tmp_path / "requests"}
+    cfg["request_dir"].mkdir()
+    monkeypatch.setattr(
+        replacement_forecast_production,
+        "_replacement_forecast_live_materialization_queue_config",
+        lambda: cfg,
+    )
+    calls: list[int] = []
+
+    def run_lane(_cfg, *, lane, seed_limit):
+        calls.append(seed_limit)
+        assert lane == "priority"
+        if seed_limit == 0:
+            return {
+                "status": "PROCESSED",
+                "processed_count": 0,
+                "failed_count": 0,
+                "reason_codes": [
+                    "REPLACEMENT_LIVE_MATERIALIZATION_TIMEOUT_RETRY_DEFERRED"
+                ],
+            }
+        return {"status": "PROCESSED", "seed_limit": seed_limit}
+
+    monkeypatch.setattr(
+        forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
+    )
+
+    receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
+
+    assert calls == [0, 3]
+    assert receipt == {"status": "PROCESSED", "seed_limit": 3}
+
+
 def test_priority_request_tranche_reserves_global_q_slot(tmp_path) -> None:
     from src.data import replacement_forecast_live_materialization_queue as queue
 

@@ -117,3 +117,10 @@ The priority micro-batch is now three slots and its interleavers preserve one
 slot for each independent capital role: held-capital refresh, current global-q
 refresh, and first-posterior expansion. Nine focused scheduler/request/seed
 tests plus three existing seed-fairness tests pass.
+
+Live then showed retry receipts with `status=PROCESSED` but every atomic count
+zero. Treating that label as progress let four timeout-retry files ratchet the
+seed bridge closed. The callback now uses the receipt counts: a real processed,
+failed, committed, or published item retains the request slot; a zero-progress
+retry receipt permits the independent seed tranche to run. Six focused
+priority-callback tests pass.
