@@ -19738,6 +19738,17 @@ class TestRecoveryResolutionTable:
             state="CONFIRMED",
             filled_size="2",
             fill_price="0.46",
+            tx_hash="0xexit-partial",
+        )
+        _append_trade_fact(
+            conn,
+            command_id="cmd-exit",
+            order_id="ord-exit-partial",
+            trade_id="0xexit-partial",
+            state="MATCHED",
+            filled_size="2",
+            fill_price="0.46",
+            tx_hash="0xexit-partial",
         )
         from src.state.venue_command_repo import append_event
 
