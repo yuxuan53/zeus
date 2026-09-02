@@ -5324,8 +5324,10 @@ class TestExitOrderCommandSplit:
             "tx_hash": "0xhash-exit-matched",
         }
 
-    def test_exit_matched_status_with_partial_size_stays_partial(self, mem_conn):
-        """Venue MATCHED text cannot terminalize fewer shares than were submitted."""
+    def test_exit_matched_status_with_partial_size_stays_partial(
+        self, mem_conn, monkeypatch
+    ):
+        """FAK short fill terminalizes its order remainder for re-auction."""
         from src.execution.executor import execute_exit_order
         from src.state.venue_command_repo import get_command
 
@@ -5334,6 +5336,21 @@ class TestExitOrderCommandSplit:
             trade_id="trd-exit-partial-matched-sell",
             shares=60.0,
             current_price=0.17,
+        )
+        object.__setattr__(intent, "submit_order_type", "FAK")
+        object.__setattr__(intent, "best_bid", 0.17)
+        object.__setattr__(intent, "exact_limit_price", 0.16)
+        monkeypatch.setattr(
+            "src.execution.executor._select_risk_allocator_order_type",
+            lambda *_args, **_kwargs: "FAK",
+        )
+        monkeypatch.setattr(
+            "src.execution.executor._global_sell_receipt_closure_error",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "src.execution.executor._marketable_sell_certificate_error",
+            lambda *_args, **_kwargs: None,
         )
         command_ids_seen: list[str] = []
 
@@ -5385,7 +5402,7 @@ class TestExitOrderCommandSplit:
         ).fetchone()
         assert dict(order_fact) == {
             "state": "PARTIALLY_MATCHED",
-            "remaining_size": "13.41",
+            "remaining_size": "0",
             "matched_size": "46.59",
         }
         event_types = [
@@ -5397,6 +5414,26 @@ class TestExitOrderCommandSplit:
         ]
         assert event_types[-1] == "PARTIAL_FILL_OBSERVED"
         assert "FILL_CONFIRMED" not in event_types
+        payload = json.loads(
+            mem_conn.execute(
+                """SELECT payload_json FROM venue_command_events
+                    WHERE command_id = ? ORDER BY sequence_no DESC LIMIT 1""",
+                (command_id,),
+            ).fetchone()[0]
+        )
+        assert payload["proof_class"] == "terminal_partial_order_fact"
+        from src.execution.exit_safety import can_submit_replacement_sell
+
+        assert can_submit_replacement_sell(
+            mem_conn, intent.trade_id, intent.token_id
+        ) == (True, None)
+        mutex = mem_conn.execute(
+            """SELECT released_at, release_reason FROM exit_mutex_holdings
+                WHERE command_id = ?""",
+            (command_id,),
+        ).fetchone()
+        assert mutex["released_at"]
+        assert mutex["release_reason"] == "TERMINAL_PARTIAL"
 
     def test_exit_idempotency_key_collision_raises_before_submit(self, mem_conn):
         """Duplicate idempotency key (exit path): place_limit_order not called."""

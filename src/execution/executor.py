@@ -7877,6 +7877,13 @@ def execute_exit_order(
                 if _venue_fill_covers_submit(matched_size, shares)
                 else "PARTIAL_FILL_OBSERVED"
             )
+        terminal_fak_partial = bool(
+            order_type == "FAK"
+            and fill_event_type == "PARTIAL_FILL_OBSERVED"
+        )
+        persisted_remaining_size = (
+            Decimal("0") if terminal_fak_partial else remaining_size
+        )
         fill_price_floor_breach = bool(
             fill_event_type
             and fill_price is not None
@@ -7915,7 +7922,7 @@ def execute_exit_order(
                     venue_order_id=order_id,
                     command_id=command_id,
                     state=order_fact_state,
-                    remaining_size=remaining_size,
+                    remaining_size=persisted_remaining_size,
                     matched_size=matched_size,
                     source="REST",
                     observed_at=ack_time,
@@ -7934,6 +7941,11 @@ def execute_exit_order(
                         "venue_order_id": order_id,
                         "submit_result": _jsonable_payload(result),
                         "source": "place_limit_order_ack",
+                        "proof_class": (
+                            "terminal_partial_order_fact"
+                            if terminal_fak_partial
+                            else None
+                        ),
                     },
                 )
             if fill_event_type and fill_trade_id:
@@ -7976,20 +7988,36 @@ def execute_exit_order(
                     order_id=order_id,
                     trade_id=fill_trade_id,
                 ):
+                    partial_payload = {
+                        "reason": "place_exit_order_matched_submit",
+                        "venue_order_id": order_id,
+                        "trade_id": fill_trade_id,
+                        "filled_size": str(matched_size),
+                        "fill_price": str(fill_price),
+                        "tx_hash": fill_tx_hash,
+                        **final_envelope_payload,
+                    }
+                    if terminal_fak_partial:
+                        partial_payload.update(
+                            {
+                                "reason": "terminal_partial_order_fact_corrected",
+                                "proof_class": "terminal_partial_order_fact",
+                                "command_id": command_id,
+                                "requested_size": str(shares),
+                                "remaining_size": "0",
+                                "required_predicates": {
+                                    "terminal_order_remainder_zero": True,
+                                    "canonical_trade_facts_match_terminal_order_fact": True,
+                                    "cumulative_fill_below_requested_size": True,
+                                },
+                            }
+                        )
                     append_event(
                         conn,
                         command_id=command_id,
                         event_type=fill_event_type,
                         occurred_at=ack_time,
-                        payload={
-                            "reason": "place_exit_order_matched_submit",
-                            "venue_order_id": order_id,
-                            "trade_id": fill_trade_id,
-                            "filled_size": matched_size,
-                            "fill_price": fill_price,
-                            "tx_hash": fill_tx_hash,
-                            **final_envelope_payload,
-                        },
+                        payload=partial_payload,
                     )
                 if fill_price_floor_breach:
                     append_event(

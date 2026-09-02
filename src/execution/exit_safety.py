@@ -359,6 +359,8 @@ def release_exit_mutex_for_command_state(
     conn: sqlite3.Connection,
     command_id: str,
     state: str,
+    *,
+    terminal_partial: bool = False,
 ) -> bool:
     """Release a held exit mutex when command state owns duplicate prevention.
 
@@ -369,7 +371,9 @@ def release_exit_mutex_for_command_state(
     """
 
     normalized = str(state).upper()
-    if normalized not in _MUTEX_RELEASE_STATES:
+    if normalized not in _MUTEX_RELEASE_STATES and not (
+        normalized == "PARTIAL" and terminal_partial
+    ):
         return False
     try:
         init_exit_mutex_schema(conn)
@@ -380,7 +384,11 @@ def release_exit_mutex_for_command_state(
              WHERE command_id = ?
                AND released_at IS NULL
             """,
-            (_utcnow(), normalized, str(command_id)),
+            (
+                _utcnow(),
+                "TERMINAL_PARTIAL" if terminal_partial else normalized,
+                str(command_id),
+            ),
         )
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc):
@@ -611,6 +619,10 @@ def can_submit_replacement_sell(
         state = str(row[1]).upper()
         if state in _TERMINAL_REPLACEMENT_STATES:
             continue
+        if state == "PARTIAL" and _terminal_partial_command_proven(
+            conn, str(row[0])
+        ):
+            continue
         if state in _ACTIVE_REPLACEMENT_STATES or state not in _TERMINAL_REPLACEMENT_STATES:
             return False, _block_reason_for_command(
                 conn,
@@ -619,6 +631,52 @@ def can_submit_replacement_sell(
                 venue_order_id=str(row[2]) if row[2] is not None else None,
             )
     return True, None
+
+
+def _terminal_partial_command_proven(
+    conn: sqlite3.Connection,
+    command_id: str,
+) -> bool:
+    """Return whether a FAK remainder is proven dead and re-auctionable."""
+
+    try:
+        row = conn.execute(
+            """
+            SELECT e.payload_json, o.remaining_size, o.matched_size, c.size,
+                   envelope.order_type, envelope.post_only
+              FROM venue_commands c
+              JOIN venue_command_events e
+                ON e.event_id = c.last_event_id
+              JOIN venue_submission_envelopes envelope
+                ON envelope.envelope_id = c.envelope_id
+              JOIN venue_order_facts o
+                ON o.command_id = c.command_id
+               AND o.venue_order_id = c.venue_order_id
+             WHERE c.command_id = ?
+               AND UPPER(c.state) = 'PARTIAL'
+             ORDER BY o.local_sequence DESC, o.fact_id DESC
+             LIMIT 1
+            """,
+            (str(command_id),),
+        ).fetchone()
+        payload = json.loads(str(row[0] or "{}")) if row is not None else {}
+        remaining = Decimal(str(row[1])) if row is not None else None
+        matched = Decimal(str(row[2])) if row is not None else None
+        requested = Decimal(str(row[3])) if row is not None else None
+    except (sqlite3.Error, TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, Mapping)
+        and payload.get("reason") == "terminal_partial_order_fact_corrected"
+        and payload.get("proof_class") == "terminal_partial_order_fact"
+        and payload.get("command_id") == str(command_id)
+        and str(row[4] or "").upper() == "FAK"
+        and not bool(row[5])
+        and remaining == 0
+        and matched is not None
+        and requested is not None
+        and Decimal("0") < matched < requested
+    )
 
 
 def request_cancel_for_command(

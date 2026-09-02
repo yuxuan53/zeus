@@ -2732,7 +2732,12 @@ def append_event(
                 convert_reservation_on_fill(conn, command_id, state_after)
             else:
                 release_reservation_for_command_state(conn, command_id, state_after)
-            release_exit_mutex_for_command_state(conn, command_id, state_after)
+            release_exit_mutex_for_command_state(
+                conn,
+                command_id,
+                state_after,
+                terminal_partial=terminal_partial,
+            )
         elif state_after == "REVIEW_REQUIRED":
             # REVIEW_REQUIRED remains a durable proof/recovery blocker for new
             # replacement sells, but it must not keep the short-lived exit
@@ -6339,8 +6344,12 @@ def append_order_fact(
             payload_json={
                 "fact_id": fact_id,
                 "command_id": command_id,
-                "remaining_size": remaining_size,
-                "matched_size": matched_size,
+                "remaining_size": (
+                    str(remaining_size) if remaining_size is not None else None
+                ),
+                "matched_size": (
+                    str(matched_size) if matched_size is not None else None
+                ),
                 "raw_payload": raw_payload_json,
             },
             source=source,
