@@ -2210,10 +2210,17 @@ def _priority_map_with_names(
             queue_files,
             payloads,
         )
-        for path in queue_files:
-            payload = payloads.get(path) if payloads is not None else _load_request_payload_for_coalescing(path)
-            if payload is not None and _day0_conditioning_identity_key(payload) is not None:
-                priority_names.add(path.name)
+    for path in queue_files:
+        payload = (
+            payloads.get(path)
+            if payloads is not None
+            else _load_request_payload_for_coalescing(path)
+        )
+        if (
+            payload is not None
+            and _day0_conditioning_identity_key(payload) is not None
+        ):
+            priority_names.add(path.name)
     return priority, priority_names
 
 
@@ -4917,6 +4924,8 @@ def _claim_only_report(
 ) -> ReplacementForecastLiveMaterializationQueueReport:
     processed = len(claim.processed_files)
     failed = len(claim.failed_files)
+    seed_processed = len(claim.seed_processed_files)
+    seed_failed = len(claim.seed_failed_files)
     reasons = list(claim.seed_reasons)
     if claim.inflight_deferred_count:
         reasons.append("REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_INFLIGHT")
@@ -4932,18 +4941,22 @@ def _claim_only_report(
             reasons.append(
                 "REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_SUPERSEDED_BY_NEWER_DUPLICATE"
             )
-    else:
+    elif not (seed_processed or seed_failed):
         reasons.append("REPLACEMENT_LIVE_MATERIALIZATION_QUEUE_EMPTY")
     return ReplacementForecastLiveMaterializationQueueReport(
-        status="FAILED" if failed else ("PROCESSED" if processed else "NO_REQUESTS"),
+        status=(
+            "FAILED"
+            if failed or seed_failed
+            else ("PROCESSED" if processed or seed_processed else "NO_REQUESTS")
+        ),
         request_dir=str(claim.request_path),
         processed_dir=str(claim.processed_path),
         failed_dir=str(claim.failed_path),
         processed_count=processed,
         failed_count=failed,
         skipped_count=claim.skipped_count,
-        seed_processed_count=len(claim.seed_processed_files),
-        seed_failed_count=len(claim.seed_failed_files),
+        seed_processed_count=seed_processed,
+        seed_failed_count=seed_failed,
         seed_discovery_report=claim.discovery_report,
         processed_files=claim.processed_files,
         failed_files=claim.failed_files,
