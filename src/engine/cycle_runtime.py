@@ -5488,20 +5488,12 @@ def _fresh_local_held_monitor_orderbooks(
                AND quote.quote_seen_at = latest.quote_seen_at
                AND quote.created_at = latest.created_at
                AND quote.depth_before_json IS NOT NULL
-              JOIN executable_market_snapshots AS metadata
-                ON metadata.snapshot_id = (
-                   SELECT candidate.snapshot_id
-                     FROM executable_market_snapshots AS candidate
-                    WHERE candidate.condition_id = latest.condition_id
-                      AND candidate.selected_outcome_token_id = latest.token_id
-                      AND julianday(candidate.captured_at) <=
-                          julianday(latest.quote_seen_at)
-                      AND julianday(candidate.freshness_deadline) >=
-                          julianday(?)
-                    ORDER BY julianday(candidate.captured_at) DESC,
-                             candidate.snapshot_id DESC
-                    LIMIT 1
-               )
+              JOIN executable_market_snapshot_latest AS metadata
+                ON metadata.condition_id = latest.condition_id
+               AND metadata.selected_outcome_token_id = latest.token_id
+               AND julianday(metadata.captured_at) <=
+                   julianday(latest.quote_seen_at)
+               AND julianday(metadata.freshness_deadline) >= julianday(?)
              WHERE julianday(latest.quote_seen_at) IS NOT NULL
                AND julianday(latest.quote_seen_at) >= julianday(?)
                AND julianday(latest.quote_seen_at) <= julianday(?)
