@@ -19721,6 +19721,7 @@ class TestRecoveryResolutionTable:
             position_id="pos-001",
             intent_kind="EXIT",
             side="SELL",
+            order_type="FAK",
             size=6.0,
             price=0.46,
             created_at="2026-04-26T00:04:00Z",
@@ -19816,6 +19817,58 @@ class TestRecoveryResolutionTable:
                AND event_type = 'EXIT_ORDER_FILLED'
             """
         ).fetchone()[0] == 0
+
+        conn.execute(
+            """
+            UPDATE position_current
+               SET chain_shares = 4.0,
+                   chain_cost_basis_usd = 1.24,
+                   chain_seen_at = '2026-04-26T00:09:00Z'
+             WHERE position_id = 'pos-001'
+            """
+        )
+        from src.execution.command_recovery import (
+            reconcile_exit_lifecycle_alignment_repairs,
+        )
+
+        alignment = reconcile_exit_lifecycle_alignment_repairs(conn)
+
+        assert alignment == {
+            "scanned": 1,
+            "advanced": 1,
+            "stayed": 0,
+            "errors": 0,
+        }
+        residual = conn.execute(
+            """
+            SELECT phase, shares, chain_shares, cost_basis_usd,
+                   chain_cost_basis_usd
+              FROM position_current
+             WHERE position_id = 'pos-001'
+            """
+        ).fetchone()
+        assert dict(residual) == {
+            "phase": "active",
+            "shares": 4.0,
+            "chain_shares": 4.0,
+            "cost_basis_usd": pytest.approx(1.24),
+            "chain_cost_basis_usd": pytest.approx(1.24),
+        }
+        reduction = conn.execute(
+            """
+            SELECT payload_json
+              FROM position_events
+             WHERE position_id = 'pos-001'
+               AND json_extract(payload_json, '$.semantic_event') =
+                   'CAPITAL_REDUCTION_FILLED'
+             ORDER BY sequence_no DESC
+             LIMIT 1
+            """
+        ).fetchone()
+        assert reduction is not None
+        reduction_payload = json.loads(reduction["payload_json"])
+        assert reduction_payload["filled_shares"] == "2"
+        assert reduction_payload["remaining_shares"] == "4"
 
     @pytest.mark.parametrize(
         (

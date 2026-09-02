@@ -12595,11 +12595,21 @@ def _exit_lifecycle_alignment_candidates(conn: sqlite3.Connection) -> list[dict]
             tuple(sorted(_EXIT_LIFECYCLE_REPAIR_COMMAND_STATES)),
         ).fetchall()
     ]
+    from src.execution.exit_safety import _terminal_partial_command_proven
+
     return [
         candidate
         for candidate in candidates
-        if str(candidate.get("state") or "") != CommandState.FILLED.value
-        or _command_bound_full_exit_intent(conn, candidate)
+        if not (
+            str(candidate.get("state") or "") == CommandState.PARTIAL.value
+            and _terminal_partial_command_proven(
+                conn, str(candidate.get("command_id") or "")
+            )
+        )
+        and (
+            str(candidate.get("state") or "") != CommandState.FILLED.value
+            or _command_bound_full_exit_intent(conn, candidate)
+        )
     ]
 
 
@@ -12628,7 +12638,7 @@ def _terminal_partial_exit_projection_candidates(
             ON pc.position_id = cmd.position_id
          WHERE cmd.intent_kind = 'EXIT'
            AND UPPER(COALESCE(cmd.side, '')) = 'SELL'
-           AND cmd.state IN ('FILLED', 'EXPIRED')
+           AND cmd.state IN ('FILLED', 'EXPIRED', 'PARTIAL')
            AND COALESCE(cmd.venue_order_id, '') <> ''
            AND pc.phase IN ('active', 'day0_window', 'pending_exit')
            AND EXISTS (
@@ -12650,11 +12660,18 @@ def _terminal_partial_exit_projection_candidates(
     )
 
     candidates: list[dict] = []
+    from src.execution.exit_safety import _terminal_partial_command_proven
+
     for row in rows:
         command = _dict_row(row)
         position_id = str(command.get("position_id") or "")
         command_id = str(command.get("command_id") or "")
         venue_order_id = str(command.get("venue_order_id") or "")
+        if (
+            str(command.get("state") or "") == CommandState.PARTIAL.value
+            and not _terminal_partial_command_proven(conn, command_id)
+        ):
+            continue
         fills = [
             fill
             for fill in economic_exit_fills_for_position(
@@ -12819,17 +12836,41 @@ def _repair_terminal_partial_exit_projection(
     expected_basis = (
         expected_remaining * entry_price if entry_price is not None else None
     )
-    if (
-        local_shares is None
-        or chain_shares is None
-        or local_basis is None
-        or chain_basis is None
-        or expected_basis is None
-        or local_shares != expected_remaining
-        or chain_shares != expected_remaining
-        or local_basis != expected_basis
-        or chain_basis != expected_basis
-    ):
+    tolerance = Decimal("0.000001")
+    local_is_residual = bool(
+        local_shares is not None
+        and local_basis is not None
+        and expected_basis is not None
+        and abs(local_shares - expected_remaining) <= tolerance
+        and abs(local_basis - expected_basis) <= tolerance
+    )
+    pre_fill_basis = (
+        holding_shares * entry_price if entry_price is not None else None
+    )
+    local_is_pre_fill = bool(
+        local_shares is not None
+        and local_basis is not None
+        and pre_fill_basis is not None
+        and abs(local_shares - holding_shares) <= tolerance
+        and abs(local_basis - pre_fill_basis) <= tolerance
+    )
+    chain_is_residual = bool(
+        chain_shares is not None
+        and chain_basis is not None
+        and expected_basis is not None
+        and abs(chain_shares - expected_remaining) <= tolerance
+        and abs(chain_basis - expected_basis) <= tolerance
+    )
+    chain_is_pre_fill = bool(
+        chain_shares is not None
+        and chain_basis is not None
+        and pre_fill_basis is not None
+        and abs(chain_shares - holding_shares) <= tolerance
+        and abs(chain_basis - pre_fill_basis) <= tolerance
+    )
+    if chain_is_pre_fill:
+        return False
+    if not chain_is_residual or not (local_is_residual or local_is_pre_fill):
         raise RuntimeError(
             f"terminal partial EXIT residual exposure conflicts for {command_id}"
         )
