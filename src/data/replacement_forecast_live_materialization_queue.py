@@ -1281,6 +1281,61 @@ def _seed_already_covered(
             conn.close()
 
 
+def _instrument_set_expansion_already_applied(
+    *,
+    forecast_db: Path | str | None,
+    payload: Mapping[str, object],
+    forecast_conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Return true only when this exact-cycle expansion no longer changes q inputs."""
+
+    if str(payload.get("upgrade_trigger") or "").strip() != "instrument_set_expansion":
+        return False
+    city = str(payload.get("city") or "").strip()
+    target_date = str(payload.get("target_date") or "").strip()
+    metric = str(payload.get("temperature_metric") or "").strip()
+    requested_cycle = _parse_utc_iso(payload.get("source_cycle_time"))
+    if not city or not target_date or not metric or requested_cycle is None:
+        return False
+    if forecast_conn is None:
+        if forecast_db is None or not Path(forecast_db).exists():
+            return False
+        conn = _queue_read_only_connection(Path(forecast_db))
+        owns_conn = True
+    else:
+        conn = forecast_conn
+        owns_conn = False
+    try:
+        from src.data.replacement_fusion_upgrade_trigger import (  # noqa: PLC0415
+            scope_capture_offers_larger_provider_set,
+        )
+
+        verdict = scope_capture_offers_larger_provider_set(
+            conn,
+            city=city,
+            target_date=target_date,
+            metric=metric,
+            decision_time=datetime.now(timezone.utc),
+        )
+    except Exception as exc:  # noqa: BLE001 - uncertainty preserves the repair attempt
+        _LOG.warning(
+            "instrument-set expansion revalidation unavailable for %s/%s/%s: %s",
+            city,
+            target_date,
+            metric,
+            exc,
+        )
+        return False
+    finally:
+        if owns_conn:
+            conn.close()
+    current_cycle = _parse_utc_iso(verdict.get("source_cycle_time"))
+    return (
+        current_cycle == requested_cycle
+        and not bool(verdict.get("is_upgrade"))
+    )
+
+
 def _parse_utc_iso(value: object) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -4535,22 +4590,29 @@ def _prepare_seed_requests_with_connection(
                 processed.append(str(moved))
                 actionable_count += 1
                 continue
-            # Only an instrument-set expansion is allowed to recompute an
-            # otherwise covered posterior: its new provider set is the fact
-            # being materialized. Other producer reasons (including a Day0
-            # observation advance) still pass the exact conditioning + input-
-            # HWM coverage check. Treating every non-empty trigger as a bypass
-            # lets a late duplicate Day0 enqueue monopolize held priority even
-            # after the current posterior consumed that exact observation.
-            if (
-                str(seed.get("upgrade_trigger") or "").strip()
-                != "instrument_set_expansion"
+            # An instrument expansion bypasses ordinary q coverage only while
+            # the single fusion-upgrade authority still proves that exact-cycle
+            # transition changes the live estimator. This drains pre-hotfix
+            # duplicate expansion debt after the current q converges instead of
+            # letting old seeds repeatedly monopolize the one SQLite writer.
+            upgrade_trigger = str(seed.get("upgrade_trigger") or "").strip()
+            instrument_expansion_applied = (
+                upgrade_trigger == "instrument_set_expansion"
+                and _instrument_set_expansion_already_applied(
+                    forecast_db=forecast_db,
+                    payload=seed,
+                    forecast_conn=forecast_conn,
+                )
+            )
+            ordinary_seed_covered = (
+                upgrade_trigger != "instrument_set_expansion"
                 and _seed_already_covered(
                 forecast_db=forecast_db,
                 seed=seed,
                 forecast_conn=forecast_conn,
                 )
-            ):
+            )
+            if instrument_expansion_applied or ordinary_seed_covered:
                 moved = _move_request(seed_json, processed_path)
                 _publish_latest_seed(moved, seed)
                 _write_sidecar(
@@ -5465,20 +5527,33 @@ def _process_claimed_materialization_batch(
         upgrade_trigger = str(
             (request_payload or {}).get("upgrade_trigger") or ""
         ).strip()
-        if (
+        instrument_expansion_applied = (
             request_payload is not None
-            and upgrade_trigger
+            and upgrade_trigger == "instrument_set_expansion"
+            and _instrument_set_expansion_already_applied(
+                forecast_db=forecast_db,
+                payload=request_payload,
+            )
+        )
+        ordinary_upgrade_covered = (
+            request_payload is not None
+            and bool(upgrade_trigger)
             and upgrade_trigger != "instrument_set_expansion"
             and _seed_already_covered(
                 forecast_db=forecast_db,
                 seed=dict(request_payload),
             )
+        )
+        if (
+            request_payload is not None
+            and (instrument_expansion_applied or ordinary_upgrade_covered)
         ):
             # A seed can race a canonical commit and publish its request after
             # the exact q is already current. Revalidate here so pre-hotfix or
             # crash-restored requests cannot keep retrying ahead of unrelated
             # families. The coverage predicate includes current input HWM and
-            # exact Day0 conditioning; fusion expansion remains the sole bypass.
+            # exact Day0 conditioning. Fusion expansion bypasses only while its
+            # authoritative current transition still changes q inputs.
             receipt = _record_latest_terminal_request(
                 input_json,
                 processed_path=processed_path,

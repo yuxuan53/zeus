@@ -1,5 +1,5 @@
 # Created: 2026-06-11
-# Last reused or audited: 2026-09-01
+# Last reused or audited: 2026-09-02
 # Authority basis: Task #32 follow-up (operator 2026-06-11) — 没有新的就用老的 applied to fusion
 #   membership. The gem_global-only previous_runs exception (edc598b440) is generalized into the
 #   SINGLE serving authority (src/data/replacement_current_value_serving.py): a provider absent
@@ -361,6 +361,87 @@ def test_queue_does_not_coverage_skip_an_upgrade_reseed(tmp_path, monkeypatch) -
     assert "SKIPPED_ALREADY_COVERED" in skip_statuses
     request_written = [s for s in sidecars.values() if s.get("request_written")]
     assert len(request_written) == 1
+
+
+def test_queue_skips_instrument_expansion_after_current_q_converges(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    monkeypatch.setattr(queue_mod, "_seed_already_covered", lambda **_kw: False)
+    monkeypatch.setattr(
+        queue_mod,
+        "_instrument_set_expansion_already_applied",
+        lambda **_kw: True,
+    )
+    monkeypatch.setattr(
+        queue_mod,
+        "build_replacement_forecast_materialization_request",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an applied expansion must not rebuild a request"
+        ),
+    )
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    seed = seed_dir / "applied-upgrade.json"
+    seed.write_text(json.dumps(_minimal_seed(upgrade=True)), encoding="utf-8")
+
+    processed, failed, _reasons = queue_mod._prepare_seed_requests(
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=tmp_path / "seed_failed",
+        request_dir=tmp_path / "requests",
+        forecast_db=tmp_path / "forecasts.db",
+        limit=1,
+    )
+
+    assert failed == []
+    assert len(processed) == 1
+    receipt = json.loads(
+        Path(processed[0])
+        .with_suffix(Path(processed[0]).suffix + ".receipt.json")
+        .read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "SKIPPED_ALREADY_COVERED"
+    assert receipt["request_written"] is False
+
+
+def test_request_skips_instrument_expansion_after_current_q_converges(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    monkeypatch.setattr(
+        queue_mod,
+        "_instrument_set_expansion_already_applied",
+        lambda **_kw: True,
+    )
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    request = request_dir / "applied-upgrade.json"
+    request.write_text(json.dumps(_minimal_seed(upgrade=True)), encoding="utf-8")
+
+    report = queue_mod.process_replacement_forecast_live_materialization_queue(
+        request_dir=request_dir,
+        processed_dir=tmp_path / "processed",
+        failed_dir=tmp_path / "failed",
+        forecast_db=tmp_path / "forecasts.db",
+        limit=1,
+        runner=lambda _argv: pytest.fail(
+            "an applied expansion must not spawn the materializer"
+        ),
+    )
+
+    assert report.status == "PROCESSED"
+    assert report.failed_count == 0
+    assert report.processed_count == 1
+    receipt = json.loads(
+        next((tmp_path / "success_coalesced_latest").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["status"] == "SKIPPED_ALREADY_COVERED"
+    assert receipt["result_evidence"]["subprocess_spawned"] is False
 
 
 def test_queue_preserves_unchanged_blocked_seed_as_terminal_receipt(
