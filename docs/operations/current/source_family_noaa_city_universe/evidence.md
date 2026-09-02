@@ -99,3 +99,13 @@ Focused tests prove both the existing held-plus-global ordering and the new
 held-plus-first-q ordering. The broader materialization slices introduce no new
 failure; two queue tests and one bounded-read test fail identically on the
 unmodified live checkout.
+
+Immediately after reload, the widened seed universe exposed a third break:
+every priority callback spent 12-18 seconds in seed preparation and returned
+`REPLACEMENT_LIVE_MATERIALIZATION_CLAIM_DEFERRED_READ_DEADLINE` before it could
+claim any prepared request. The priority callback now runs the existing
+request-only path first (`seed_limit=0`) and bridges two seeds only when that
+path truthfully returns `NO_REQUESTS`. This preserves bounded seed progress
+while preventing seed planning from becoming a mutex in front of complete q
+requests. Seven focused scheduler/interleave tests pass; the wider scheduler
+slice's single failure reproduces unchanged on live.

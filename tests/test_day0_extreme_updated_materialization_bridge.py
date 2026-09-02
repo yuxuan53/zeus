@@ -2739,7 +2739,7 @@ def test_priority_job_exception_writes_failed_scheduler_health(monkeypatch, tmp_
     assert "priority boom" in str(health[-1][2])
 
 
-def test_priority_job_bridges_bounded_seeds_when_requests_exist(
+def test_priority_job_processes_existing_request_before_seed_bridge(
     monkeypatch, tmp_path
 ) -> None:
     from src.ingest import forecast_live_daemon
@@ -2765,11 +2765,11 @@ def test_priority_job_bridges_bounded_seeds_when_requests_exist(
 
     receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
 
-    assert calls == [2]
-    assert receipt == {"status": "PROCESSED", "seed_limit": 2}
+    assert calls == [0]
+    assert receipt == {"status": "PROCESSED", "seed_limit": 0}
 
 
-def test_priority_job_uses_one_seed_bridge_call_when_queue_is_empty(
+def test_priority_job_bridges_seeds_after_request_lane_is_empty(
     monkeypatch, tmp_path
 ) -> None:
     from src.ingest import forecast_live_daemon
@@ -2787,7 +2787,10 @@ def test_priority_job_uses_one_seed_bridge_call_when_queue_is_empty(
     def run_lane(_cfg, *, lane, seed_limit):
         calls.append(seed_limit)
         assert lane == "priority"
-        return {"status": "NO_REQUESTS", "seed_limit": seed_limit}
+        return {
+            "status": "NO_REQUESTS" if seed_limit == 0 else "PROCESSED",
+            "seed_limit": seed_limit,
+        }
 
     monkeypatch.setattr(
         forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
@@ -2795,8 +2798,8 @@ def test_priority_job_uses_one_seed_bridge_call_when_queue_is_empty(
 
     receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
 
-    assert calls == [2]
-    assert receipt == {"status": "NO_REQUESTS", "seed_limit": 2}
+    assert calls == [0, 2]
+    assert receipt == {"status": "PROCESSED", "seed_limit": 2}
 
 
 def test_priority_request_tranche_reserves_global_q_slot(tmp_path) -> None:

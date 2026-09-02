@@ -1337,18 +1337,26 @@ def _replacement_forecast_materialize_job(
 
 @_scheduler_job(REPLACEMENT_FORECAST_PRIORITY_MATERIALIZE_JOB_ID)
 def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
-    """Bridge bounded current-money seeds and claim one priority request."""
+    """Drain prepared priority requests before bridging more seeds."""
     from src.data.replacement_forecast_production import (
         _replacement_forecast_live_materialization_queue_config,
     )
 
     cfg = _replacement_forecast_live_materialization_queue_config()
+    request_report = _replacement_forecast_materialize_lane(
+        cfg,
+        lane="priority",
+        seed_limit=0,
+    )
+    if request_report.get("status") != "NO_REQUESTS":
+        return request_report
+    # Prepared requests are the exact handoff into q. Only bridge another
+    # bounded seed tranche when that handoff has no actionable work; otherwise
+    # a widened city universe can make seed planning consume the claim deadline
+    # on every tick and starve both held and first-posterior requests.
     return _replacement_forecast_materialize_lane(
         cfg,
         lane="priority",
-        # Existing requests must not starve seeds that carry a newer current
-        # input revision. Seed preparation interleaves Day0 and future work in
-        # this bounded tranche; the lane still materializes one request.
         seed_limit=2,
     )
 
