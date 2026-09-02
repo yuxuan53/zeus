@@ -34778,29 +34778,76 @@ def _provisional_day0_revision_likelihood(
 
         city_obj = runtime_cities_by_name().get(str(city))
         station = str(getattr(city_obj, "wu_station", "") or "").strip().upper()
-        if (
-            city_obj is None
-            or not station
-            or str(getattr(city_obj, "settlement_source_type", "") or "")
-            .strip()
-            .lower()
-            != "noaa"
-        ):
+        if city_obj is None or not station:
             raise ValueError("METAR_PROVISIONAL_REVISION_AUTHORITY_UNAVAILABLE")
-        return same_station_preliminary_report_survival_likelihood(
-            conn,
-            city=city,
-            station_id=station,
-            timezone_name=city_timezone,
-            target_date=target_date,
-            temperature_metric=temperature_metric,
-            decision_time=decision_time,
-            # ENTRY must prove empirical same-station transitions; held
-            # reduce-only redecision may use the typed Jeffreys prior-only
-            # carrier so exit belief does not go blind.
-            allow_prior_only=not entry_authority,
-        )
+        try:
+            return same_station_preliminary_report_survival_likelihood(
+                conn,
+                city=city,
+                station_id=station,
+                timezone_name=city_timezone,
+                target_date=target_date,
+                temperature_metric=temperature_metric,
+                decision_time=decision_time,
+                # ENTRY must prove empirical same-station transitions; held
+                # reduce-only redecision may use the typed Jeffreys prior-only
+                # carrier so exit belief does not go blind.
+                allow_prior_only=not entry_authority,
+            )
+        except ValueError as exc:
+            if str(exc) == "NOAA_PRELIMINARY_SURVIVAL_EVIDENCE_UNAVAILABLE":
+                raise ValueError(
+                    "METAR_PROVISIONAL_REVISION_AUTHORITY_UNAVAILABLE"
+                ) from exc
+            raise
     raise ValueError("PROVISIONAL_SOURCE_REVISION_MODEL_UNAVAILABLE")
+
+
+def _carried_day0_revision_likelihood(
+    payload: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Return the likelihood already used to build this probability carrier."""
+
+    raw = payload.get("_edli_day0_provisional_revision_likelihood")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("GLOBAL_DAY0_PROVISIONAL_REVISION_LIKELIHOOD_INVALID")
+    try:
+        survival = float(raw["boundary_survival_probability"])
+        identity_hash = str(raw["identity_hash"] or "").strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "GLOBAL_DAY0_PROVISIONAL_REVISION_LIKELIHOOD_INVALID"
+        ) from exc
+    if not identity_hash or not 0.0 < survival < 1.0:
+        raise ValueError("GLOBAL_DAY0_PROVISIONAL_REVISION_LIKELIHOOD_INVALID")
+
+    from src.events.day0_authority import day0_is_noaa_preliminary_source
+
+    source = _day0_probability_conditioning_source(payload).lower()
+    if day0_is_noaa_preliminary_source(source):
+        binding = payload.get("_edli_global_day0_binding")
+        configured_station = (
+            str(binding.get("configured_station_id") or "").strip().upper()
+            if isinstance(binding, Mapping)
+            else ""
+        )
+        source_pair = raw.get("source_channel_pair")
+        if (
+            not configured_station
+            or str(raw.get("station_id") or "").strip().upper()
+            != configured_station
+            or source_pair
+            != {
+                "awc": "aviationweather_metar",
+                "ogimet": f"ogimet_metar_{configured_station.lower()}",
+            }
+        ):
+            raise ValueError(
+                "GLOBAL_DAY0_PROVISIONAL_REVISION_SOURCE_IDENTITY_INVALID"
+            )
+    return dict(raw)
 
 
 def _day0_replacement_conditioning(
@@ -38536,19 +38583,23 @@ def _prepare_current_global_probability_family(
             day0_payload_out.update(current_day0_payload)
         if provisional_day0_observation:
             try:
-                provisional_source = _day0_probability_conditioning_source(
+                revision_likelihood = _carried_day0_revision_likelihood(
                     current_day0_payload
-                ).lower()
-                revision_likelihood = _provisional_day0_revision_likelihood(
-                    day0_observation_conn,
-                    source=provisional_source,
-                    city=str(family.city),
-                    city_timezone=str(city.timezone),
-                    target_date=str(family.target_date),
-                    temperature_metric=str(family.metric),
-                    decision_time=decision_time,
-                    entry_authority=entry_authority,
                 )
+                if revision_likelihood is None:
+                    provisional_source = _day0_probability_conditioning_source(
+                        current_day0_payload
+                    ).lower()
+                    revision_likelihood = _provisional_day0_revision_likelihood(
+                        day0_observation_conn,
+                        source=provisional_source,
+                        city=str(family.city),
+                        city_timezone=str(city.timezone),
+                        target_date=str(family.target_date),
+                        temperature_metric=str(family.metric),
+                        decision_time=decision_time,
+                        entry_authority=entry_authority,
+                    )
             except ValueError as exc:
                 if str(exc) == "HKO_PROVISIONAL_ROLLOVER_UNCONFIRMED":
                     # SCOPE: this HKO family only. DRAIN: a changed official

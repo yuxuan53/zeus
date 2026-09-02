@@ -823,6 +823,67 @@ def test_probability_conditioning_source_outranks_settlement_channel_for_revisio
     assert payload["settlement_source"] == "wu_icao_history"
 
 
+def test_carried_noaa_likelihood_uses_probability_station_not_settlement_type():
+    import src.engine.event_reactor_adapter as era
+
+    likelihood = {
+        "identity_hash": "carrier-likelihood-id",
+        "boundary_survival_probability": 0.5,
+        "station_id": "RCSS",
+        "source_channel_pair": {
+            "awc": "aviationweather_metar",
+            "ogimet": "ogimet_metar_rcss",
+        },
+    }
+    payload = {
+        "settlement_source": "wu_icao_history",
+        "_edli_global_day0_binding": {
+            "configured_station_id": "RCSS",
+            "statistical_probability_conditioning": {
+                "source": "aviationweather_metar",
+            },
+        },
+        "_edli_day0_provisional_revision_likelihood": likelihood,
+    }
+
+    assert era._carried_day0_revision_likelihood(payload) == likelihood
+
+    payload["_edli_global_day0_binding"]["configured_station_id"] = "RCKH"
+    with pytest.raises(
+        ValueError,
+        match="GLOBAL_DAY0_PROVISIONAL_REVISION_SOURCE_IDENTITY_INVALID",
+    ):
+        era._carried_day0_revision_likelihood(payload)
+
+
+def test_noaa_revision_fallback_uses_probability_station_not_settlement_type():
+    import src.engine.event_reactor_adapter as era
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE observation_prints (
+            id INTEGER PRIMARY KEY, city TEXT, station_id TEXT,
+            source_channel TEXT, publish_ts_utc TEXT, value_native REAL,
+            unit TEXT, fetched_at_utc TEXT, raw_report TEXT
+        )"""
+    )
+
+    likelihood = era._provisional_day0_revision_likelihood(
+        conn,
+        source="aviationweather_metar",
+        city="Taipei",
+        city_timezone="Asia/Taipei",
+        target_date="2026-09-02",
+        temperature_metric="high",
+        decision_time=datetime(2026, 9, 2, 5, 30, tzinfo=UTC),
+        entry_authority=False,
+    )
+
+    assert likelihood["station_id"] == "RCSS"
+    assert likelihood["boundary_survival_probability"] == pytest.approx(0.5)
+    conn.close()
+
+
 def test_noaa_probability_conditioning_keeps_survival_scenarios_with_wu_settlement():
     import src.engine.event_reactor_adapter as era
 
