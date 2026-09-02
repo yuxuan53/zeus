@@ -17629,9 +17629,16 @@ def _rehydrate_held_pinned_bundle_for_actuation(
         # Rehydrate the exact parent and let the current prepare seam rebuild
         # and compare the child against current observation truth.
         return bundle
-    if selected_identity != str(bundle.posterior_identity_hash or "").strip():
-        raise ValueError("GLOBAL_ACTUATION_HELD_PINNED_IDENTITY_MISMATCH")
-    return bundle
+    if selected_identity == str(bundle.posterior_identity_hash or "").strip():
+        return bundle
+    # A held monitor may have intentionally superseded the persisted carrier
+    # with held_exposure_current_day0_only_v1 after newer causal vectors made
+    # that carrier obsolete.  In that case there is no bundle to pin.  Rebuild
+    # the current-evidence witness at the sealed decision instant below and let
+    # the full action-content comparison reject any changed q/source/sample
+    # fact.  Returning the unrelated prior bundle here would deterministically
+    # strand every such reduce-only SELL before that authoritative comparison.
+    return None
 
 
 def _current_global_actuation_prepared_family(

@@ -1984,6 +1984,47 @@ def test_reduce_only_actuation_rehydrates_selected_pinned_identity(monkeypatch):
     assert rehydrated is bundle
 
 
+def test_reduce_only_actuation_does_not_pin_superseded_prior_identity(monkeypatch):
+    """A direct current-evidence held witness must reach content revalidation."""
+
+    import src.data.replacement_forecast_bundle_reader as bundle_reader
+    import src.engine.event_reactor_adapter as era
+
+    event = SimpleNamespace(
+        event_type="DAY0_EXTREME_UPDATED",
+        payload_json=json.dumps(
+            {
+                "city": "Taipei",
+                "target_date": "2026-09-02",
+                "metric": "high",
+            }
+        ),
+    )
+    selected = SimpleNamespace(
+        posterior_identity_hash="held-current-evidence-identity"
+    )
+    prior_bundle = SimpleNamespace(
+        posterior_identity_hash="superseded-prior-bundle-identity"
+    )
+    monkeypatch.setattr(
+        bundle_reader,
+        "read_prior_complete_replacement_forecast_bundle",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="READY", ok=True, bundle=prior_bundle
+        ),
+    )
+
+    rehydrated = era._rehydrate_held_pinned_bundle_for_actuation(
+        event,
+        selected=selected,
+        probability_use=era._CurrentProbabilityUse.REDUCE_ONLY_EXIT,
+        forecast_conn=sqlite3.connect(":memory:"),
+        decision_time=datetime(2026, 9, 2, 6, 20, tzinfo=timezone.utc),
+    )
+
+    assert rehydrated is None
+
+
 def test_partial_deterministic_child_must_cover_requested_held_bin():
     """An exact sibling cannot replace the held bin's current statistical q."""
 
