@@ -607,15 +607,21 @@ def refresh_unresolved_reconcile_findings(
         observed_at=observed,
         live_tick_scope=True,
     )
+    open_order_ids = {
+        order_id
+        for order_id in (
+            _order_id(item) for item in snapshot.adapter.get_open_orders()
+        )
+        if order_id
+    }
     reappeared_summary = _resolve_reappeared_local_orphan_findings(
         conn,
-        open_order_ids={
-            order_id
-            for order_id in (
-                _order_id(item) for item in snapshot.adapter.get_open_orders()
-            )
-            if order_id
-        },
+        open_order_ids=open_order_ids,
+        observed_at=observed,
+    )
+    terminal_fill_summary = _resolve_terminal_filled_local_orphan_findings(
+        conn,
+        open_order_ids=open_order_ids,
         observed_at=observed,
     )
     local_orphan_summary = reconcile_local_orphan_finding_commands(
@@ -669,6 +675,7 @@ def refresh_unresolved_reconcile_findings(
         "repair_summary": repair_summary,
         "local_orphan_summary": local_orphan_summary,
         "reappeared_local_orphan_summary": reappeared_summary,
+        "terminal_fill_local_orphan_summary": terminal_fill_summary,
         "stale_terminal_summary": stale_terminal_summary,
         "proven_absence_summary": proven_absence_summary,
         "foreign_or_operator_resolved": foreign_resolved,
@@ -3602,6 +3609,105 @@ def _resolve_reappeared_local_orphan_findings(
             observed_at=observed_at,
         )
         summary["resolved"] += int(resolved)
+    return summary
+
+
+def _resolve_terminal_filled_local_orphan_findings(
+    conn: sqlite3.Connection,
+    *,
+    open_order_ids: set[str],
+    observed_at: datetime,
+) -> dict[str, int]:
+    """Resolve an orphan finding made obsolete by an exact terminal fill.
+
+    SCOPE: one unresolved local-orphan finding with one uniquely owned FILLED
+    command. DRAIN: each M5 finding refresh compares the fresh open-order set
+    with canonical CONFIRMED trade facts. RESET: only full-size confirmed fill
+    coverage while absent from the open book resolves the exact finding CAS.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT finding.finding_id,
+               finding.subject_id AS venue_order_id,
+               MIN(cmd.command_id) AS command_id,
+               MIN(cmd.size) AS command_size,
+               (
+                   SELECT COALESCE(SUM(CAST(latest.filled_size AS REAL)), 0)
+                     FROM venue_trade_facts latest
+                    WHERE latest.command_id = cmd.command_id
+                      AND latest.venue_order_id = cmd.venue_order_id
+                      AND latest.state = 'CONFIRMED'
+                      AND latest.local_sequence = (
+                          SELECT MAX(revision.local_sequence)
+                            FROM venue_trade_facts revision
+                           WHERE revision.command_id = latest.command_id
+                             AND revision.trade_id = latest.trade_id
+                      )
+               ) AS confirmed_filled_size
+          FROM exchange_reconcile_findings finding
+          JOIN venue_commands cmd
+            ON cmd.venue_order_id = finding.subject_id
+         WHERE finding.kind = 'local_orphan_order'
+           AND finding.resolved_at IS NULL
+           AND cmd.state = 'FILLED'
+           AND (
+                SELECT COUNT(*)
+                  FROM venue_commands owner
+                 WHERE owner.venue_order_id = finding.subject_id
+           ) = 1
+         GROUP BY finding.subject_id
+        HAVING COUNT(DISTINCT finding.finding_id) = 1
+           AND COUNT(DISTINCT cmd.command_id) = 1
+           AND confirmed_filled_size + 1e-9 >= command_size
+         ORDER BY MIN(finding.recorded_at), MIN(finding.finding_id)
+        """
+    ).fetchall()
+    summary = {"scanned": len(rows), "resolved": 0}
+    for row in rows:
+        venue_order_id = str(row["venue_order_id"])
+        if venue_order_id in open_order_ids:
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE exchange_reconcile_findings
+               SET resolved_at = ?,
+                   resolution = 'local_orphan_order_terminal_fill_confirmed',
+                   resolved_by = 'src.execution.exchange_reconcile'
+             WHERE finding_id = ?
+               AND kind = 'local_orphan_order'
+               AND subject_id = ?
+               AND resolved_at IS NULL
+               AND (
+                    SELECT COUNT(*)
+                      FROM venue_commands owner
+                     WHERE owner.venue_order_id = ?
+                       AND owner.command_id = ?
+               ) = 1
+               AND (
+                    SELECT COUNT(*)
+                      FROM venue_commands owner
+                     WHERE owner.venue_order_id = ?
+               ) = 1
+               AND (
+                    SELECT COUNT(*)
+                      FROM exchange_reconcile_findings sibling
+                     WHERE sibling.kind = 'local_orphan_order'
+                       AND sibling.subject_id = ?
+                       AND sibling.resolved_at IS NULL
+               ) = 1
+            """,
+            (
+                observed_at.isoformat(),
+                str(row["finding_id"]),
+                venue_order_id,
+                venue_order_id,
+                str(row["command_id"]),
+                venue_order_id,
+                venue_order_id,
+            ),
+        )
+        summary["resolved"] += int(cursor.rowcount == 1)
     return summary
 
 

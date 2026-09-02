@@ -9801,6 +9801,116 @@ def test_unresolved_refresh_drains_review_required_local_orphan_atomically(conn)
     assert terminal[:] == ("CANCEL_CONFIRMED", "0", "0")
 
 
+def test_unresolved_refresh_resolves_local_orphan_after_terminal_fill(conn):
+    from src.execution.exchange_reconcile import record_finding, refresh_unresolved_reconcile_findings
+
+    command_id = "cmd-refresh-terminal-fill"
+    order_id = "ord-refresh-terminal-fill"
+    seed_command(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        position_id="pos-refresh-terminal-fill",
+        state="FILLED",
+        size=11.85,
+        price=0.20,
+    )
+    append_trade_fact(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        trade_id="trade-refresh-terminal-fill",
+        size="11.85",
+        fill_price="0.20",
+    )
+    finding = record_finding(
+        conn,
+        kind="local_orphan_order",
+        subject_id=order_id,
+        context="ws_gap",
+        evidence={
+            "reason": "local_open_order_absent_from_exchange_open_orders",
+            "trade_enumeration_available": True,
+        },
+        recorded_at=NOW,
+    )
+
+    result = refresh_unresolved_reconcile_findings(
+        FakeM5Adapter(open_orders=[], trades=[], positions=[]),
+        conn,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    resolved = conn.execute(
+        "SELECT resolved_at, resolution, resolved_by "
+        "FROM exchange_reconcile_findings WHERE finding_id=?",
+        (finding.finding_id,),
+    ).fetchone()
+    assert result["status"] == "resolved"
+    assert result["terminal_fill_local_orphan_summary"] == {"scanned": 1, "resolved": 1}
+    assert resolved["resolved_at"] is not None
+    assert resolved["resolution"] == "local_orphan_order_terminal_fill_confirmed"
+    assert resolved["resolved_by"] == "src.execution.exchange_reconcile"
+
+
+def test_unresolved_refresh_keeps_terminal_fill_without_full_trade_coverage(conn):
+    from src.execution.exchange_reconcile import record_finding, refresh_unresolved_reconcile_findings
+    from src.state.venue_command_repo import append_trade_fact as append_trade_revision
+
+    command_id = "cmd-refresh-partial-trade"
+    order_id = "ord-refresh-partial-trade"
+    seed_command(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        state="FILLED",
+        size=11.85,
+        price=0.20,
+    )
+    append_trade_fact(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        trade_id="trade-refresh-partial-trade",
+        size="5",
+        fill_price="0.20",
+    )
+    append_trade_revision(
+        conn,
+        trade_id="trade-refresh-partial-trade",
+        venue_order_id=order_id,
+        command_id=command_id,
+        state="CONFIRMED",
+        filled_size="5",
+        fill_price="0.20",
+        source="REST",
+        observed_at=NOW + timedelta(microseconds=1),
+        raw_payload_hash=hashlib.sha256(b"trade-refresh-partial-trade:revision-2").hexdigest(),
+        raw_payload_json={"revision": 2},
+    )
+    finding = record_finding(
+        conn,
+        kind="local_orphan_order",
+        subject_id=order_id,
+        context="ws_gap",
+        evidence={"reason": "local_open_order_absent_from_exchange_open_orders"},
+        recorded_at=NOW,
+    )
+
+    result = refresh_unresolved_reconcile_findings(
+        FakeM5Adapter(open_orders=[], trades=[], positions=[]),
+        conn,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    assert result["status"] == "blocked"
+    assert result["terminal_fill_local_orphan_summary"] == {"scanned": 0, "resolved": 0}
+    assert conn.execute(
+        "SELECT resolved_at FROM exchange_reconcile_findings WHERE finding_id=?",
+        (finding.finding_id,),
+    ).fetchone()["resolved_at"] is None
+
+
 @pytest.mark.parametrize(
     "command_state",
     [
