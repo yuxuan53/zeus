@@ -1,8 +1,8 @@
-# Lifecycle: created=2026-04-27; last_reviewed=2026-08-13; last_reused=2026-08-13
+# Lifecycle: created=2026-04-27; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: R3 Z2 Polymarket V2 adapter and submission envelope antibodies.
 # Reuse: Run when V2 SDK adapter, envelope provenance, or Q1 preflight behavior changes.
 # Created: 2026-04-27
-# Last reused/audited: 2026-08-13
+# Last reused/audited: 2026-09-02
 # Authority basis: docs/operations/task_2026-04-26_ultimate_plan/r3/slice_cards/Z2.yaml
 #                  + docs/archive/2026-Q2/task_2026-05-15_live_order_e2e_verification/LIVE_ORDER_E2E_VERIFICATION_PLAN.md
 #                  + docs/archive/2026-Q2/task_2026-05-15_live_order_e2e_goal/LIVE_ORDER_E2E_GOAL_PLAN.md
@@ -177,6 +177,18 @@ class FakeOrderManagerNotReady425Client(FakeTwoStepClient):
         response = SimpleNamespace(
             status_code=425,
             json=lambda: {"error": "order manager not ready, please retry"},
+        )
+        raise PolyApiException(response)
+
+
+class FakeTradingDisabled503Client(FakeTwoStepClient):
+    def post_order(self, order, order_type=None, post_only=False, defer_exec=False):
+        from py_clob_client_v2.exceptions import PolyApiException
+
+        self.calls.append(("post_order", order, order_type, post_only, defer_exec))
+        response = SimpleNamespace(
+            status_code=503,
+            json=lambda: {"error": "trading is disabled"},
         )
         raise PolyApiException(response)
 
@@ -2575,6 +2587,35 @@ def test_order_manager_not_ready_425_is_deterministic_rejection(
     assert legacy["success"] is False
     assert legacy["status"] == "rejected"
     assert legacy["errorCode"] == "venue_order_manager_not_ready_425"
+
+
+def test_trading_disabled_503_is_deterministic_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    import src.venue.polymarket_v2_adapter as adapter_mod
+
+    fake = FakeTradingDisabled503Client()
+    adapter, _ = _adapter(tmp_path, fake)
+    envelope = adapter.create_submission_envelope(
+        _intent(),
+        FakeSnapshot(),
+        order_type="FAK",
+        post_only=False,
+    )
+    monkeypatch.setattr(
+        adapter_mod,
+        "_deterministic_v2_order_id",
+        lambda *args, **kwargs: "0xexpected-order-id",
+    )
+
+    result = _submit(adapter, envelope)
+
+    assert result.status == "rejected"
+    assert result.error_code == "venue_trading_disabled_503"
+    assert result.envelope.order_id is None
+    assert result.envelope.signed_order == fake.signed_order
+    assert any(call[0] == "post_order" for call in fake.calls)
 
 
 def test_post_only_cross_400_is_deterministic_rejection(tmp_path, monkeypatch):

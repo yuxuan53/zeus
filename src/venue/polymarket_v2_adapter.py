@@ -1,5 +1,5 @@
 # Created: 2026-04-27
-# Last reused/audited: 2026-07-29
+# Last reused/audited: 2026-09-02
 # Authority basis (2026-06-12): operator law 2026-06-10 ABSOLUTE — redeem submission
 #   FORBIDDEN. redeem() now raises REDEEM_SUBMISSION_FORBIDDEN unconditionally; the
 #   autonomous web3 broadcast body (eth_sendRawTransaction EOA path) was DELETED.
@@ -1165,6 +1165,14 @@ class PolymarketV2Adapter:
                 return _rejected_submit_result(
                     envelope,
                     error_code="venue_order_manager_not_ready_425",
+                    error_message=str(exc),
+                    signed_order=signed_order,
+                    signed_order_hash=signed_hash,
+                )
+            if post_started and _is_polymarket_trading_disabled_503_error(exc):
+                return _rejected_submit_result(
+                    envelope,
+                    error_code="venue_trading_disabled_503",
                     error_message=str(exc),
                     signed_order=signed_order,
                     signed_order_hash=signed_hash,
@@ -3676,6 +3684,16 @@ def _is_polymarket_order_manager_not_ready_425_error(
         and exc.status_code == 425
         and exc.error_msg
         == {"error": "order manager not ready, please retry"}
+    )
+
+
+def _is_polymarket_trading_disabled_503_error(exc: BaseException) -> bool:
+    """Recognize the venue's synchronous no-order trading-disabled rejection."""
+
+    return (
+        isinstance(exc, PolyApiException)
+        and exc.status_code == 503
+        and exc.error_msg == {"error": "trading is disabled"}
     )
 
 
