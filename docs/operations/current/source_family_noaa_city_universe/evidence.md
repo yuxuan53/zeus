@@ -75,3 +75,27 @@ After landing and daemon reload, verify current `market_events`, posterior
 materialization, family eligibility, global selection receipts, venue facts,
 and portfolio capital truth. Do not infer capital advantage from the 51-city
 admission result alone.
+
+## Post-deploy queue starvation defect
+
+After the source-family hotfix landed as `274fe3a4`, the current-target planner
+expanded to 51 cities and fetched every missing same-cycle Open-Meteo anchor
+manifest. The live `anchor_missing_scope_count` fell from 199 to zero. Austin,
+Atlanta, and Toronto then had complete materialization requests, but those
+files remained queued while the one-second priority lane repeatedly spent both
+of its bounded request slots on held Day0 revisions from the original six-city
+set.
+
+The request interleaver reserved its second slot only for a family already in
+the global-auction scope. A never-priced family cannot enter that scope until
+its first q exists, creating a circular gate: first q required auction scope,
+while auction scope required first q. The hotfix keeps the held-capital slot
+and uses the second slot for the strongest non-held priority request when no
+existing global-auction request is available. The queue is already filtered to
+priority-owned work at that boundary, so background traffic does not gain the
+reserved slot.
+
+Focused tests prove both the existing held-plus-global ordering and the new
+held-plus-first-q ordering. The broader materialization slices introduce no new
+failure; two queue tests and one bounded-read test fail identically on the
+unmodified live checkout.

@@ -3828,7 +3828,7 @@ def _interleave_current_priority_request_files(
     current_global_scope: frozenset[tuple[str, str, str]],
     limit: int,
 ) -> tuple[Path, ...]:
-    """Reserve one request slot for global q while protecting held capital."""
+    """Reserve one request slot for non-held q while protecting held capital."""
 
     ordered = tuple(paths)
     if limit < 2:
@@ -3850,6 +3850,20 @@ def _interleave_current_priority_request_files(
         ),
         None,
     )
+    if global_path is None:
+        # ``paths`` is already filtered to the priority lane. A never-priced
+        # family cannot enter the global auction until its first posterior is
+        # materialized, so requiring global-auction membership here creates a
+        # circular starvation gate while held Day0 revisions keep arriving.
+        global_path = next(
+            (
+                path
+                for path in ordered
+                if _request_family_scope(payloads.get(path))
+                not in current_money_risk
+            ),
+            None,
+        )
     if held is None or global_path is None:
         return ordered
     selected = {held, global_path}

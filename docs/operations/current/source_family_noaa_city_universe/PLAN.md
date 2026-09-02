@@ -1,7 +1,7 @@
 # source_family_noaa_city_universe -- Plan
 
 Date: 2026-09-02
-Branch: `p2-source-family-noaa-city-universe`
+Branch: `hotfix/materializer-new-city-fairness`
 Status: active
 
 ## Background
@@ -30,6 +30,8 @@ _See sibling scope.yaml for machine-readable scope._
 - Preserve HKO, Jinan, Taipei, and currently inactive city contracts.
 - Prove new-city Gamma events parse, persist, receive forecast/Day0 data, and
   enter the global family selection funnel.
+- Keep one bounded priority-materialization slot available to non-held
+  first-posterior work even while held Day0 revisions continuously arrive.
 - Re-run the strict current-regime capital evaluator; city coverage is not
   itself capital-advantage proof.
 

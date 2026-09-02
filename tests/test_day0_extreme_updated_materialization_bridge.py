@@ -2842,6 +2842,46 @@ def test_priority_request_tranche_reserves_global_q_slot(tmp_path) -> None:
     assert ordered[:2] == (held, global_q)
 
 
+def test_priority_request_tranche_reserves_first_q_before_global_auction(
+    tmp_path,
+) -> None:
+    """Held churn cannot starve a family that needs its first posterior."""
+    from src.data import replacement_forecast_live_materialization_queue as queue
+
+    held = tmp_path / "held.json"
+    held_sibling = tmp_path / "held-sibling.json"
+    first_q = tmp_path / "first-q.json"
+    held_scope = ("Istanbul", "2026-09-02", "high")
+    first_q_scope = ("Austin", "2026-09-02", "high")
+    payloads = {
+        held: {
+            "city": held_scope[0],
+            "target_date": held_scope[1],
+            "temperature_metric": held_scope[2],
+        },
+        held_sibling: {
+            "city": held_scope[0],
+            "target_date": held_scope[1],
+            "temperature_metric": held_scope[2],
+        },
+        first_q: {
+            "city": first_q_scope[0],
+            "target_date": first_q_scope[1],
+            "temperature_metric": first_q_scope[2],
+        },
+    }
+
+    ordered = queue._interleave_current_priority_request_files(
+        (held, held_sibling, first_q),
+        payloads,
+        current_money_risk=frozenset({held_scope}),
+        current_global_scope=frozenset({held_scope}),
+        limit=2,
+    )
+
+    assert ordered[:2] == (held, first_q)
+
+
 def test_materialize_callbacks_return_lane_receipts_and_truthful_status_health(
     monkeypatch, tmp_path
 ) -> None:
