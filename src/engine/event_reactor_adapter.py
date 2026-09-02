@@ -45627,15 +45627,52 @@ def _day0_remaining_day_members(
             )
         else:
             # Source-clock actions retain the immutable posterior successor
-            # contract.  A newly captured member set cannot be rebound to an
-            # older posterior in place.
-            validated_bundle = _validate_day0_causal_bundle_successor(
-                conn=forecast_conn,
-                payload=payload,
-                family=family,
-                decision_time=decision_time,
-                vector_witness=current_vector_witness,
-            )
+            # contract for ENTRY. Held/reduce-only redecision instead owns an
+            # explicit current-evidence transition: a complete newer vector
+            # revision must rebuild q now, not wait on a successor that can be
+            # obsolete again before the next monitor cycle.
+            try:
+                validated_bundle = _validate_day0_causal_bundle_successor(
+                    conn=forecast_conn,
+                    payload=payload,
+                    family=family,
+                    decision_time=decision_time,
+                    vector_witness=current_vector_witness,
+                )
+            except ValueError as exc:
+                held_bundle_scope = (
+                    payload.get("_edli_day0_redecision_authority_scope")
+                    == "held_exposure_current_bundle_day0_only_v1"
+                )
+                if (
+                    entry_authority
+                    or not held_bundle_scope
+                    or str(exc) != "DAY0_CAUSAL_EVIDENCE_BUNDLE_MISMATCH"
+                ):
+                    raise
+                superseded_validation = payload.get(
+                    "_edli_day0_causal_evidence_bundle_validation"
+                )
+                payload.update(
+                    {
+                        "_edli_day0_redecision_authority_scope": (
+                            "held_exposure_current_day0_only_v1"
+                        ),
+                        "_edli_day0_direct_current_redecision_authority": True,
+                        "_edli_day0_superseded_bundle_validation": (
+                            dict(superseded_validation)
+                            if isinstance(superseded_validation, Mapping)
+                            else None
+                        ),
+                    }
+                )
+                validated_bundle = _build_direct_current_day0_causal_bundle(
+                    payload=payload,
+                    family=family,
+                    unit=unit,
+                    decision_time=decision_time,
+                    vector_witness=current_vector_witness,
+                )
         if validated_bundle is not None:
             payload["_edli_day0_remaining_vector_witness"] = dict(
                 validated_bundle["carrier_vector_witness"]

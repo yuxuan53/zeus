@@ -4091,10 +4091,10 @@ class TestRemainingDayMembers:
         )
         conn.close()
 
-    def test_held_current_vector_witness_waits_for_materialized_successor(
+    def test_held_current_vector_witness_rebuilds_from_new_complete_revision(
         self, monkeypatch
     ):
-        """A newer vector cannot be rebound onto the held posterior in-place."""
+        """Held q follows complete current vectors without a successor ratchet."""
         import src.engine.event_reactor_adapter as era
 
         vector = _vector(model="ecmwf_ifs", temps=[25.0] * 24)
@@ -4120,7 +4120,12 @@ class TestRemainingDayMembers:
         payload = {
             "metric": "high",
             "rounded_value": 20.0,
+            "high_so_far": 20.0,
             "observation_time": "2026-06-10T13:00:00+00:00",
+            "settlement_source": "wu_icao_history",
+            "settlement_unit": "C",
+            "station_id": "LFPG",
+            "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
             "_edli_day0_redecision_authority_scope": (
                 "held_exposure_current_bundle_day0_only_v1"
             ),
@@ -4149,13 +4154,24 @@ class TestRemainingDayMembers:
             forecast_conn=object(),
         )
 
-        assert members is None
+        assert members is not None
+        assert members.tolist() == [25.0]
+        assert payload["_edli_day0_redecision_authority_scope"] == (
+            "held_exposure_current_day0_only_v1"
+        )
+        assert payload["_edli_day0_direct_current_redecision_authority"] is True
+        assert payload["_edli_day0_superseded_bundle_validation"]["reason"] == (
+            "DAY0_CAUSAL_EVIDENCE_BUNDLE_MISMATCH"
+        )
         receipt = payload["_edli_day0_causal_evidence_bundle_validation"]
-        assert receipt["reason"] == "DAY0_CAUSAL_EVIDENCE_BUNDLE_MISMATCH"
+        assert receipt["reason"] is None
         assert payload[
             "_edli_day0_causal_evidence_bundle_successor_materialized"
-        ] is True
-        assert payload["_edli_day0_remaining_vector_witness"] == source_witness
+        ] is False
+        assert payload["_edli_day0_remaining_vector_witness"] == {
+            "vector_id": "current-vector",
+            "vector_ids_by_model": {"ecmwf_ifs": "current-vector"},
+        }
 
     def test_source_clock_total_variance_subtracts_current_path_spread(self):
         import src.engine.event_reactor_adapter as era
