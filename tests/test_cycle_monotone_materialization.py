@@ -1,8 +1,8 @@
 # Created: 2026-06-12
-# Last reused or audited: 2026-08-27 (Day0 same-cycle input revision reseed;
+# Last reused or audited: 2026-09-02 (causal baseline completion witness;
 #   external review FINDING 2: per-family materializable-cycle
 #   gate + typed leg-artifact-missing reason)
-# Lifecycle: created=2026-06-12; last_reviewed=2026-08-27; last_reused=2026-08-27
+# Lifecycle: created=2026-06-12; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Relationship tests for consumed-cycle monotonicity and single-family BPF reseed repair.
 # Reuse: Run when replacement cycle-advance, materialization reseed, or freshness gates change.
 # Authority basis: U5 step 2a (operator regime-unification + freshness investigation 2026-06-12,
@@ -729,6 +729,90 @@ def test_batch_cycle_advance_enqueues_day0_with_observed_extreme(
     assert marker is not None
     assert marker["seed_file"]
     assert marker["day0_observed_extreme_observation_time"] == "2026-07-03T22:00:00+00:00"
+
+
+def test_committed_ens_wake_is_complete_when_current_q_consumed_exact_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A moved old marker cannot republish an ENS run already present in current q."""
+
+    db_path = tmp_path / "forecast.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    ensure_replacement_forecast_live_schema(conn)
+    target_cycle = datetime(2026, 8, 23, 0, tzinfo=UTC)
+    committed_run = "ecmwf_open_data:mx2t6_high:2026-08-23T00Z"
+    _insert_posterior(
+        conn,
+        city="Cape Town",
+        target_date="2026-08-24",
+        metric="high",
+        cycle_iso=target_cycle.isoformat(),
+        computed_at="2026-08-23T07:00:00+00:00",
+    )
+    conn.execute(
+        """
+        UPDATE forecast_posteriors
+           SET dependency_source_run_ids_json = ?
+         WHERE city = 'Cape Town'
+           AND target_date = '2026-08-24'
+           AND temperature_metric = 'high'
+        """,
+        (json.dumps({"baseline_b0": committed_run}),),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        cycle_advance,
+        "freshest_materializable_cycle",
+        lambda _conn: target_cycle,
+    )
+    monkeypatch.setattr(
+        cycle_advance,
+        "scope_needs_cycle_advance",
+        lambda *_args, **_kwargs: {
+            "needs_advance": False,
+            "consumed_cycle": target_cycle.isoformat(),
+            "target_cycle": target_cycle.isoformat(),
+        },
+    )
+    monkeypatch.setattr(
+        cycle_advance,
+        "family_materializable_cycle",
+        lambda *_args, **_kwargs: (target_cycle, ()),
+    )
+    monkeypatch.setattr(
+        cycle_advance,
+        "_newer_eligible_ensemble_cycle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cycle_advance,
+        "_superseded_baseline_seed_file",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an already-consumed ENS wake must not inspect or replace its old marker"
+        ),
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+
+    report = cycle_advance.enqueue_cycle_advance_reseeds(
+        forecast_db=db_path,
+        seed_dir=tmp_path / "seeds",
+        raw_manifest_dir=raw_dir,
+        computed_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
+        limit=1,
+        scopes=(("Cape Town", "2026-08-24", "high"),),
+        manifests=(),
+        causal_baseline_source_run_id=committed_run,
+    )
+
+    assert report["seeds_enqueued"] == 0
+    assert report["causal_baseline_scope_failed"] == 0
+    assert report["causal_baseline_already_consumed"] == 1
+    assert not (tmp_path / "seeds").exists()
 
 
 @pytest.mark.parametrize(

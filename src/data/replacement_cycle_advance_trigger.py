@@ -697,6 +697,61 @@ def _latest_posterior_covers_target_cycle(
     return computed_at is not None and computed_at >= minimum_computed_at.astimezone(UTC)
 
 
+def _latest_posterior_consumes_causal_baseline(
+    conn: sqlite3.Connection,
+    *,
+    city: str,
+    target_date: str,
+    metric: str,
+    target_cycle_iso: str,
+    required_baseline_source_run_id: str | None,
+) -> bool:
+    """Whether current q already consumed this exact committed ENS wake."""
+
+    required = str(required_baseline_source_run_id or "").strip()
+    target_cycle = _parse_cycle(target_cycle_iso)
+    if not required or target_cycle is None:
+        return False
+    try:
+        row = conn.execute(
+            """
+            SELECT source_cycle_time, dependency_source_run_ids_json
+              FROM forecast_posteriors
+             WHERE source_id = ?
+               AND runtime_layer = 'live'
+               AND city = ?
+               AND target_date = ?
+               AND temperature_metric = ?
+             ORDER BY computed_at DESC, posterior_id DESC
+             LIMIT 1
+            """,
+            (SOURCE_ID, city, target_date, metric),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    consumed_cycle = _parse_cycle(
+        row["source_cycle_time"] if hasattr(row, "keys") else row[0]
+    )
+    try:
+        dependencies = json.loads(
+            str(
+                row["dependency_source_run_ids_json"]
+                if hasattr(row, "keys")
+                else row[1]
+            )
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        consumed_cycle is not None
+        and consumed_cycle >= target_cycle
+        and isinstance(dependencies, Mapping)
+        and str(dependencies.get("baseline_b0") or "") == required
+    )
+
+
 def _day0_enqueue_owner_request_check(
     *,
     city: str,
@@ -1682,6 +1737,7 @@ def enqueue_cycle_advance_reseeds(
         "family_scope_check_failed": 0,
         "seed_build_failed": 0,
         "causal_baseline_scope_failed": 0,
+        "causal_baseline_already_consumed": 0,
         "retry_pending": 0,
         "day0_identity_incomplete": 0,
         "enqueued": [],
@@ -2016,6 +2072,24 @@ def enqueue_cycle_advance_reseeds(
                 ) + 1
                 continue
             target_cycle_iso = family_cycle.isoformat()
+            if causal_baseline_source_run_id and _latest_posterior_consumes_causal_baseline(
+                conn,
+                city=city,
+                target_date=target_date,
+                metric=metric,
+                target_cycle_iso=target_cycle_iso,
+                required_baseline_source_run_id=causal_baseline_source_run_id,
+            ):
+                # SCOPE: this exact family/cycle/committed ENS run. DRAIN: the
+                # source wake is complete when current q names that run as its
+                # baseline dependency. RESET: a different committed run id or
+                # newer target cycle makes the predicate false. Marker state is
+                # deliberately irrelevant: a moved old seed cannot outrank the
+                # canonical posterior that already consumed this causal fact.
+                report["causal_baseline_already_consumed"] = int(
+                    report["causal_baseline_already_consumed"]
+                ) + 1
+                continue
             try:
                 superseded_seed_file = _superseded_baseline_seed_file(
                     conn,
