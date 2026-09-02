@@ -1089,17 +1089,22 @@ def _canonical_live_restart_obligations(trade_db: Path) -> dict[str, object]:
             {state.value for state in TERMINAL_STATES} | {"CANCELED", "FAILED"}
         )
         terminal_placeholders = ", ".join("?" for _ in terminal_states)
-        command_ids = tuple(
-            str(row[0])
-            for row in conn.execute(
+        command_rows = conn.execute(
                 f"""
-                SELECT command_id
+                SELECT command_id, UPPER(COALESCE(state, ''))
                   FROM venue_commands
                  WHERE UPPER(COALESCE(state, '')) NOT IN ({terminal_placeholders})
                  ORDER BY command_id
                 """,
                 tuple(terminal_states),
             ).fetchall()
+        from src.execution.exit_safety import _terminal_partial_command_proven
+
+        command_ids = tuple(
+            str(command_id)
+            for command_id, state in command_rows
+            if state != "PARTIAL"
+            or not _terminal_partial_command_proven(conn, str(command_id))
         )
         return {
             "open_position_count": len(position_ids),

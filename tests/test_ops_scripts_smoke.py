@@ -5979,6 +5979,30 @@ def test_deploy_live_loaded_restart_blocks_nonterminal_command_without_position(
     assert "buy-live" in detail
 
 
+def test_deploy_live_restart_ignores_proven_terminal_fak_partial(
+    monkeypatch, tmp_path
+):
+    dl = _load("deploy_live_restart_terminal_partial", "deploy_live.py")
+    state = tmp_path / "state"
+    state.mkdir()
+    world, trade = _init_paused_entry_park_authority(state)
+    trade.execute("INSERT INTO venue_commands VALUES ('sell-partial', 'SELL', 'PARTIAL')")
+    trade.commit()
+    trade.close()
+    world.close()
+    monkeypatch.setattr(
+        "src.execution.exit_safety._terminal_partial_command_proven",
+        lambda _conn, command_id: command_id == "sell-partial",
+    )
+
+    obligations = dl._canonical_live_restart_obligations(
+        state / "zeus_trades.db"
+    )
+
+    assert obligations["nonterminal_command_count"] == 0
+    assert obligations["nonterminal_command_ids"] == ()
+
+
 def test_deploy_live_absent_daemon_bootstrap_restores_monitoring_with_exposure(
     monkeypatch, tmp_path
 ):
