@@ -1,6 +1,6 @@
 # Created: 2026-07-19
-# Last reused/audited: 2026-09-01
-# Lifecycle: created=2026-07-19; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused/audited: 2026-09-02
+# Lifecycle: created=2026-07-19; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: Prove Day0 reseed ownership and single-writer materialization ordering.
 # Reuse: Run after changing Day0 enqueue, replacement queue claims, or writer concurrency.
 # Authority basis: operator directive 2026-07-19 (Day0 is a zero-sum race against the market
@@ -1734,6 +1734,171 @@ def test_day0_fusion_revision_uses_its_own_owner_not_cycle_advance_marker(
 
     assert ownership.ownership is materialization_queue._Day0EnqueueOwnership.CURRENT
     assert ownership.witness is None
+
+
+def test_covered_day0_upgrade_skips_but_instrument_expansion_rebuilds(
+    tmp_path, monkeypatch
+) -> None:
+    """A duplicate Day0 trigger cannot occupy the writer after exact q coverage."""
+
+    monkeypatch.setattr(
+        materialization_queue,
+        "validate_materialization_seed",
+        lambda _seed: None,
+    )
+    coverage_checks: list[str] = []
+
+    def covered(*, seed, **_kwargs):
+        coverage_checks.append(str(seed.get("upgrade_trigger") or ""))
+        return True
+
+    monkeypatch.setattr(materialization_queue, "_seed_already_covered", covered)
+    built: list[str] = []
+
+    def ready_builder(seed, **_kwargs):
+        built.append(str(seed.get("upgrade_trigger") or ""))
+        return SimpleNamespace(
+            ok=True,
+            status="READY",
+            reason_codes=("REPLACEMENT_MATERIALIZATION_REQUEST_READY",),
+            request={
+                "city": seed["city"],
+                "target_date": seed["target_date"],
+                "temperature_metric": seed["temperature_metric"],
+                "source_cycle_time": seed["source_cycle_time"],
+            },
+        )
+
+    monkeypatch.setattr(
+        materialization_queue,
+        "build_replacement_forecast_materialization_request",
+        ready_builder,
+    )
+    trade_conn = sqlite3.connect(":memory:")
+    try:
+        for trigger in ("day0_observation_advanced", "instrument_set_expansion"):
+            root = tmp_path / trigger
+            seed_dir = root / "seeds"
+            seed_dir.mkdir(parents=True)
+            seed = seed_dir / "seed.json"
+            seed.write_text(
+                json.dumps(
+                    {
+                        "city": "Tel Aviv",
+                        "target_date": "2026-09-02",
+                        "temperature_metric": "high",
+                        "computed_at": "2026-09-02T08:47:20+00:00",
+                        "source_cycle_time": "2026-09-02T00:00:00+00:00",
+                        "baseline_source_run_id": "baseline:0",
+                        "openmeteo_source_run_id": "openmeteo:0",
+                        "openmeteo_payload_json": "payload.json",
+                        "precision_metadata_json": "precision.json",
+                        "bins": [{"bin_id": "33C"}],
+                        "upgrade_trigger": trigger,
+                        "day0_observed_extreme_source": "aviationweather_metar",
+                        "day0_observed_extreme_observation_time": (
+                            "2026-09-02T08:20:00+00:00"
+                        ),
+                        "day0_observed_extreme_c": 33.0,
+                        "day0_observed_extreme_unit": "C",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            processed, failed, _reasons = (
+                materialization_queue._prepare_seed_requests_with_connection(
+                    seed_dir=seed_dir,
+                    seed_processed_dir=root / "seed_processed",
+                    seed_failed_dir=root / "seed_failed",
+                    request_dir=root / "requests",
+                    forecast_db=None,
+                    forecast_conn=None,
+                    trade_conn=trade_conn,
+                    limit=1,
+                )
+            )
+            assert len(processed) == 1
+            assert not failed
+
+        assert coverage_checks == ["day0_observation_advanced"]
+        assert built == ["instrument_set_expansion"]
+        covered_receipt = next(
+            (tmp_path / "day0_observation_advanced" / "seed_processed").glob(
+                "*.receipt.json"
+            )
+        )
+        assert json.loads(covered_receipt.read_text(encoding="utf-8"))[
+            "status"
+        ] == "SKIPPED_ALREADY_COVERED"
+        assert tuple(
+            (tmp_path / "instrument_set_expansion" / "requests").glob("*.json")
+        )
+    finally:
+        trade_conn.close()
+
+
+def test_covered_day0_request_never_retries_materializer(
+    tmp_path, monkeypatch
+) -> None:
+    """A request published after its exact q commit terminates before spawn."""
+
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    request = request_dir / "tel-aviv.json"
+    request.write_text(
+        json.dumps(
+            {
+                "city": "Tel Aviv",
+                "target_date": "2026-09-02",
+                "temperature_metric": "high",
+                "computed_at": "2026-09-02T08:47:20+00:00",
+                "source_cycle_time": "2026-09-02T00:00:00+00:00",
+                "baseline_source_run_id": "baseline:0",
+                "openmeteo_source_run_id": "openmeteo:0",
+                "upgrade_trigger": "day0_observation_advanced",
+                "day0_observed_extreme_source": "aviationweather_metar",
+                "day0_observed_extreme_observation_time": (
+                    "2026-09-02T08:20:00+00:00"
+                ),
+                "day0_observed_extreme_c": 33.0,
+                "day0_observed_extreme_unit": "C",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_validate_request_payload",
+        lambda _path: (True, "", ""),
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_seed_already_covered",
+        lambda **_kwargs: True,
+    )
+
+    def unexpected_runner(_command):
+        raise AssertionError("covered Day0 request spawned the materializer")
+
+    report = materialization_queue.process_replacement_forecast_live_materialization_queue(
+        request_dir=request_dir,
+        processed_dir=tmp_path / "processed",
+        failed_dir=tmp_path / "failed",
+        forecast_db=None,
+        discover=False,
+        runner=unexpected_runner,
+    )
+
+    assert report.processed_count == 1
+    assert report.failed_count == 0
+    assert (
+        "REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_ALREADY_COVERED"
+        in report.reason_codes
+    )
+    receipt = tmp_path / "success_coalesced_latest" / "Tel_Aviv.2026-09-02.high.json"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["status"] == (
+        "SKIPPED_ALREADY_COVERED"
+    )
 
 
 def test_queue_defers_current_day0_upgrade_seed_when_marker_read_is_transient(

@@ -4535,10 +4535,21 @@ def _prepare_seed_requests_with_connection(
                 processed.append(str(moved))
                 actionable_count += 1
                 continue
-            if not seed.get("upgrade_trigger") and _seed_already_covered(
+            # Only an instrument-set expansion is allowed to recompute an
+            # otherwise covered posterior: its new provider set is the fact
+            # being materialized. Other producer reasons (including a Day0
+            # observation advance) still pass the exact conditioning + input-
+            # HWM coverage check. Treating every non-empty trigger as a bypass
+            # lets a late duplicate Day0 enqueue monopolize held priority even
+            # after the current posterior consumed that exact observation.
+            if (
+                str(seed.get("upgrade_trigger") or "").strip()
+                != "instrument_set_expansion"
+                and _seed_already_covered(
                 forecast_db=forecast_db,
                 seed=seed,
                 forecast_conn=forecast_conn,
+                )
             ):
                 moved = _move_request(seed_json, processed_path)
                 _publish_latest_seed(moved, seed)
@@ -5345,6 +5356,7 @@ def _process_claimed_materialization_batch(
     stale_day0_superseded: list[str] = []
     source_cycle_regressions: list[str] = []
     source_cycles_awaiting_ensemble: list[str] = []
+    already_covered: list[str] = []
     write_deferred: list[str] = []
     timed_out_requests: list[str] = []
     timeout_stage_reasons: list[str] = []
@@ -5449,6 +5461,40 @@ def _process_claimed_materialization_batch(
             )
             processed.append(str(receipt))
             source_cycle_regressions.append(str(receipt))
+            continue
+        upgrade_trigger = str(
+            (request_payload or {}).get("upgrade_trigger") or ""
+        ).strip()
+        if (
+            request_payload is not None
+            and upgrade_trigger
+            and upgrade_trigger != "instrument_set_expansion"
+            and _seed_already_covered(
+                forecast_db=forecast_db,
+                seed=dict(request_payload),
+            )
+        ):
+            # A seed can race a canonical commit and publish its request after
+            # the exact q is already current. Revalidate here so pre-hotfix or
+            # crash-restored requests cannot keep retrying ahead of unrelated
+            # families. The coverage predicate includes current input HWM and
+            # exact Day0 conditioning; fusion expansion remains the sole bypass.
+            receipt = _record_latest_terminal_request(
+                input_json,
+                processed_path=processed_path,
+                request_payload=request_payload,
+                receipt_dir_name="success_coalesced_latest",
+                status="SKIPPED_ALREADY_COVERED",
+                reason_codes=(
+                    "REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_ALREADY_COVERED",
+                ),
+                result_evidence={
+                    "request_validated": True,
+                    "subprocess_spawned": False,
+                },
+            )
+            processed.append(str(receipt))
+            already_covered.append(str(receipt))
             continue
         marker_path, attempt_fingerprint, unchanged = (
             _blocked_attempt_state(
@@ -5691,6 +5737,10 @@ def _process_claimed_materialization_batch(
         reasons.append("REPLACEMENT_MATERIALIZATION_SOURCE_CYCLE_REGRESSION")
     if source_cycles_awaiting_ensemble:
         reasons.append(_AWAITING_ENSEMBLE_HWM_REASON)
+    if already_covered:
+        reasons.append(
+            "REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_ALREADY_COVERED"
+        )
     if write_deferred:
         reasons.append(_WRITE_DEFERRED_REASON)
         _LOG.warning(
