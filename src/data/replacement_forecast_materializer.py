@@ -5978,6 +5978,7 @@ def _compute_posterior_payload(
     _day0_shared_carrier: dict[str, object] | None = None
     _day0_shared_carrier_likelihood: dict[str, object] | None = None
     _day0_shared_carrier_station_extremes: tuple[dict[str, object], ...] = ()
+    _day0_shared_carrier_error: str | None = None
     _provisional_extreme_c: float | None = None
     if (
         bayes_precision_fusion_override is not None
@@ -6601,6 +6602,7 @@ def _compute_posterior_payload(
             _day0_center_delta_c = 0.0
             _day0_center_vector_id = None
             _day0_center_hours_remaining = None
+            _day0_shared_carrier_error = str(_exc)
             try:
                 import logging  # noqa: PLC0415
                 logging.getLogger("zeus.replacement_bayes_precision_fusion").warning(
@@ -6615,7 +6617,10 @@ def _compute_posterior_payload(
         and _is_noaa_preliminary_source(request.day0_observed_extreme_source)
         and _day0_shared_carrier is None
     ):
-        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_UNAVAILABLE")
+        raise ValueError(
+            _day0_shared_carrier_error
+            or "DAY0_NOAA_PRELIMINARY_CARRIER_UNAVAILABLE"
+        )
     bin_topology_payload = _bin_topology_payload(request.bins, settlement_step_c=float(request.settlement_step_c))
     bin_topology_hash = _json_hash(bin_topology_payload)
     dependency_payload = {
@@ -7589,7 +7594,24 @@ def prepare_replacement_forecast_live(
             anchor_id=None,
             readiness_id=None,
         )
-    posterior = _compute_posterior_payload(conn, request, metric=metric, anchor_id=-1)
+    try:
+        posterior = _compute_posterior_payload(
+            conn, request, metric=metric, anchor_id=-1
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        if reason in {
+            "DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_MISSING",
+            "DAY0_NOAA_PRELIMINARY_CARRIER_FUTURE_MEMBERS_MISSING",
+        }:
+            return ReplacementForecastMaterializeResult(
+                status="BLOCKED",
+                reason_codes=(reason,),
+                posterior_id=None,
+                anchor_id=None,
+                readiness_id=None,
+            )
+        raise
     return PreparedReplacementForecastMaterialization(
         request=request,
         metric=metric,

@@ -23,9 +23,12 @@ _DECISION_TIME = "2026-07-13T07:00:00+00:00"
 
 
 def _make_forecast_db(tmp_path: Path) -> Path:
+    from src.data.day0_hourly_vectors import _ensure_schema
+
     db_path = tmp_path / "forecasts.db"
     conn = sqlite3.connect(str(db_path))
     apply_canonical_schema(conn, forecast_tables=True)
+    _ensure_schema(conn)
     conn.commit()
     conn.close()
     return db_path
@@ -126,4 +129,51 @@ def test_fingerprint_changes_on_consumable_provider_advance(tmp_path: Path) -> N
     fp2 = queue_mod._blocked_attempt_fingerprint(
         input_json=input_json, forecast_db=db_path, payload=payload
     )
+    assert fp2 != fp1
+
+
+def test_fingerprint_changes_when_day0_hourly_carrier_arrives(tmp_path: Path) -> None:
+    """A newly possessed remaining-day vector must reopen a blocked carrier."""
+
+    db_path = _make_forecast_db(tmp_path)
+    input_json = tmp_path / "request.json"
+    input_json.write_text("{}")
+    payload = _payload(_OWN_CYCLE)
+
+    fp1 = queue_mod._blocked_attempt_fingerprint(
+        input_json=input_json, forecast_db=db_path, payload=payload
+    )
+    assert fp1 is not None
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO day0_hourly_vectors (
+            vector_id, model, city, target_date, timezone_name, captured_at,
+            provider, endpoint, request_hash, times_json, temps_c_json,
+            source_run_meta_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "vector-1",
+            "ecmwf_ifs",
+            _CITY,
+            _TARGET_DATE,
+            "UTC",
+            "2026-07-13T06:30:00+00:00",
+            "openmeteo",
+            "single_runs",
+            "sha256:vector-1",
+            '["2026-07-14T00:00"]',
+            "[20.0]",
+            '{"provider_source_cycle_time_utc":"2026-07-13T06:00:00+00:00"}',
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    fp2 = queue_mod._blocked_attempt_fingerprint(
+        input_json=input_json, forecast_db=db_path, payload=payload
+    )
+    assert fp2 is not None
     assert fp2 != fp1

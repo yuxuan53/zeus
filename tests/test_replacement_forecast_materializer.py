@@ -397,6 +397,38 @@ def _prepare_for_final_write(
     return prepared
 
 
+def test_missing_day0_hourly_carrier_is_a_blocked_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged missing vector is terminal until its evidence frontier moves."""
+
+    conn = sqlite3.connect(":memory:")
+    request = _request()
+    monkeypatch.setattr(
+        materializer_mod,
+        "_validated_replacement_forecast_request",
+        lambda *_args, **_kwargs: (request, "high"),
+    )
+    monkeypatch.setattr(
+        materializer_mod,
+        "_day0_ledger_frontier_identity",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def missing(*_args, **_kwargs):
+        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_MISSING")
+
+    monkeypatch.setattr(materializer_mod, "_compute_posterior_payload", missing)
+
+    result = materializer_mod.prepare_replacement_forecast_live(conn, request)
+
+    assert isinstance(result, materializer_mod.ReplacementForecastMaterializeResult)
+    assert result.status == "BLOCKED"
+    assert result.reason_codes == (
+        "DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_MISSING",
+    )
+
+
 def test_day0_owner_witness_allows_current_owner_posterior_write(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

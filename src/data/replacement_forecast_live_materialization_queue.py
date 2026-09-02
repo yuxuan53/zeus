@@ -2682,6 +2682,34 @@ def _blocked_attempt_fingerprint(
                     "source_cycle_time": ensemble_mark[1].isoformat(),
                 }
             )
+            day0_hourly_frontier: dict[str, dict[str, object]] | None = None
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT model, vector_id, captured_at, source_run_meta_json
+                    FROM day0_hourly_vectors
+                    WHERE city = ? AND target_date = ?
+                      AND julianday(captured_at) <= julianday(?)
+                    ORDER BY model, captured_at DESC, vector_id DESC
+                    """,
+                    (scope[0], scope[1], computed_at.isoformat()),
+                ).fetchall()
+                latest_by_model: dict[str, dict[str, object]] = {}
+                for row in rows:
+                    model = str(row[0] or "").strip()
+                    if not model or model in latest_by_model:
+                        continue
+                    latest_by_model[model] = {
+                        "vector_id": str(row[1] or ""),
+                        "captured_at": str(row[2] or ""),
+                        "source_run_meta_json": str(row[3] or ""),
+                    }
+                day0_hourly_frontier = dict(sorted(latest_by_model.items()))
+            except sqlite3.Error:
+                # Non-Day0/legacy stores may not own this table. Absence stays
+                # an inert fingerprint component; unreadable primary evidence
+                # is still handled by the outer retry-safe path.
+                day0_hourly_frontier = None
         finally:
             conn.close()
     except _ClaimReadDeadlineExceeded:
@@ -2726,6 +2754,7 @@ def _blocked_attempt_fingerprint(
                 "missing_configured_sources": missing_sources,
                 "source_clock_frontier": source_clock_frontier,
                 "eligible_ensemble_input_mark": eligible_ensemble_input_mark,
+                "day0_hourly_frontier": day0_hourly_frontier,
             },
             "logic": logic_revisions,
         },
