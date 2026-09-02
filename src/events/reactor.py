@@ -1798,7 +1798,10 @@ class OpportunityEventReactor:
             # world/trade txn is open (each unit-of-work committed + released its mutex before the
             # loop body returned), so the refresher's network I/O is structurally outside any txn.
             with contextlib.suppress(Exception):
-                self._drain_substrate_refreshes(result=result)
+                self._drain_substrate_refreshes(
+                    result=result,
+                    cancelled=cycle_cancelled,
+                )
         return result
 
     def _process_global_event_batch(
@@ -3132,7 +3135,12 @@ class OpportunityEventReactor:
         if family not in bucket:
             bucket.append(family)
 
-    def _drain_substrate_refreshes(self, *, result: ReactorResult) -> None:
+    def _drain_substrate_refreshes(
+        self,
+        *,
+        result: ReactorResult,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         """Invoke the substrate refreshers for every family blocked this cycle, OUTSIDE any world
         write SAVEPOINT / trade read txn (the drain runs at end-of-cycle in process_pending, where
         no per-event txn is open — the structural no-network-in-txn guarantee).
@@ -3152,7 +3160,10 @@ class OpportunityEventReactor:
         limit: decisions, the 30s decision budget, the fair rotation order, and every money-path
         gate are untouched; only the background refresh fan-out is time-bounded. The budget is
         SHARED across both buckets and HELD-position families are drained FIRST (money at risk),
-        so a budget can never starve a held family's refresh.
+        so a budget can never starve a held family's refresh. A higher-priority cancellation is
+        different: it yields before the next network call, including a held-family refresh,
+        because the held monitor itself now owns current probability/book work and the blocked
+        event remains durable for the sidecar or next reactor cycle.
         """
         sidecar_owns_broad = _substrate_sidecar_owns_broad_refresh()
         if sidecar_owns_broad:
@@ -3194,6 +3205,7 @@ class OpportunityEventReactor:
             result=result,
             held=held,
             deadline=drain_deadline,
+            cancelled=cancelled,
         )
         self._drain_one_bucket(
             self._pending_snapshot_refreshes,
@@ -3204,6 +3216,7 @@ class OpportunityEventReactor:
             result=result,
             held=held,
             deadline=drain_deadline,
+            cancelled=cancelled,
         )
         self._drain_one_bucket(
             self._pending_cycle_advances,
@@ -3214,6 +3227,7 @@ class OpportunityEventReactor:
             result=result,
             held=held,
             deadline=drain_deadline,
+            cancelled=cancelled,
         )
         # NOTE: _drain_one_bucket clears each bucket on full drain and RETAINS only the
         # budget-truncated remainder (#83), so a blanket clear here is intentionally absent —
@@ -3240,6 +3254,7 @@ class OpportunityEventReactor:
         result: ReactorResult,
         held: "frozenset[tuple[str, str, str]]" = frozenset(),
         deadline: "float | None" = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if refresher is None or not families:
             return
@@ -3270,7 +3285,12 @@ class OpportunityEventReactor:
         now = time.monotonic()
         unreached: list[tuple[str, str, str]] = []
         budget_truncated = False
+        cancellation_preempted = False
         for idx, (city, target_date, metric) in enumerate(ordered):
+            if cancelled is not None and cancelled():
+                unreached = list(ordered[idx:])
+                cancellation_preempted = True
+                break
             # DRAIN BUDGET (#83): stop BEFORE invoking the refresher once the shared per-cycle
             # wall-clock budget is spent — so we always finish the CURRENT family first and never
             # cut a /book fetch mid-network. The families not reached are retained in the bucket
@@ -3313,15 +3333,25 @@ class OpportunityEventReactor:
         # BUDGET TRUNCATION (#83): retain the unreached families IN the bucket so they are visible
         # and carried (the caller drops the blanket clear). Visibility counter records how many were
         # deferred; the next cycle's fair rotation advances them toward the front (no starvation).
-        if budget_truncated:
+        if budget_truncated or cancellation_preempted:
             families[:] = unreached
             result.drained_truncated += len(unreached)
-            _log.info(
-                "always-decidable %s drain hit per-cycle budget (ZEUS_REACTOR_DRAIN_BUDGET_"
-                "SECONDS); deferred %d famil%s to a later cycle (held-first preserved; "
-                "fair-rotation guarantees bounded coverage; NOT a money-path cap)",
-                label, len(unreached), "y" if len(unreached) == 1 else "ies",
-            )
+            if cancellation_preempted:
+                _log.info(
+                    "always-decidable %s drain yielded %d famil%s to higher-priority "
+                    "reactor/monitor work; blocked events remain durable for the "
+                    "sidecar/next cycle",
+                    label,
+                    len(unreached),
+                    "y" if len(unreached) == 1 else "ies",
+                )
+            else:
+                _log.info(
+                    "always-decidable %s drain hit per-cycle budget (ZEUS_REACTOR_DRAIN_BUDGET_"
+                    "SECONDS); deferred %d famil%s to a later cycle (held-first preserved; "
+                    "fair-rotation guarantees bounded coverage; NOT a money-path cap)",
+                    label, len(unreached), "y" if len(unreached) == 1 else "ies",
+                )
         else:
             families.clear()
 

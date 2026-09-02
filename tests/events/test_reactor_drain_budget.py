@@ -7,8 +7,9 @@
 #   the reactor's 60s schedule and coalescing it into multi-minute gaps -> ~1 family decided/cycle.
 #   These tests pin the BACKGROUND-I/O wall-clock budget (ZEUS_REACTOR_DRAIN_BUDGET_SECONDS) that
 #   bounds the drain: it stops after the current family (never mid-network), retains the unreached
-#   families for a later cycle, ALWAYS drains held-position families first (money at risk, never
-#   budget-starved), and preserves fail-soft. This is NOT a money-path cap — decisions, the 30s
+#   families for a later cycle, drains held-position families first under ordinary budget pressure,
+#   yields even that background I/O to an active held-monitor handoff, and preserves fail-soft.
+#   This is NOT a money-path cap — decisions, the 30s
 #   decision budget, the fair rotation, and every money-path gate are untouched.
 """Drain-budget tests for the #83 continuous-fills limiter.
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
 
 from src.events.event_store import EventStore
 from src.events.reactor import (
@@ -221,6 +223,55 @@ def test_held_position_family_never_budget_starved(monkeypatch):
     deferred = {c for c, _d, _m in reactor._pending_snapshot_refreshes}
     assert deferred.isdisjoint(held_cities)
     assert res.drained_truncated == len(reactor._pending_snapshot_refreshes)
+
+
+def test_held_monitor_preempts_end_of_cycle_refresh_even_for_held_family(monkeypatch):
+    """A claimed monitor turn outranks background refresh fan-out."""
+
+    conn, store = _store()
+    calls: list[str] = []
+    held = frozenset({("HELD", "2026-09-03", "high")})
+    reactor = _reactor(
+        store,
+        refresher=lambda *, city, **_kwargs: calls.append(city) or True,
+        held_family_provider=lambda: held,
+    )
+    reactor._pending_snapshot_refreshes = [
+        ("HELD", "2026-09-03", "high"),
+        ("NEW", "2026-09-03", "high"),
+    ]
+    reactor._pending_cycle_advances = []
+
+    result = ReactorResult()
+    reactor._drain_substrate_refreshes(
+        result=result,
+        cancelled=lambda: True,
+    )
+
+    assert calls == []
+    assert reactor._pending_snapshot_refreshes == [
+        ("HELD", "2026-09-03", "high"),
+        ("NEW", "2026-09-03", "high"),
+    ]
+    assert result.drained_truncated == 2
+
+
+def test_process_pending_carries_monitor_cancellation_into_final_drain(monkeypatch):
+    conn, store = _store()
+    reactor = _reactor(store)
+    observed: list[bool] = []
+    monkeypatch.setattr(
+        reactor,
+        "_drain_substrate_refreshes",
+        lambda *, result, cancelled=None: observed.append(bool(cancelled and cancelled())),
+    )
+
+    reactor.process_pending(
+        decision_time=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        cancelled=lambda: True,
+    )
+
+    assert observed == [True]
 
 
 def test_day0_hourly_drain_precedes_snapshot_under_shared_budget(monkeypatch):
