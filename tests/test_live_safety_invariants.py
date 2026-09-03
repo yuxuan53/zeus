@@ -23368,7 +23368,7 @@ def test_incomplete_full_book_persists_typed_outcome_before_artifact(monkeypatch
         failure_outcome_sink=outcomes.append,
     ) is False
     assert persisted_summary["held_monitor_failure_outcome"] == "COVERAGE_INCOMPLETE"
-    assert pulse_payloads[-1]["held_monitor_failure_outcome"] == "COVERAGE_INCOMPLETE"
+    assert pulse_payloads == []
     assert outcomes == ["COVERAGE_INCOMPLETE"]
     assert not active.is_set()
     conn.close()

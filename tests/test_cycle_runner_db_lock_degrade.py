@@ -146,7 +146,7 @@ def test_live_health_composite_runs_as_separate_scheduler_job():
     main_source = inspect.getsource(main.main)
     health_job_source = inspect.getsource(main._live_health_composite_cycle)
     assert "write_cycle_pulse" in health_job_source
-    assert "compute_composite_live_health" in health_job_source
+    assert "refresh_composite_live_health_bounded" in health_job_source
     assert "_live_health_composite_cycle" in main_source
     assert 'id="live_health_composite"' in main_source
     assert 'executor="observability"' in main_source
@@ -214,14 +214,14 @@ def test_live_health_composite_breaks_entry_defer_before_status_stales(monkeypat
     )
     monkeypatch.setattr(
         live_health,
-        "compute_composite_live_health",
-        lambda: calls.append(("health", None)),
+        "refresh_composite_live_health_bounded",
+        lambda **_kwargs: calls.append(("health", None)),
     )
 
     assert main._live_health_composite_cycle.__wrapped__() is None
     assert calls == [
-        ("pulse", {"mode": "heartbeat_pulse", "heartbeat": True}),
         ("health", None),
+        ("pulse", {"mode": "heartbeat_pulse", "heartbeat": True}),
     ]
 
 
@@ -253,38 +253,52 @@ def test_live_health_composite_yields_to_held_monitor_with_fresh_status(monkeypa
     assert calls == ["live_health_composite"]
 
 
-def test_live_health_composite_breaks_held_monitor_defer_after_status_expires(
+def test_live_health_composite_keeps_held_monitor_priority_after_status_expires(
     monkeypatch,
 ):
-    """Held-monitor priority cannot indefinitely suppress its health witness."""
+    """Expired derived status cannot preempt current held-capital redecision."""
 
     import src.control.live_health as live_health
     import src.main as main
-    import src.observability.status_summary as status_summary
-
     calls = []
     monkeypatch.setattr(main, "_status_summary_refresh_can_defer", lambda: False)
     monkeypatch.setattr(
         main,
         "_defer_for_held_position_monitor",
-        lambda _name: pytest.fail("expired status must bypass held-monitor defer"),
+        lambda name: calls.append(name) or True,
     )
     monkeypatch.setattr(
         live_health,
         "compute_composite_live_health",
-        lambda: calls.append(("health", None)),
-    )
-    monkeypatch.setattr(
-        status_summary,
-        "write_cycle_pulse",
-        lambda payload: calls.append(("pulse", payload)),
+        lambda: pytest.fail("derived health must wait for held monitor coverage"),
     )
 
     assert main._live_health_composite_cycle.__wrapped__() is None
-    assert calls == [
-        ("pulse", {"mode": "heartbeat_pulse", "heartbeat": True}),
-        ("health", None),
-    ]
+    assert calls == ["live_health_composite"]
+
+
+def test_live_health_composite_skips_all_db_work_during_canonical_monitor_debt(
+    monkeypatch,
+):
+    """Canonical exposure debt wins before health performs even defer probes."""
+    import src.control.live_health as live_health
+    import src.main as main
+
+    main._held_position_monitor_canonical_debt.set()
+    monkeypatch.setattr(
+        main,
+        "_status_summary_refresh_can_defer",
+        lambda: pytest.fail("health freshness read must not run during monitor debt"),
+    )
+    monkeypatch.setattr(
+        live_health,
+        "compute_composite_live_health",
+        lambda: pytest.fail("health DB scan must not run during monitor debt"),
+    )
+    try:
+        assert main._live_health_composite_cycle.__wrapped__() is None
+    finally:
+        main._held_position_monitor_canonical_debt.clear()
 
 
 def test_status_summary_refresh_defer_has_half_budget_backstop(monkeypatch, tmp_path):
@@ -321,8 +335,8 @@ def test_status_summary_refresh_defer_has_half_budget_backstop(monkeypatch, tmp_
     assert not main._status_summary_refresh_can_defer()
 
 
-def test_live_health_composite_refreshes_status_before_evaluation(monkeypatch):
-    """The isolated observability lane evaluates the status cut it just wrote."""
+def test_live_health_composite_refreshes_health_then_writes_status_pulse(monkeypatch):
+    """The isolated observability lane completes both derived refreshes."""
 
     import src.control.live_health as live_health
     import src.main as main
@@ -339,14 +353,14 @@ def test_live_health_composite_refreshes_status_before_evaluation(monkeypatch):
     )
     monkeypatch.setattr(
         live_health,
-        "compute_composite_live_health",
-        lambda: calls.append(("health", None)),
+        "refresh_composite_live_health_bounded",
+        lambda **_kwargs: calls.append(("health", None)),
     )
 
     assert main._live_health_composite_cycle.__wrapped__() is None
     assert calls == [
-        ("pulse", {"mode": "heartbeat_pulse", "heartbeat": True}),
         ("health", None),
+        ("pulse", {"mode": "heartbeat_pulse", "heartbeat": True}),
     ]
 
 

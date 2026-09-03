@@ -141,16 +141,19 @@ def collect_monitor_cadence_evidence(
             "phase": position["phase"],
             "chain_state": position["chain_state"],
         }
-        exit_event = _latest_exit_redecision_event(
-            conn,
-            str(position["position_id"]),
-            event_columns,
-        )
-        review_event = _latest_review_required_event(
-            conn,
-            str(position["position_id"]),
-            event_columns,
-        )
+        exit_event = None
+        review_event = None
+        if not monitor_refreshed_only:
+            exit_event = _latest_exit_redecision_event(
+                conn,
+                str(position["position_id"]),
+                event_columns,
+            )
+            review_event = _latest_review_required_event(
+                conn,
+                str(position["position_id"]),
+                event_columns,
+            )
         if not occurred_at:
             if monitor_refreshed_only:
                 stale_or_missing.append(

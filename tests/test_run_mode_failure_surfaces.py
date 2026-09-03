@@ -11351,6 +11351,35 @@ def test_durable_monitor_recovery_dispatches_without_running_monitor_inline(
         main_module._held_position_monitor_canonical_debt.clear()
 
 
+def test_durable_monitor_recovery_detector_does_not_rescan_while_worker_owns_debt(
+    monkeypatch,
+) -> None:
+    import src.main as main_module
+
+    class Worker:
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    monkeypatch.setattr(main_module, "_held_position_monitor_recovery_worker", Worker())
+    monkeypatch.setattr(
+        main_module,
+        "_held_position_monitor_recovery_evidence",
+        lambda: pytest.fail("the active durable worker owns cadence reads"),
+    )
+    main_module._held_position_monitor_canonical_debt.set()
+    main_module._held_position_monitor_recovery_requested.clear()
+    try:
+        assert (
+            main_module._durable_held_position_monitor_recovery_cycle.__wrapped__()
+            is True
+        )
+        assert main_module._held_position_monitor_recovery_requested.is_set()
+    finally:
+        main_module._held_position_monitor_recovery_requested.clear()
+        main_module._held_position_monitor_canonical_debt.clear()
+
+
 def test_durable_monitor_recovery_worker_redrives_until_canonical_refresh(
     monkeypatch,
 ) -> None:
@@ -11405,6 +11434,37 @@ def test_durable_monitor_recovery_worker_redrives_until_canonical_refresh(
     finally:
         main_module._held_position_monitor_recovery_requested.clear()
         main_module._periodic_held_position_monitor_fairness_debt.clear()
+        main_module._held_position_monitor_canonical_debt.clear()
+
+
+def test_durable_monitor_recovery_worker_waits_for_existing_monitor_owner(
+    monkeypatch,
+) -> None:
+    import src.main as main_module
+
+    fresh = {"stale_or_missing_position_count": 0, "future_monitor_event_count": 0}
+    sleeps = []
+    main_module._held_position_monitor_active.set()
+    main_module._held_position_monitor_recovery_requested.clear()
+    main_module._held_position_monitor_canonical_debt.set()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        main_module._held_position_monitor_active.clear()
+
+    monkeypatch.setattr(main_module.time, "sleep", sleep)
+    monkeypatch.setattr(
+        main_module,
+        "_held_position_monitor_recovery_evidence",
+        lambda: fresh,
+    )
+    try:
+        main_module._held_position_monitor_recovery_worker_main()
+        assert sleeps == [main_module.HELD_POSITION_MONITOR_RECOVERY_RETRY_SECONDS]
+        assert not main_module._held_position_monitor_canonical_debt.is_set()
+    finally:
+        main_module._held_position_monitor_active.clear()
+        main_module._held_position_monitor_recovery_requested.clear()
         main_module._held_position_monitor_canonical_debt.clear()
 
 

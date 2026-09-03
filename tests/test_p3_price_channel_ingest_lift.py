@@ -1402,7 +1402,14 @@ def test_boot_fill_bridge_recovery_does_not_block_scheduler_startup(monkeypatch)
     entered = threading.Event()
     release = threading.Event()
     complete = threading.Event()
+    monitor_bootstrap_complete = threading.Event()
+    monitor_bootstrap_complete.set()
     monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_complete", complete)
+    monkeypatch.setattr(
+        main_mod,
+        "_held_position_monitor_bootstrap_complete",
+        monitor_bootstrap_complete,
+    )
     monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_thread", None)
 
     def _slow_success():
@@ -1434,8 +1441,15 @@ def test_boot_fill_bridge_recovery_retries_before_buy_release(monkeypatch):
     import src.main as main_mod
 
     complete = threading.Event()
+    monitor_bootstrap_complete = threading.Event()
+    monitor_bootstrap_complete.set()
     attempts = []
     monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_complete", complete)
+    monkeypatch.setattr(
+        main_mod,
+        "_held_position_monitor_bootstrap_complete",
+        monitor_bootstrap_complete,
+    )
     monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_thread", None)
     monkeypatch.setattr(main_mod, "_EDLI_BOOT_FILL_BRIDGE_RETRY_SECONDS", 0.001)
 
@@ -1451,6 +1465,40 @@ def test_boot_fill_bridge_recovery_retries_before_buy_release(monkeypatch):
 
     assert attempts == [1, 2]
     assert complete.is_set() is True
+
+
+def test_boot_fill_bridge_waits_for_held_monitor_coverage(monkeypatch):
+    """Historical BUY repair cannot contend with initial held-capital refresh."""
+    import src.main as main_mod
+
+    complete = threading.Event()
+    monitor_bootstrap_complete = threading.Event()
+    attempted = threading.Event()
+    monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_complete", complete)
+    monkeypatch.setattr(main_mod, "_edli_boot_fill_bridge_recovery_thread", None)
+    monkeypatch.setattr(
+        main_mod,
+        "_held_position_monitor_bootstrap_complete",
+        monitor_bootstrap_complete,
+    )
+    monkeypatch.setattr(main_mod, "_EDLI_BOOT_FILL_BRIDGE_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(main_mod, "HELD_POSITION_MONITOR_BOOTSTRAP_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_mod,
+        "_edli_boot_fill_bridge_recovery",
+        lambda: attempted.set() or True,
+    )
+
+    thread = main_mod._start_edli_boot_fill_bridge_recovery()
+    assert thread is not None
+    assert attempted.wait(timeout=0.05) is False
+    assert complete.is_set() is False
+
+    monitor_bootstrap_complete.set()
+    thread.join(timeout=1.0)
+    assert thread.is_alive() is False
+    assert attempted.is_set()
+    assert complete.is_set()
 
 
 def test_no_regression_order_runtime_reads_current_feasibility_projection():

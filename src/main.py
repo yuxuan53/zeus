@@ -2285,10 +2285,22 @@ def _stop_boot_process_heartbeat(
 def _live_health_composite_cycle() -> None:
     """Refresh composite live-health without blocking the heartbeat pulse."""
 
-    refresh_can_defer = _status_summary_refresh_can_defer()
-    if refresh_can_defer and _defer_for_held_position_monitor(
-        "live_health_composite"
+    # Derived observability never outranks current held-capital redecision.
+    # SCOPE: only this DB-derived health/status refresh; process heartbeat and
+    # canonical monitor/exit work continue. DRAIN: the sole monitor owner
+    # refreshes every current positive exposure. RESET: canonical cadence debt
+    # and the process-local claim clear after that coverage commits.
+    if (
+        _held_position_monitor_canonical_debt.is_set()
+        or _held_position_monitor_active.is_set()
+        or _held_position_monitor_claim.locked()
     ):
+        logger.info(
+            "live_health_composite deferred: held-position monitor owns DB priority"
+        )
+        return
+    refresh_can_defer = _status_summary_refresh_can_defer()
+    if _defer_for_held_position_monitor("live_health_composite"):
         return
     if (
         refresh_can_defer
@@ -9862,7 +9874,7 @@ def _edli_boot_fill_bridge_recovery() -> bool:
 
 
 def _start_edli_boot_fill_bridge_recovery() -> threading.Thread | None:
-    """Drain historical fill-bridge debt without delaying monitor startup."""
+    """Drain historical fill debt only after held-capital bootstrap coverage."""
 
     global _edli_boot_fill_bridge_recovery_thread
     if _edli_boot_fill_bridge_recovery_complete.is_set():
@@ -9875,6 +9887,17 @@ def _start_edli_boot_fill_bridge_recovery() -> threading.Thread | None:
 
     def _run() -> None:
         while not _edli_boot_fill_bridge_recovery_complete.is_set():
+            if not _held_position_monitor_bootstrap_complete.is_set():
+                # BUY admission remains fail-closed while its recovery waits.
+                # Reading historical fill debt before current held exposure is
+                # refreshed creates a restart-time I/O priority inversion.
+                _held_position_monitor_bootstrap_complete.wait(
+                    min(
+                        _EDLI_BOOT_FILL_BRIDGE_RETRY_SECONDS,
+                        HELD_POSITION_MONITOR_BOOTSTRAP_CHECK_SECONDS,
+                    )
+                )
+                continue
             if _edli_boot_fill_bridge_recovery():
                 _edli_boot_fill_bridge_recovery_complete.set()
                 logger.info(
@@ -10338,6 +10361,15 @@ def _held_position_monitor_recovery_worker_main() -> None:
     current_worker = threading.current_thread()
     try:
         while True:
+            if (
+                _held_position_monitor_active.is_set()
+                or _held_position_monitor_claim.locked()
+            ):
+                # Another monitor generation already owns the only useful
+                # capital-protection lane. Do not add competing cadence reads;
+                # its canonical result will be observed after claim release.
+                time.sleep(HELD_POSITION_MONITOR_RECOVERY_RETRY_SECONDS)
+                continue
             try:
                 evidence = _held_position_monitor_recovery_evidence()
                 overdue_count, future_count, groups = (
@@ -10431,6 +10463,15 @@ def _ensure_held_position_monitor_recovery_worker() -> threading.Thread:
 @_scheduler_job("exit_monitor_recovery")
 def _durable_held_position_monitor_recovery_cycle() -> bool:
     """Detect canonical monitor debt and dispatch its non-overlapping worker."""
+
+    with _held_position_monitor_recovery_worker_lock:
+        worker = _held_position_monitor_recovery_worker
+        if worker is not None and worker.is_alive():
+            # The durable worker already owns detection and drain. Repeated
+            # scheduler reads cannot improve its decision, but do compete for
+            # the same large SQLite pages needed by monitor execution.
+            _held_position_monitor_recovery_requested.set()
+            return True
 
     try:
         overdue = _held_position_monitor_recovery_evidence()

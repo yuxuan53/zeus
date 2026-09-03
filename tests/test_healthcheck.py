@@ -1914,6 +1914,39 @@ def test_monitor_cadence_monitor_refreshed_only_rejects_post_boot_alternative_ev
     assert evidence["stale_or_missing_position_count"] == 1
 
 
+def test_monitor_cadence_monitor_only_path_skips_unused_alternative_event_reads(
+    monkeypatch,
+    tmp_path,
+):
+    import src.ops.monitor_cadence as cadence
+
+    db_path = tmp_path / "zeus_trades.db"
+    now = datetime.now(timezone.utc)
+    _init_monitor_cadence_db(db_path, monitor_at=now)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    monkeypatch.setattr(
+        cadence,
+        "_latest_exit_redecision_event",
+        lambda *_args: pytest.fail("monitor-only evidence must not read exit fallback"),
+    )
+    monkeypatch.setattr(
+        cadence,
+        "_latest_review_required_event",
+        lambda *_args: pytest.fail("monitor-only evidence must not read review fallback"),
+    )
+    try:
+        evidence = cadence.collect_monitor_cadence_evidence(
+            conn,
+            now=now,
+            monitor_refreshed_only=True,
+        )
+    finally:
+        conn.close()
+
+    assert evidence["fresh_position_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("monitor_refreshed_only", "expected_fresh"),
     ((False, 1), (True, 0)),

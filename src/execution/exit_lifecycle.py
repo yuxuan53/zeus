@@ -14433,7 +14433,12 @@ def run_exit_monitor_cycle(
         summary["held_monitor_failure_outcome"] = outcome
 
     if target_families is None:
-        _schedule_exit_monitor_status_pulse(summary)
+        # A failed monitor retains canonical cadence debt. Starting a derived
+        # DB status scan here would race the immediate recovery attempt that can
+        # actually protect capital. The next successful full-book pass emits
+        # the pulse; the independent health cadence remains the empty-book path.
+        if succeeded:
+            _schedule_exit_monitor_status_pulse(summary)
 
         _write_scheduler_health(
             "exit_monitor",
