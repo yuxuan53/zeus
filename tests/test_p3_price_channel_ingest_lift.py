@@ -4487,6 +4487,65 @@ def test_position_fill_redecision_reads_before_world_write_without_poisoning_cha
     assert "processed_with_fill_redecision_error" in repair_src
 
 
+def test_position_fill_redecision_without_carrier_avoids_world_writer(monkeypatch):
+    from src.events import price_channel_redecision_router as router
+    from src.ingest import price_channel_ingest as lane
+    from src.state import db as state_db
+
+    class _ReadConnection:
+        def __init__(self):
+            self.progress_handler = None
+
+        def set_progress_handler(self, handler, _steps):
+            self.progress_handler = handler
+
+        def close(self):
+            return None
+
+    reads = [_ReadConnection(), _ReadConnection(), _ReadConnection()]
+    monkeypatch.setattr(state_db, "get_world_connection_read_only", lambda: reads[0])
+    monkeypatch.setattr(state_db, "get_trade_connection_read_only", lambda: reads[1])
+    monkeypatch.setattr(state_db, "get_forecasts_connection_read_only", lambda: reads[2])
+    monkeypatch.setattr(lane, "_fill_bridge_write_deadline", lambda: float("inf"))
+    monkeypatch.setattr(
+        router,
+        "_edli_open_position_fill_rows",
+        lambda _conn: [
+            {
+                "trade_fact_id": 41,
+                "ingested_at": "2026-06-20T12:00:00+00:00",
+                "position_id": "position-41",
+                "city": "Denver",
+                "target_date": "2026-06-20",
+                "metric": "high",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        router,
+        "_edli_position_fill_redecision_events",
+        lambda *_args, **_kwargs: ([], {41}, set()),
+    )
+
+    @contextlib.contextmanager
+    def _forbidden_writer(*, owner):
+        raise AssertionError(f"unexpected WORLD writer: {owner}")
+        yield
+
+    monkeypatch.setattr(
+        lane,
+        "_edli_price_channel_world_write_connection",
+        _forbidden_writer,
+    )
+    router._EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS.clear()
+    try:
+        assert router._edli_position_fill_redecision_cycle() == 0
+        assert router._EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS == {41}
+        assert all(conn.progress_handler is not None for conn in reads)
+    finally:
+        router._EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS.clear()
+
+
 def _seed_committed_denver_2026_06_20(forecasts_conn) -> None:
     """COMPLETE/LIVE_ELIGIBLE Denver low coverage for target 2026-06-20 (same
     shape as tests/events/test_forecast_snapshot_ready.py's Chicago seed)."""

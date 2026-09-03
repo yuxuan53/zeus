@@ -772,6 +772,7 @@ def _edli_position_fill_redecision_cycle() -> int:
     """Persist and wake fill-driven redecision after the fill transaction commits."""
 
     from src.ingest.price_channel_ingest import (
+        _fill_bridge_write_deadline,
         _edli_price_channel_world_write_connection,
     )
     from src.state.db import (
@@ -782,6 +783,7 @@ def _edli_position_fill_redecision_cycle() -> int:
 
     with _EDLI_POSITION_FILL_REDECISION_LOCK:
         seen_fact_ids = set(_EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS)
+    read_deadline = _fill_bridge_write_deadline()
     with contextlib.ExitStack() as reads:
         world_read = reads.enter_context(
             contextlib.closing(get_world_connection_read_only())
@@ -792,6 +794,11 @@ def _edli_position_fill_redecision_cycle() -> int:
         forecasts_read = reads.enter_context(
             contextlib.closing(get_forecasts_connection_read_only())
         )
+        for conn in (world_read, trade_read, forecasts_read):
+            conn.set_progress_handler(
+                lambda: int(time.monotonic() >= read_deadline),
+                1_000,
+            )
         rows = _edli_open_position_fill_rows(trade_read)
         current_fact_ids = {int(row["trade_fact_id"]) for row in rows}
         (
@@ -805,6 +812,16 @@ def _edli_position_fill_redecision_cycle() -> int:
             fill_rows=rows,
             seen_trade_fact_ids=seen_fact_ids,
         )
+
+    if not events:
+        with _EDLI_POSITION_FILL_REDECISION_LOCK:
+            _EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS.intersection_update(
+                current_fact_ids
+            )
+            _EDLI_POSITION_FILL_REDECISION_SEEN_FACT_IDS.update(
+                evaluated_fact_ids
+            )
+        return 0
 
     with _edli_price_channel_world_write_connection(
         owner="position_fill_redecision_emit"
