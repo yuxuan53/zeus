@@ -2682,9 +2682,11 @@ def _reconcile_recorded_exit_fill_projections(
     as the local recorded-trade repair hook.  This keeps confirmed exit
     self-healing local: the daemon needs only the command, trade fact, and
     position projection already in SQLite, not a fresh full venue resweep.
-    Matched/mined trade facts are admitted only for already economically closed
-    sell projections so restart repair can clear stale local exposure without
-    bypassing finality waits for active/pending exits.
+    Matched/mined trade facts are admitted for already economically closed sell
+    projections, or for an exact FILLED full-close command after Chain has
+    independently confirmed zero exposure.  The latter lets current capital
+    truth drain before broad maintenance without treating a non-final trade
+    feed row alone as close authority.
     """
 
     summary = {"scanned": 0, "projected": 0, "stayed": 0, "errors": 0}
@@ -2735,8 +2737,19 @@ def _reconcile_recorded_exit_fill_projections(
                UPPER(COALESCE(tf.state, '')) = 'CONFIRMED'
                OR (
                     UPPER(COALESCE(tf.state, '')) IN ('MATCHED', 'MINED')
-                    AND pc.phase = 'economically_closed'
-                    AND pc.order_status = 'sell_filled'
+                    AND (
+                         (
+                             pc.phase = 'economically_closed'
+                             AND pc.order_status = 'sell_filled'
+                         )
+                         OR (
+                             UPPER(COALESCE(cmd.state, '')) = 'FILLED'
+                             AND pc.phase = 'pending_exit'
+                             AND LOWER(COALESCE(pc.chain_state, '')) =
+                                 'chain_confirmed_zero'
+                             AND CAST(COALESCE(pc.chain_shares, '0') AS REAL) = 0
+                         )
+                    )
                   )
            )
            AND UPPER(COALESCE(cmd.intent_kind, '')) = 'EXIT'

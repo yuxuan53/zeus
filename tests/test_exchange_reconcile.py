@@ -1,6 +1,6 @@
 # Created: 2026-04-27
-# Last reused/audited: 2026-08-28
-# Lifecycle: created=2026-04-27; last_reviewed=2026-08-28; last_reused=2026-08-28
+# Last reused/audited: 2026-09-03
+# Lifecycle: created=2026-04-27; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Authority basis: first-principles command-scoped entry/exit fill aggregation
 # Purpose: R3 M5 exchange reconciliation sweep antibodies.
 # Reuse: Run when exchange_reconcile, venue facts, findings, heartbeat/cutover reconciliation, or operator finding resolution changes.
@@ -6798,6 +6798,77 @@ def test_recorded_nonfinal_full_exit_trade_terminalizes_command_without_economic
         ).fetchone()[0]
         == 0
     )
+
+
+def test_recorded_matched_full_exit_closes_after_independent_chain_zero(conn):
+    """A FILLED full-close plus Chain-zero drains before broad recovery work."""
+    from src.execution.exchange_reconcile import reconcile_recorded_exit_fill_projections
+
+    position_id = "pos-recorded-matched-chain-zero"
+    command_id = "cmd-recorded-matched-chain-zero"
+    order_id = "ord-recorded-matched-chain-zero"
+    token = "recorded-matched-chain-zero-token"
+    seed_position_baseline(conn, position_id=position_id, order_id="ord-entry")
+    conn.execute(
+        """
+        UPDATE position_current
+           SET phase = 'pending_exit', token_id = ?, order_id = ?,
+               order_status = 'sell_pending_confirmation', shares = 5,
+               cost_basis_usd = 0.6, entry_price = 0.12,
+               chain_state = 'chain_confirmed_zero', chain_shares = 0,
+               chain_avg_price = 0, chain_cost_basis_usd = 0, updated_at = ?
+         WHERE position_id = ?
+        """,
+        (token, order_id, NOW.isoformat(), position_id),
+    )
+    seed_command(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        position_id=position_id,
+        token_id=token,
+        side="SELL",
+        size=5,
+        price=0.23,
+        state="FILLED",
+        order_type="FAK",
+        exit_close_position=True,
+    )
+    append_trade_fact(
+        conn,
+        command_id=command_id,
+        venue_order_id=order_id,
+        token_id=token,
+        trade_id="trade-recorded-matched-chain-zero",
+        size="5",
+        fill_price="0.23",
+        state="MATCHED",
+    )
+
+    summary = reconcile_recorded_exit_fill_projections(
+        conn,
+        observed_at=NOW,
+        command_ids=(command_id,),
+    )
+
+    assert summary == {"scanned": 1, "projected": 1, "stayed": 0, "errors": 0}
+    assert dict(
+        conn.execute(
+            """
+            SELECT phase, order_status, chain_shares, exit_price,
+                   realized_pnl_usd
+              FROM position_current
+             WHERE position_id = ?
+            """,
+            (position_id,),
+        ).fetchone()
+    ) == {
+        "phase": "economically_closed",
+        "order_status": "sell_filled",
+        "chain_shares": 0.0,
+        "exit_price": 0.23,
+        "realized_pnl_usd": 0.55,
+    }
 
 
 def test_recorded_nonfinal_exit_tx_alias_cannot_fake_full_command_coverage(conn):
