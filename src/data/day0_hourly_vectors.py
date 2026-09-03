@@ -532,9 +532,19 @@ def build_day0_remaining_probability_carrier(
                 for b, w in scenarios
             )):
         raise ValueError("DAY0_REMAINING_CARRIER_INPUT_INVALID")
-    content = {"v": 1, "metric": metric, "future": sorted(values.tolist()), "scenarios": scenarios,
+    # Decision/cutoff clocks prove causality and freshness, but they do not
+    # change the probability distribution when the selected future path and
+    # physical observation inputs are unchanged. Including them in the content
+    # hash also changed the Monte Carlo seed on every monitor refresh, minting
+    # false q revisions that could prevent held-SELL coverage from stabilizing.
+    economic_identity_inputs = {
+        key: value
+        for key, value in identity_inputs.items()
+        if key not in {"decision_time_utc", "probability_cutoff_utc"}
+    }
+    content = {"v": 2, "metric": metric, "future": sorted(values.tolist()), "scenarios": scenarios,
                "path_sigma": path_error_sigma_c, "instrument_sigma": instrument_sigma_c,
-               "bins": bounds, "n_point": n_point, "n_samples": n_samples, "inputs": dict(identity_inputs)}
+               "bins": bounds, "n_point": n_point, "n_samples": n_samples, "inputs": economic_identity_inputs}
     identity = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
     sigma = math.hypot(path_error_sigma_c, instrument_sigma_c)
     def draw(rows: int, seed: int) -> np.ndarray:

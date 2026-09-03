@@ -149,6 +149,53 @@ def test_shared_remaining_carrier_has_coherent_500_rows_and_identity(metric):
     )["content_identity"]
 
 
+def test_remaining_carrier_decision_clock_is_provenance_not_probability_content():
+    common = {
+        "future_extremes_c": [31.0, 31.5, 32.0],
+        "boundary_scenarios": ((33.0, 0.95), (None, 0.05)),
+        "metric": "high",
+        "path_error_sigma_c": 0.35,
+        "instrument_sigma_c": 0.25,
+        "bin_bounds_c": [(None, 30), (31, 31), (32, 32), (33, None)],
+        "n_point": 1000,
+        "n_samples": 500,
+    }
+    identity = {
+        "city": "Istanbul",
+        "unit": "C",
+        "decision_time_utc": "2026-09-02T08:44:47+00:00",
+        "probability_cutoff_utc": "2026-09-02T08:44:47+00:00",
+        "station_id": "LTFM",
+        "awc_source_channel": "aviationweather_metar",
+        "ogimet_source_channel": "ogimet_metar_ltfm",
+        "preliminary_survival_identity": "likelihood-1",
+    }
+    first = build_day0_remaining_probability_carrier(
+        **common,
+        identity_inputs=identity,
+    )
+    later = build_day0_remaining_probability_carrier(
+        **common,
+        identity_inputs={
+            **identity,
+            "decision_time_utc": "2026-09-02T08:45:13+00:00",
+            "probability_cutoff_utc": "2026-09-02T08:45:13+00:00",
+        },
+    )
+    changed_source = build_day0_remaining_probability_carrier(
+        **common,
+        identity_inputs={
+            **identity,
+            "preliminary_survival_identity": "likelihood-2",
+        },
+    )
+
+    assert later["content_identity"] == first["content_identity"]
+    assert later["q"] == first["q"]
+    assert later["samples"] == first["samples"]
+    assert changed_source["content_identity"] != first["content_identity"]
+
+
 @pytest.mark.parametrize(
     ("identity", "bounds", "error"),
     (
