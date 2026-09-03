@@ -401,9 +401,11 @@ def test_causal_catastrophe_confirmation_refuses_quote_gap():
     assert count == 1
 
 
-def test_flash_catastrophe_requires_global_capital_reauction():
+def test_flash_catastrophe_preserves_immediate_reduce_only_authority():
     decision = SimpleNamespace(trigger="FLASH_CRASH_PANIC")
-    assert _global_auction_owns_statistical_sell(decision, decision.trigger) is True
+    assert _global_auction_owns_statistical_sell(decision, decision.trigger) is False
+    ordinary = SimpleNamespace(trigger="SELL_REVERSAL")
+    assert _global_auction_owns_statistical_sell(ordinary, ordinary.trigger) is True
 
 
 # --- 4. Single-site coherence (Wave 3, 2026-06-03) -----------------------------------

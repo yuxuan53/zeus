@@ -3989,6 +3989,12 @@ _DIRECT_REDUCE_ONLY_SELL_TRIGGERS = (
     "RED_FORCE_EXIT",
     "DAY0_HARD_FACT_BIN_DEAD",
     "POSTERIOR_SUPPORT_ZERO_SELL_DOMINATES",
+    # Position.evaluate_exit emits this only after multiple causal quotes prove
+    # a fresh, executable deep book collapse and settlement is not guaranteed.
+    # It is the market-path override to HOLD/EVIDENCE_UNAVAILABLE, so routing it
+    # back through an ordinary statistical full-family preparation can erase
+    # the emergency decision before command persistence.
+    "FLASH_CRASH_PANIC",
 )
 
 _FAMILY_OVERLAY_MIN_DIRECT_SELL_ADVANTAGE_USD = 0.05

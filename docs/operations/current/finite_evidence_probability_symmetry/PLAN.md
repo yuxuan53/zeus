@@ -4,6 +4,25 @@ Date: 2026-07-11
 Branch: `live` (was `p2-pending-exit-restart-redecision`; renamed at main→live cutover)
 Status: active
 
+## 2026-09-03 — persistent executable catastrophe不能被global preparation撤销
+
+- **实时反例：** Istanbul Sep-2 HIGH 26C 的 residual 5.0043 shares 在
+  `10:44:11Z` 已由两次 causal 0.05 bid、约 -45.7% executable-bid velocity 触发
+  `FLASH_CRASH_PANIC`；`Position.evaluate_exit` 已选择 immediate SELL，但
+  `cycle_runtime` 把该 typed market-path override 重新分类为 ordinary statistical
+  SELL，改写为 `GLOBAL_FULL_FAMILY_PREPARATION_PENDING`。到 `10:55Z` held q
+  已降至约 0.0314、bid 仍有 0.07，仍未生成第二个 EXIT command，之后 book 关闭。
+- **结构性修复：** `FLASH_CRASH_PANIC` 加入 direct reduce-only typed triggers。
+  该 trigger 只有在 fresh executable book、persistent deep collapse、多 causal
+  quotes、非 `GUARANTEED` settlement 同时成立时才由 `Position.evaluate_exit`
+  产生；single tick、shallow move、ordinary `SELL_REVERSAL`、profitable HOLD 与
+  global BUY/SELL/HOLD/CASH comparison 均不改变。
+- **SCOPE / DRAIN / RESET：** scope 是一个已经产生 typed panic 的 existing
+  position；drain 是同一 monitor turn 的现有 `execute_exit`/retry/reauction lane；
+  reset 是 command/fill terminal fact或下一 fresh monitor 不再满足 persistent
+  catastrophe。抗体要求 panic 直接进入 actuator，普通 statistical trigger 仍由
+  global auction 拥有。
+
 ## 2026-09-03 — physical Day0 fact直接重建held q，不等待posterior successor
 
 - **实时反例：** Chicago Sep-3 HIGH 92–93F 的同站 AWC fact 已于
