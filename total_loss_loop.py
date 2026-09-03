@@ -2726,7 +2726,7 @@ def _retry_committed_receipt(cfg: Mapping[str, Any], deadline: float) -> None:
 
 
 def detect(
-    cfg: Mapping[str, Any], *, capture_evidence: bool = True
+    cfg: Mapping[str, Any], *, capture_evidence: bool = True, run_maintenance: bool = True
 ) -> list[str]:
     global _LAST_EVIDENCE_CYCLE
     _LAST_EVIDENCE_CYCLE = {"built": [], "deferred": [], "attempted": 0, "validated": 0, "bytes": 0}
@@ -2740,6 +2740,14 @@ def detect(
     receipt_deadline = time.monotonic() + max(0.01, float(cfg["loop"].get("receipt_budget_ms", 50.0))) / 1000.0
     _retry_committed_receipt(cfg, receipt_deadline)
     _phase_heartbeat(cfg, "evidence_start", created=trigger_created)
+    if not run_maintenance:
+        _phase_heartbeat(
+            cfg,
+            "maintenance_suppressed",
+            created=trigger_created,
+            reason="live_capital_lane_unhealthy_or_not_due",
+        )
+        return list(dict.fromkeys(trigger_created))
     _phase_heartbeat(cfg, "maintenance_start", created=trigger_created)
     maintenance_deadline = time.monotonic() + max(
         0.001,
@@ -8678,7 +8686,9 @@ def daemon(cfg: Mapping[str, Any]) -> int:
     capabilities_ready = False
     next_debt_check_at = 0.0
     next_evidence_check_at = 0.0
+    next_maintenance_check_at = 0.0
     evidence_suppressed_reason: str | None = None
+    maintenance_suppressed_reason: str | None = None
     while not stopping and not (run / "HALT").exists():
         cycle_started = time.monotonic()
         detector_elapsed = 0.0
@@ -8756,9 +8766,23 @@ def daemon(cfg: Mapping[str, Any]) -> int:
         try:
             detector_started = time.monotonic()
             # Crossing persistence owns the sub-second detector clock. Evidence
-            # reconstruction runs in its own worker and cannot delay the next
-            # market observation.
-            created = detect(cfg, capture_evidence=False)
+            # reconstruction and historical maintenance must yield to the live
+            # capital lane.  The trigger path still runs every cycle.
+            maintenance_due = time.monotonic() >= next_maintenance_check_at
+            maintenance_ready = False
+            if maintenance_due:
+                maintenance_ready, maintenance_suppressed_reason = (
+                    _live_capital_lane_ready_for_evidence(cfg)
+                )
+                next_maintenance_check_at = time.monotonic() + max(
+                    5.0,
+                    float(cfg["loop"].get("maintenance_scan_interval_seconds", 60)),
+                )
+            created = detect(
+                cfg,
+                capture_evidence=False,
+                run_maintenance=maintenance_due and maintenance_ready,
+            )
             detector_elapsed = time.monotonic() - detector_started
         except Exception as exc:  # the detector remains restartable and evidence-backed
             error = f"{type(exc).__name__}: {exc}"
@@ -8789,6 +8813,7 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                 "error": error,
                 "dispatch_error": dispatch_error,
                 "evidence_suppressed_reason": evidence_suppressed_reason,
+                "maintenance_suppressed_reason": maintenance_suppressed_reason,
                 "provider_backoff": _provider_backoff(cfg),
             },
         )

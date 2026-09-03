@@ -18,6 +18,7 @@ max_evidence_rows_per_table = 250000
 evidence_source_rows = 16
 evidence_build_budget_ms = 10000
 evidence_scan_interval_seconds = 60
+maintenance_scan_interval_seconds = 60
 
 [active]
 profile = "frontier_current"

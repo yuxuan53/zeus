@@ -1868,6 +1868,25 @@ def test_evidence_worker_admits_only_fresh_healthy_live_capital_lane(
     assert loop._live_capital_lane_ready_for_evidence(cfg) == (True, None)
 
 
+def test_detector_preserves_trigger_without_running_background_maintenance(
+    cfg: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop, "_bounded_floor_price", lambda *_args: 0.05)
+    monkeypatch.setattr(loop, "_detect_trigger", lambda *_args: ["trigger-id"])
+    monkeypatch.setattr(loop, "_publish_trigger_receipt", lambda *_args: None)
+    monkeypatch.setattr(loop, "_retry_committed_receipt", lambda *_args: None)
+    monkeypatch.setattr(loop, "_phase_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        loop,
+        "_detect_maintenance",
+        lambda *_args, **_kwargs: pytest.fail("background maintenance must yield"),
+    )
+
+    assert loop.detect(cfg, capture_evidence=False, run_maintenance=False) == [
+        "trigger-id"
+    ]
+
+
 def test_evidence_queue_cursor_bounds_provider_backoff_capture(
     cfg: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
