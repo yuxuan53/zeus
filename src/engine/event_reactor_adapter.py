@@ -45716,9 +45716,20 @@ def _day0_remaining_day_members(
                     vector_witness=current_vector_witness,
                 )
         if validated_bundle is not None:
-            payload["_edli_day0_remaining_vector_witness"] = dict(
+            validated_witness = dict(
                 validated_bundle["carrier_vector_witness"]
             )
+            payload["_edli_day0_remaining_vector_witness"] = validated_witness
+            binding = payload.get("_edli_global_day0_binding")
+            if isinstance(binding, Mapping):
+                current_binding = dict(binding)
+                current_binding["day0_remaining_vector_witness"] = dict(
+                    validated_witness
+                )
+                current_binding["day0_causal_evidence_bundle"] = dict(
+                    validated_bundle
+                )
+                payload["_edli_global_day0_binding"] = current_binding
         from src.strategy.live_inference.source_clock_vnext import (
             provider_family_for_source,
         )

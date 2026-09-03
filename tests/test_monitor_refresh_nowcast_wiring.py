@@ -1,7 +1,7 @@
 # Created: 2026-05-20
-# Last reused/audited: 2026-09-01
+# Last reused/audited: 2026-09-03
 # Authority basis: PHASE_2_ULTRAPLAN.md §8.2 + §8.3; finite-evidence probability symmetry packet held/entry single-q law
-# Lifecycle: created=2026-05-20; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Lifecycle: created=2026-05-20; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Purpose: T5 GREEN antibody — _maybe_write_day0_nowcast gate conditions + write_nowcast_run call.
 # Reuse: Run when _maybe_write_day0_nowcast, write_nowcast_run wiring, or day0 gate logic changes.
 """
@@ -1049,6 +1049,78 @@ def test_provisional_day0_monitor_uses_revision_aware_remaining_probability() ->
         "day0_absorbing_hard_fact" not in validation
         for validation in refreshed.applied_validations
     )
+
+
+def test_direct_day0_monitor_accepts_top_level_causal_bundle_with_base_identity() -> None:
+    """A direct held recompute has a base identity even without posterior_id."""
+    import numpy as np
+
+    condition_id = "0x" + "78" * 32
+    witness = SimpleNamespace(
+        bindings=(
+            SimpleNamespace(
+                bin_id="31C",
+                condition_id=condition_id,
+                yes_token_id="yes-31",
+                no_token_id="no-31",
+            ),
+        ),
+        yes_q_samples=np.array([[0.2], [0.3]]),
+        yes_point_q=np.array([0.25]),
+        witness_identity="direct-current-witness",
+        probability_content_identity="direct-current-content",
+        q_version="direct-current-q",
+        source_truth_identity="direct-current-truth",
+        band_basis="current_coherent_settlement_simplex_v1",
+        band_alpha=0.05,
+    )
+    vector_witness = {"vector_id": "direct-vector"}
+    bundle = {
+        "bundle_identity": "direct-bundle",
+        "carrier_vector_identity": "direct-vector-identity",
+        "carrier_vector_hash": "direct-vector-hash",
+        "carrier_vector_witness": vector_witness,
+    }
+    validation = {
+        "reason": None,
+        "actual_bundle_identity": "direct-bundle",
+        "expected_bundle_identity": "direct-bundle",
+        "actual_carrier_vector_identity": "direct-vector-identity",
+        "expected_carrier_vector_identity": "direct-vector-identity",
+        "actual_carrier_vector_hash": "direct-vector-hash",
+        "expected_carrier_vector_hash": "direct-vector-hash",
+    }
+    snapshot = monitor_refresh_module._CurrentGlobalDay0FamilySnapshot(
+        witness=witness,
+        token_pairs=((condition_id, "yes-31", "no-31"),),
+        deterministic_condition_ids=frozenset(),
+        day0_payload={
+            "_edli_global_day0_binding": {
+                "probability_base_identity": "direct-base",
+            },
+            "_edli_day0_causal_evidence_bundle": bundle,
+            "_edli_day0_remaining_vector_witness": vector_witness,
+            "_edli_day0_causal_evidence_bundle_validation": validation,
+        },
+        metric="high",
+        probability_authority="day0_remaining_day_global_probability_v1",
+    )
+    pos = _make_position()
+    pos.condition_id = condition_id
+    pos.direction = "buy_yes"
+    pos.token_id = "yes-31"
+    pos.no_token_id = "no-31"
+
+    probability, refreshed, fresh = (
+        monitor_refresh_module._materialize_current_global_day0_probability(
+            pos,
+            snapshot,
+        )
+    )
+
+    assert probability == pytest.approx(0.25)
+    assert fresh is True
+    assert refreshed.selected_method == "day0_observation_remaining_window"
 
 
 def test_remaining_day_monitor_rejects_incomplete_statistical_provenance() -> None:

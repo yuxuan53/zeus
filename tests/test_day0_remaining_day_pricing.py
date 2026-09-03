@@ -1,6 +1,6 @@
 # Created: 2026-06-10
-# Last reused or audited: 2026-09-02
-# Lifecycle: created=2026-06-10; last_reviewed=2026-09-02; last_reused=2026-09-02
+# Last reused or audited: 2026-09-03
+# Lifecycle: created=2026-06-10; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Purpose: Protect causal Day0 remaining-window probability construction.
 # Reuse: Run before changing Day0 hourly members, state diagnostics, or bootstrap pricing.
 # Authority basis: operator green-light 2026-06-10 item B (remaining-day

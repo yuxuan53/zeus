@@ -293,6 +293,34 @@ def _pinned_complete_bundle_matches_current_day0_event(
     )
 
 
+def _pinned_complete_bundle_has_valid_causal_evidence(bundle: object) -> bool:
+    """Require the immutable carrier and its causal vector certificate together."""
+
+    provenance = getattr(bundle, "provenance_json", None)
+    if not isinstance(provenance, Mapping):
+        return False
+    causal_bundle = provenance.get("day0_causal_evidence_bundle")
+    remaining_witness = provenance.get("day0_remaining_vector_witness")
+    if not isinstance(causal_bundle, Mapping) or not isinstance(
+        remaining_witness, Mapping
+    ):
+        return False
+    if remaining_witness != causal_bundle.get("carrier_vector_witness"):
+        return False
+    try:
+        from src.data.day0_hourly_vectors import (
+            validate_day0_causal_evidence_bundle,
+        )
+
+        validation = validate_day0_causal_evidence_bundle(
+            expected=causal_bundle,
+            actual=causal_bundle,
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(validation.ok)
+
+
 def _pinned_carrier_block_defers_to_current_day0_event(reason_code: object) -> bool:
     """Whether a rejected old carrier may defer to current-event authority.
 
@@ -5659,11 +5687,19 @@ def _materialize_current_global_day0_probability(
             if isinstance(observation, Mapping)
             else None
         )
+        if not isinstance(bundle, Mapping):
+            bundle = snapshot.day0_payload.get(
+                "_edli_day0_causal_evidence_bundle"
+            )
         remaining_witness = (
             observation.get("day0_remaining_vector_witness")
             if isinstance(observation, Mapping)
             else None
         )
+        if not isinstance(remaining_witness, Mapping):
+            remaining_witness = snapshot.day0_payload.get(
+                "_edli_day0_remaining_vector_witness"
+            )
         identity_pairs = (
             ("bundle_identity", "actual_bundle_identity"),
             ("carrier_vector_identity", "actual_carrier_vector_identity"),
@@ -5671,7 +5707,11 @@ def _materialize_current_global_day0_probability(
         )
         provenance_complete = bool(
             isinstance(observation, Mapping)
-            and str(observation.get("posterior_id") or "").strip()
+            and str(
+                observation.get("posterior_id")
+                or observation.get("probability_base_identity")
+                or ""
+            ).strip()
             and isinstance(bundle, Mapping)
             and isinstance(remaining_witness, Mapping)
             and remaining_witness == bundle.get("carrier_vector_witness")
@@ -6053,6 +6093,17 @@ def _build_current_global_day0_family_snapshot(
                 # posterior materialized from this exact fact. RESET: the next
                 # read can pin that matching carrier.  Never pass an older q as
                 # a pinned source identity while the successor is absent.
+                pinned_complete_bundle = None
+            if (
+                pinned_complete_bundle is not None
+                and not _pinned_complete_bundle_has_valid_causal_evidence(
+                    pinned_complete_bundle
+                )
+            ):
+                # SCOPE: this held city/date/metric pin only. DRAIN: the
+                # current-bundle path below rebuilds q from a complete causal
+                # vector certificate. RESET: a later immutable posterior that
+                # carries the certificate is eligible for pinning again.
                 pinned_complete_bundle = None
             if pinned_complete_bundle is None:
                 if hwm_forecasts is None:

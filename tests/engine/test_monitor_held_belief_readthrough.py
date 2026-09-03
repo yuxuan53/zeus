@@ -1,6 +1,6 @@
 # Created: 2026-06-21
-# Last reused or audited: 2026-08-27
-# Lifecycle: created=2026-06-21; last_reviewed=2026-08-27; last_reused=2026-08-27
+# Last reused or audited: 2026-09-03
+# Lifecycle: created=2026-06-21; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Authority basis: docs/evidence/live_order_pathology/2026-06-21_forward_chain_diagnosis.md
 #   "CHOSEN FIX (consult-validated, two layers)" — LAYER 2 monitor read-through.
 """ANTIBODY: stale held belief must recover without blocking portfolio monitoring.
@@ -1279,9 +1279,24 @@ def test_day0_pinned_complete_route_skips_raw_hwm_handoff(monkeypatch):
     import src.engine.event_reactor_adapter as era
     import src.engine.monitor_refresh as mr
     import src.state.db as db
+    from src.data.day0_hourly_vectors import build_day0_causal_evidence_bundle
 
     world = _day0_event_connection()
     forecasts = sqlite3.connect(":memory:")
+    vector_witness = {
+        "vector_ids_by_model": {"ecmwf_ifs": "vector-1"},
+    }
+    causal_bundle = build_day0_causal_evidence_bundle(
+        city="Karachi",
+        target_date="2026-06-12",
+        metric="high",
+        observation_context={
+            "source": "aviationweather_metar",
+            "observed_extreme_native": 34.0,
+        },
+        cutoff_utc="2026-06-12T12:00:00+00:00",
+        vector_witness=vector_witness,
+    )
     pinned_bundle = SimpleNamespace(
         posterior_id="complete-00",
         provenance_json={
@@ -1292,7 +1307,9 @@ def test_day0_pinned_complete_route_skips_raw_hwm_handoff(monkeypatch):
                 "observation_time": "2026-06-12T12:00:00+00:00",
                 "observed_extreme_c": 34.0,
                 "unit": "C",
-            }
+            },
+            "day0_remaining_vector_witness": vector_witness,
+            "day0_causal_evidence_bundle": causal_bundle,
         },
     )
     world.execute(
