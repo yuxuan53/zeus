@@ -4,6 +4,29 @@ Date: 2026-07-11
 Branch: `live` (was `p2-pending-exit-restart-redecision`; renamed at main→live cutover)
 Status: active
 
+## 2026-09-03 — physical Day0 fact直接重建held q，不等待posterior successor
+
+- **实时反例：** Chicago Sep-3 HIGH 92–93F 的同站 AWC fact 已于
+  `05:53:12Z` 因果可用，但最新 replacement bundle 尚无该 observation
+  conditioning；held monitor 从 `05:53:26Z` 起、截至 `06:30:16Z` 连续 71 次返回
+  `GLOBAL_DAY0_REPLACEMENT_CONDITIONING_MISSING`，保留旧 q、无法形成
+  BUY/SELL/HOLD/CASH 决策。历史 Tel Aviv Sep-2 在 bid 跌破 0.05 前也暴露同一
+  `fact available -> held probability unavailable` seam。
+- **结构性修复：** 仅当 current local day 的同站 NOAA physical fact 已授权、
+  settlement-channel fact 尚不可见且 action 是 `HELD_MONITOR` 或
+  `REDUCE_ONLY_EXIT` 时，缺 conditioning 的旧 bundle 立即转入现有 direct
+  remaining-window recomputation。该 q 绑定 current fact、fresh complete hourly
+  vectors、source identity及 NOAA preliminary revision likelihood；ENTRY 继续以
+  `GLOBAL_DAY0_PHYSICAL_FRONTIER_NOT_SETTLEMENT_CONFIRMED` fail-closed，physical
+  fact 不获得 deterministic settlement authority。
+- **SCOPE / DRAIN / RESET：** scope 是一个已有 exposure 的
+  city/date/metric family；drain 是每次 monitor/JIT rebind 即时重算，不等待
+  materializer；reset 是 conditioned successor 到达后恢复 normal bundle route，
+  或 vectors/source identity 不完整时局部 fail-closed。抗体同时覆盖 held、
+  reduce-only 成功和 ENTRY 拒绝；patched code 对 live canonical DB 只读 replay
+  得到 fresh Chicago held q `0.38065`、`physical_only=true`、revision likelihood
+  present。
+
 ## 2026-08-29 — RiskGuard总level必须打印真实host/storage driver
 
 - **实时反例：** canonical `risk_state`以`host_power_level=ORANGE`记录Battery Power 17%、

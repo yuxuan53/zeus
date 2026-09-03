@@ -38382,6 +38382,27 @@ def _prepare_current_global_probability_family(
                     )
         held_day0_redecision_fallback_eligible = False
         if final_daily_observation is None:
+            physical_only_current_day_redecision = bool(
+                provisional_day0_fact is None
+                and physical_day0_fact is not None
+                and str(getattr(city, "settlement_source_type", "") or "")
+                .strip()
+                .lower()
+                == "noaa"
+                and local_target == local_now.date()
+            )
+            day0_redecision_fact = (
+                physical_day0_fact
+                if physical_only_current_day_redecision
+                else provisional_day0_fact
+            )
+            if physical_only_current_day_redecision:
+                # A same-station NOAA print is immediate statistical evidence,
+                # not final settlement truth.  The remaining-path probability
+                # must therefore carry its empirical/prior-only revision
+                # likelihood for held and reduce-only use; treating the print
+                # as absorbing would understate reversal risk.
+                provisional_day0_observation = True
             held_day0_current_bundle_pin_eligible = bool(
                 (provisional_day0_fact is not None or physical_day0_fact is not None)
                 and local_target == local_now.date()
@@ -38392,9 +38413,10 @@ def _prepare_current_global_probability_family(
                 }
             )
             held_day0_redecision_fallback_eligible = bool(
-                provisional_day0_fact is not None
+                day0_redecision_fact is not None
                 and (
-                    provisional_day0_observation
+                    physical_only_current_day_redecision
+                    or provisional_day0_observation
                     or post_local_incomplete_monitor_authority
                 )
                 and (
@@ -38431,21 +38453,22 @@ def _prepare_current_global_probability_family(
             if not day0_base_identity:
                 raise ValueError("GLOBAL_HELD_PINNED_POSTERIOR_IDENTITY_MISSING")
         if final_daily_observation is None and current_day0_redecision_only:
-            # SCOPE: this already-held family's genuinely provisional Day0 or
-            # post-local incomplete observability.  It may refresh monitoring
-            # or JIT reduce-only q, but it can never add exposure.  Prefer a
-            # current replacement certificate when one exists; otherwise the
-            # direct current-evidence certificate below binds the observation
-            # and hourly vectors that actually produce this invocation's q.
+            # SCOPE: this already-held family's genuinely provisional Day0,
+            # same-station physical-only current fact, or post-local incomplete
+            # observability.  It may refresh monitoring or JIT reduce-only q,
+            # but it can never add exposure.  Prefer a current replacement
+            # certificate when one exists; otherwise the direct current-
+            # evidence certificate below binds the observation and hourly
+            # vectors that actually produce this invocation's q.
             # DRAIN: the strict remaining-window builder below consumes a fresh,
             # complete expected-provider vector bundle on every redecision.
             # RESET: missing/stale vectors or the next local day fail closed;
             # final-daily evidence upgrades to the exact simplex instead.
             source_cycle_raw = str(
-                provisional_day0_fact.get("observation_time") or ""
+                day0_redecision_fact.get("observation_time") or ""
             ).strip()
             source_available_at = str(
-                provisional_day0_fact.get("observation_available_at")
+                day0_redecision_fact.get("observation_available_at")
                 or source_cycle_raw
             ).strip()
             day0_base_identity = stable_hash(
@@ -38454,17 +38477,17 @@ def _prepare_current_global_probability_family(
                     "city": family.city,
                     "target_date": str(family.target_date),
                     "metric": family.metric,
-                    "observation_source": provisional_day0_fact.get(
+                    "observation_source": day0_redecision_fact.get(
                         "observation_source"
                     ),
-                    "station_id": provisional_day0_fact.get("station_id"),
-                    "unit": provisional_day0_fact.get("unit"),
+                    "station_id": day0_redecision_fact.get("station_id"),
+                    "unit": day0_redecision_fact.get("unit"),
                     "observation_time": source_cycle_raw,
                     "observation_available_at": source_available_at,
-                    "observed_extreme_native": provisional_day0_fact.get(
+                    "observed_extreme_native": day0_redecision_fact.get(
                         "observed_extreme_native"
                     ),
-                    "raw_payload_sha256": provisional_day0_fact.get(
+                    "raw_payload_sha256": day0_redecision_fact.get(
                         "raw_payload_sha256"
                     ),
                 }
@@ -38832,25 +38855,39 @@ def _prepare_current_global_probability_family(
                     allow_stale_supporting_conditioning=True,
                 )
             elif bundle is not None:
-                conditioning = _day0_replacement_conditioning(
-                    bundle,
-                    provisional=probability_conditioning_is_provisional,
-                    metric=str(family.metric),
-                    unit=str(omega.resolution.measurement_unit),
-                    decision_time=decision_time,
-                    entry_authority=entry_authority,
-                    # The source-clock observation is only a provenance
-                    # carrier when the action q is rebuilt from the current
-                    # remaining path below. Its age cannot freeze the whole
-                    # city between hourly provider publications: the
-                    # remaining-path builder prices the unobserved interval
-                    # through decision_time from the causal current-state
-                    # ledger. Direct source-clock action routes retain the
-                    # strict 15-minute gate above.
-                    allow_stale_supporting_conditioning=(
-                        remaining_path_supporting_conditioning
-                    ),
-                )
+                try:
+                    conditioning = _day0_replacement_conditioning(
+                        bundle,
+                        provisional=probability_conditioning_is_provisional,
+                        metric=str(family.metric),
+                        unit=str(omega.resolution.measurement_unit),
+                        decision_time=decision_time,
+                        entry_authority=entry_authority,
+                        # The source-clock observation is only a provenance
+                        # carrier when the action q is rebuilt from the current
+                        # remaining path below. Its age cannot freeze the whole
+                        # city between hourly provider publications: the
+                        # remaining-path builder prices the unobserved interval
+                        # through decision_time from the causal current-state
+                        # ledger. Direct source-clock action routes retain the
+                        # strict 15-minute gate above.
+                        allow_stale_supporting_conditioning=(
+                            remaining_path_supporting_conditioning
+                        ),
+                    )
+                except ValueError as exc:
+                    if (
+                        str(exc)
+                        == "GLOBAL_DAY0_REPLACEMENT_CONDITIONING_MISSING"
+                        and held_day0_redecision_fallback_eligible
+                        and not _force_day0_redecision_fallback
+                    ):
+                        # The current physical fact outranks an older carrier's
+                        # missing Day0 overlay for existing capital only.  Do
+                        # not wait for materialization when the strict direct
+                        # remaining-path route can price that fact now.
+                        return _prepare_held_day0_fallback()
+                    raise
             current_day0_payload = _global_day0_execution_payload(
                 event,
                 family=family,

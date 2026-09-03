@@ -8502,6 +8502,89 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
         True,
     ]
 
+    # A newer same-station physical fact may be visible before the replacement
+    # materializer writes a conditioned successor. Existing capital must use
+    # that fact with the current remaining path immediately; ENTRY must still
+    # wait for the source-clock successor.
+    source_clock_bundle.provenance_json.pop("day0_provisional_observation")
+    physical_fact = {
+        "observation_source": "aviationweather_metar",
+        "observation_time": "2026-07-11T17:10:00+00:00",
+        "observation_available_at": "2026-07-11T17:11:00+00:00",
+        "observed_extreme_native": 70.0,
+        "sample_count": 6,
+        "station_id": "KDAL",
+        "unit": "F",
+        "raw_payload_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        current_target_plan,
+        "_latest_authorized_day0_fact",
+        lambda *_args, **kwargs: (
+            None if kwargs["require_settlement_channel"] else physical_fact
+        ),
+    )
+    physical_payload: dict[str, object] = {}
+    physical_held = era._prepare_current_global_probability_family(
+        _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
+        forecast_conn=forecast,
+        topology_conn=forecast,
+        observation_conn=observations,
+        decision_time=_dt.datetime(
+            2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
+        ),
+        max_age=_dt.timedelta(seconds=30),
+        day0_payload_out=physical_payload,
+        allow_provisional_day0_replacement=True,
+        probability_use=era._CurrentProbabilityUse.HELD_MONITOR,
+    )
+    physical_reduce_only = era._prepare_current_global_probability_family(
+        _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
+        forecast_conn=forecast,
+        topology_conn=forecast,
+        observation_conn=observations,
+        decision_time=_dt.datetime(
+            2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
+        ),
+        max_age=_dt.timedelta(seconds=30),
+        allow_provisional_day0_replacement=True,
+        probability_use=era._CurrentProbabilityUse.REDUCE_ONLY_EXIT,
+    )
+    assert physical_held.posterior_id is None
+    assert physical_reduce_only.posterior_id is None
+    assert physical_payload["_edli_day0_redecision_authority_scope"] == (
+        "held_exposure_current_day0_only_v1"
+    )
+    assert (
+        physical_payload["_edli_day0_direct_current_redecision_authority"] is True
+    )
+    assert conditioning_reads[-2:] == [None, None]
+    assert revision_prior_permissions[-2:] == [True, True]
+    physical_revision_permissions = list(revision_prior_permissions)
+    with pytest.raises(
+        ValueError, match="GLOBAL_DAY0_PHYSICAL_FRONTIER_NOT_SETTLEMENT_CONFIRMED"
+    ):
+        era._prepare_current_global_probability_family(
+            _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
+            forecast_conn=forecast,
+            topology_conn=forecast,
+            observation_conn=observations,
+            decision_time=_dt.datetime(
+                2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
+            ),
+            max_age=_dt.timedelta(seconds=30),
+            allow_provisional_day0_replacement=True,
+            probability_use=era._CurrentProbabilityUse.ENTRY,
+        )
+    monkeypatch.setattr(
+        current_target_plan,
+        "_latest_authorized_day0_fact",
+        lambda *_args, **_kwargs: definitive_fact,
+    )
+    source_clock_bundle.provenance_json[
+        "day0_provisional_observation"
+    ] = provisional_conditioning
+
     capture_time["value"] = "2026-07-11T17:31:00+00:00"
     recaptured_payload: dict[str, object] = {}
     recaptured = era._prepare_current_global_probability_family(
@@ -8523,16 +8606,7 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
     assert witness.probability_content_identity != (
         recaptured.probability_witness.probability_content_identity
     )
-    assert revision_prior_permissions == [
-        False,
-        False,
-        False,
-        False,
-        True,
-        True,
-        True,
-        False,
-    ]
+    assert revision_prior_permissions == [*physical_revision_permissions, False]
 
     missing_observations = sqlite3.connect(":memory:")
     with pytest.raises(ValueError, match="GLOBAL_DAY0_OBSERVATION_HWM_UNAVAILABLE"):
