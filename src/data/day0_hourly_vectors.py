@@ -521,6 +521,18 @@ def build_day0_remaining_probability_carrier(
         for low, high in bounds
     ):
         raise ValueError("DAY0_REMAINING_CARRIER_BIN_BOUNDS_INVALID")
+    # ``bounds`` arrive on the settlement-native integer grid, but Fahrenheit
+    # families round-trip through canonical Celsius storage first.  Normalize
+    # the already-validated values before topology checks and probability
+    # assignment so harmless conversion residue (for example 97.00000000000001)
+    # cannot turn adjacent 97/98 bins into a false gap.
+    bounds = tuple(
+        (
+            None if low is None else float(round(low)),
+            None if high is None else float(round(high)),
+        )
+        for low, high in bounds
+    )
     if any(low is None and high is None for low, high in bounds):
         raise ValueError("DAY0_REMAINING_CARRIER_OPEN_OPEN_BIN_INVALID")
     ordered = sorted(bounds, key=lambda item: float("-inf") if item[0] is None else item[0])

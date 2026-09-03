@@ -298,6 +298,50 @@ def test_shared_remaining_carrier_accepts_valid_market_order_and_preserves_align
     )
 
 
+def test_shared_remaining_carrier_normalizes_fahrenheit_round_trip_grid():
+    """Celsius storage residue must not invalidate adjacent Fahrenheit bins."""
+
+    bounds_c = [
+        (None, 26.11111111111111),
+        (26.666666666666668, 27.22222222222222),
+        (27.77777777777778, 28.333333333333332),
+        (28.88888888888889, 29.444444444444443),
+        (30.0, 30.555555555555557),
+        (31.11111111111111, 31.666666666666668),
+        (32.22222222222222, 32.77777777777778),
+        (33.333333333333336, 33.888888888888886),
+        (34.44444444444444, 35.0),
+        (35.55555555555556, 36.111111111111114),
+        (36.666666666666664, None),
+    ]
+    native_scale = 9.0 / 5.0
+    bounds_f = [
+        (
+            None if low is None else low * native_scale + 32.0,
+            None if high is None else high * native_scale + 32.0,
+        )
+        for low, high in bounds_c
+    ]
+    assert bounds_f[-2][1] == pytest.approx(97.0)
+    assert bounds_f[-2][1] != 97.0
+
+    carrier = build_day0_remaining_probability_carrier(
+        future_extremes_c=[90.0, 91.0, 92.0],
+        boundary_scenarios=((None, 1.0),),
+        metric="high",
+        path_error_sigma_c=0.0,
+        instrument_sigma_c=0.0,
+        bin_bounds_c=bounds_f,
+        n_point=10,
+        n_samples=5,
+        identity_inputs={"city": "Chicago", "unit": "F"},
+        settlement_semantics=_settlement_semantics("Chicago"),
+    )
+
+    assert sum(carrier["q"]) == pytest.approx(1.0)
+    assert carrier["q"][5:8] == pytest.approx([0.0, 2.0 / 3.0, 1.0 / 3.0])
+
+
 def test_shared_remaining_carrier_uses_hko_oracle_truncation() -> None:
     common = {
         "future_extremes_c": [25.9],
