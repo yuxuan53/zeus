@@ -2640,10 +2640,10 @@ class TestExecutor:
             snapshot_hash=snapshot.executable_snapshot_hash,
         ) == "protective_sell_semantic_authority_superseded"
 
-    def test_flash_catastrophe_without_global_authority_cannot_reach_venue(
+    def test_canonical_flash_catastrophe_reaches_protective_fak_venue(
         self, monkeypatch
     ):
-        """Market-path panic is a proposal, never independent SELL authority."""
+        """A canonical persistent catastrophe owns typed protective SELL authority."""
         from src.execution.exit_lifecycle import execute_exit
         from src.state.portfolio import (
             ExitContext,
@@ -2816,14 +2816,17 @@ class TestExecutor:
                 LIMIT 1""",
             (position.trade_id,),
         ).fetchone()
-        assert outcome == "exit_blocked: global_capital_optimal_sell_intent_required"
-        assert captured == {}
-        assert command is None
+        assert outcome.startswith("sell_pending: order=flash-catastrophe-e2e-order")
+        assert captured["order_type"] == "FAK"
+        assert captured["price"] == pytest.approx(0.19)
+        assert command is not None
+        assert command["side"] == "SELL"
+        assert command["price"] == pytest.approx(0.19)
         assert _TEST_CONN.execute(
             """SELECT COUNT(*) FROM position_events
                 WHERE position_id = ? AND event_type = 'EXIT_INTENT'""",
             (position.trade_id,),
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
 
     def test_unproved_flash_catastrophe_cannot_mutate_exit_lifecycle(self):
         from src.execution.exit_lifecycle import execute_exit
@@ -2895,7 +2898,7 @@ class TestExecutor:
             "SELECT phase FROM position_current WHERE position_id=?",
             (position.trade_id,),
         ).fetchone()
-        assert outcome == "exit_blocked: global_capital_optimal_sell_intent_required"
+        assert outcome == "exit_blocked: flash_crash_sell_authority_required"
         assert position.state == "holding"
         assert current["phase"] == "active"
         assert _TEST_CONN.execute(
@@ -2903,6 +2906,79 @@ class TestExecutor:
                 WHERE position_id=? AND event_type='EXIT_INTENT'""",
             (position.trade_id,),
         ).fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        "payload_update",
+        (
+            {"held_sell_full_depth_action_authority": False},
+            {"last_monitor_market_price_is_fresh": False},
+            {"last_monitor_best_bid": 0.049},
+            {"market_velocity_1h": None},
+            {"flash_crash_count": None},
+            {"applied_validations": ["flash_crash_trigger"]},
+        ),
+    )
+    def test_flash_catastrophe_semantic_receipt_rejects_incomplete_proof(
+        self, payload_update
+    ):
+        from src.execution.exit_lifecycle import (
+            _flash_crash_monitor_semantic_receipt,
+        )
+        from src.state.portfolio import (
+            flash_crash_catastrophe_velocity,
+            flash_crash_confirmations,
+        )
+
+        suffix = hashlib.sha256(
+            json.dumps(payload_update, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        position_id = f"flash-incomplete-{suffix}"
+        payload = {
+            "exit_decision_should_exit": True,
+            "exit_decision_trigger": "FLASH_CRASH_PANIC",
+            "held_sell_full_depth_action_authority": True,
+            "last_monitor_market_price_is_fresh": True,
+            "last_monitor_best_bid": 0.20,
+            "market_velocity_1h": flash_crash_catastrophe_velocity() - 0.01,
+            "flash_crash_count": flash_crash_confirmations(),
+            "applied_validations": [
+                "flash_crash_persistent_market_evidence",
+                "flash_crash_trigger",
+            ],
+        }
+        payload.update(payload_update)
+        if payload_update.get("market_velocity_1h") is None and (
+            "market_velocity_1h" in payload_update
+        ):
+            payload["market_velocity_1h"] = (
+                flash_crash_catastrophe_velocity() + 0.01
+            )
+        if payload_update.get("flash_crash_count") is None and (
+            "flash_crash_count" in payload_update
+        ):
+            payload["flash_crash_count"] = max(
+                0, flash_crash_confirmations() - 1
+            )
+        _TEST_CONN.execute(
+            """INSERT INTO position_events(
+                   event_id, position_id, event_version, sequence_no,
+                   event_type, occurred_at, phase_before, phase_after,
+                   source_module, env, payload_json
+               ) VALUES (?, ?, 1, 1, 'MONITOR_REFRESHED', ?, 'active',
+                         'active', 'src.engine.cycle_runtime', 'live', ?)""",
+            (
+                f"event-{position_id}",
+                position_id,
+                _NOW.isoformat(),
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+        _TEST_CONN.commit()
+
+        assert _flash_crash_monitor_semantic_receipt(
+            _TEST_CONN,
+            position_id=position_id,
+        ) is None
 
     def test_untyped_protective_fak_is_rejected_before_persistence(self, monkeypatch):
         from src.state.snapshot_repo import get_snapshot

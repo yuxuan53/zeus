@@ -59,6 +59,8 @@ from src.state.portfolio import (
     compute_economic_close,
     compute_settlement_close,
     ExitContext,
+    flash_crash_catastrophe_velocity,
+    flash_crash_confirmations,
     mark_admin_closed,
     Position,
     PortfolioState,
@@ -2511,6 +2513,7 @@ class ProtectiveSellExecutionAuthority:
         if self.kind not in {
             "RED_FORCE_EXIT",
             "DAY0_HARD_FACT_BIN_DEAD",
+            "FLASH_CRASH_PANIC",
         }:
             raise ValueError("protective sell kind invalid")
         if not all((
@@ -2712,6 +2715,7 @@ def _protective_sell_semantic_receipt(
     ):
         return None
     reason = str(payload.get("exit_intent_reason") or "")
+    semantic_payload_sha256 = hashlib.sha256(payload_text.encode()).hexdigest()
     if kind == "RED_FORCE_EXIT":
         if reason.upper() != _RED_FORCE_EXIT:
             return None
@@ -2732,6 +2736,22 @@ def _protective_sell_semantic_receipt(
             or not isinstance(receipt.get("hard_fact_evidence"), Mapping)
         ):
             return None
+    elif kind == "FLASH_CRASH_PANIC":
+        monitor = _flash_crash_monitor_semantic_receipt(
+            conn,
+            position_id=position_id,
+            before_sequence_no=int(row["sequence_no"]),
+            required_sequence_no=int(row["sequence_no"]) - 1,
+        )
+        if not reason.startswith("FLASH_CRASH_PANIC") or monitor is None:
+            return None
+        monitor_event_id, monitor_payload_sha256 = monitor
+        semantic_payload_sha256 = hashlib.sha256(
+            (
+                f"{monitor_event_id}\x1f{monitor_payload_sha256}\x1f"
+                f"{payload_text}"
+            ).encode()
+        ).hexdigest()
     else:
         return None
     try:
@@ -2745,6 +2765,74 @@ def _protective_sell_semantic_receipt(
     except sqlite3.Error:
         return None
     if terminal is not None:
+        return None
+    return str(row["event_id"]), semantic_payload_sha256
+
+
+def _flash_crash_monitor_semantic_receipt(
+    conn: sqlite3.Connection | None,
+    *,
+    position_id: str,
+    before_sequence_no: int | None = None,
+    required_sequence_no: int | None = None,
+) -> tuple[str, str] | None:
+    """Return canonical persistent-catastrophe evidence for one monitor cut."""
+
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            """SELECT event_id, sequence_no, source_module, env, phase_after,
+                      payload_json
+                 FROM position_events
+                WHERE position_id=? AND event_type='MONITOR_REFRESHED'
+                  AND (? IS NULL OR sequence_no < ?)
+                ORDER BY sequence_no DESC LIMIT 1""",
+            (position_id, before_sequence_no, before_sequence_no),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or (
+        required_sequence_no is not None
+        and int(row["sequence_no"]) != int(required_sequence_no)
+    ):
+        return None
+    if (
+        str(row["source_module"] or "") != "src.engine.cycle_runtime"
+        or str(row["env"] or "") != "live"
+        or str(row["phase_after"] or "") in _RED_TERMINAL_PHASES
+    ):
+        return None
+    try:
+        payload_text = str(row["payload_json"] or "")
+        payload = json.loads(payload_text)
+        velocity = float(payload.get("market_velocity_1h"))
+        confirmations = int(payload.get("flash_crash_count"))
+        best_bid = float(payload.get("last_monitor_best_bid"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    validations = {
+        str(value) for value in payload.get("applied_validations", ())
+    } if isinstance(payload, Mapping) else set()
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("exit_decision_should_exit") is not True
+        or str(payload.get("exit_decision_trigger") or "")
+        != "FLASH_CRASH_PANIC"
+        or payload.get("held_sell_full_depth_action_authority") is not True
+        or payload.get("last_monitor_market_price_is_fresh") is not True
+        or not math.isfinite(velocity)
+        or velocity > flash_crash_catastrophe_velocity()
+        or confirmations < flash_crash_confirmations()
+        or not math.isfinite(best_bid)
+        or not LIVE_ORDER_MIN_UNIT_PRICE
+        <= Decimal(str(best_bid))
+        <= LIVE_ORDER_MAX_UNIT_PRICE
+        or not {
+            "flash_crash_persistent_market_evidence",
+            "flash_crash_trigger",
+        }.issubset(validations)
+    ):
         return None
     return str(row["event_id"]), hashlib.sha256(payload_text.encode()).hexdigest()
 
@@ -7449,6 +7537,17 @@ def _execute_live_exit(
             now=_utcnow(),
         )
     )
+    flash_crash_candidate = str(exit_intent.reason or "").startswith(
+        "FLASH_CRASH_PANIC"
+    )
+    flash_crash_authorized = bool(
+        live_non_red
+        and flash_crash_candidate
+        and _flash_crash_monitor_semantic_receipt(
+            conn,
+            position_id=str(position.trade_id),
+        )
+    )
     global_authorized = False
     branchwise_authorized = False
     continuing_existing_exit = bool(
@@ -7469,6 +7568,12 @@ def _execute_live_exit(
                 branchwise_sell_authority,
             )
             branchwise_authorized = preliminary_error is None
+        elif flash_crash_candidate:
+            preliminary_error = (
+                None
+                if flash_crash_authorized
+                else "flash_crash_sell_authority_required"
+            )
         else:
             preliminary_error = _global_sell_execution_authority_shape_error(
                 global_sell_authority
@@ -7587,6 +7692,8 @@ def _execute_live_exit(
         if is_red_force_exit
         else "DAY0_HARD_FACT_BIN_DEAD"
         if hard_fact_authorized
+        else "FLASH_CRASH_PANIC"
+        if flash_crash_authorized
         else ""
     )
     protective_bid = _positive_decimal(

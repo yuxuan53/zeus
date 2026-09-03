@@ -5692,3 +5692,23 @@ Allowed files for this hot-fix are `src/execution/command_recovery.py`,
   complete bundle; held monitor consumes it on its next redecision cycle.
 - RESET: every later refresh independently requests and validates its own real
   anchor; an incomplete response remains fail-closed.
+
+### 2026-09-03 persistent-catastrophe actuation completion hot-fix
+
+- Money-path seam: `monitor decision -> durable EXIT_INTENT -> venue command`.
+- Defect: `FLASH_CRASH_PANIC` was classified as a direct reduce-only decision,
+  but the execution boundary still accepted only global-auction, exact-zero,
+  RED, or hard-fact authority, so every live panic was rejected before command
+  persistence.
+- Fix: the existing typed protective FAK authority accepts FLASH only when the
+  immediately preceding canonical `MONITOR_REFRESHED` proves a fresh full-depth
+  in-band bid, configured deep velocity, configured causal confirmations, and
+  the exact persistent-catastrophe validations. The authority hash binds that
+  monitor payload, the adjacent EXIT_INTENT, and the submit-time snapshot.
+- SCOPE: one held position with canonical `FLASH_CRASH_PANIC`; ordinary
+  statistical SELL remains globally optimized.
+- DRAIN: the same monitor turn records EXIT_INTENT and submits one FAK against
+  a newly captured executable snapshot.
+- RESET: a later monitor cut must independently satisfy all evidence; stale,
+  shallow, single-quote, missing-depth, out-of-band, or terminal evidence fails
+  closed without mutating lifecycle.
