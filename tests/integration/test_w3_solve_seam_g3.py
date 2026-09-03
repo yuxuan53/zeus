@@ -8070,10 +8070,20 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
         ("p2", (72.0 - 32.0) * 5.0 / 9.0, None),
     )
     source_clock_q = (0.1, 0.6, 0.3)
-    causal_bundle = {
-        "bundle_identity": "day0-causal-dallas-17",
-        "carrier_vector_identity": "vector-dallas-17",
-    }
+    from src.data.day0_hourly_vectors import build_day0_causal_evidence_bundle
+
+    causal_bundle = build_day0_causal_evidence_bundle(
+        city="Dallas",
+        target_date="2026-07-11",
+        metric="high",
+        observation_context={
+            "observation_time": "2026-07-11T17:00:00+00:00",
+        },
+        cutoff_utc="2026-07-11T18:00:00+00:00",
+        vector_witness={
+            "vector_ids_by_model": {"ecmwf": "vector-dallas-17"},
+        },
+    )
     source_clock_bundle = SimpleNamespace(
         posterior_id=17,
         posterior_identity_hash="source-clock-posterior-17",
@@ -8461,22 +8471,18 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
         allow_provisional_day0_replacement=True,
         probability_use=era._CurrentProbabilityUse.HELD_MONITOR,
     )
-    with pytest.raises(
-        ValueError,
-        match="GLOBAL_CURRENT_REPLACEMENT_BUNDLE_BLOCKED:STALE_FOR_LIVE",
-    ):
-        era._prepare_current_global_probability_family(
-            _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
-            forecast_conn=forecast,
-            topology_conn=forecast,
-            observation_conn=observations,
-            decision_time=_dt.datetime(
-                2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
-            ),
-            max_age=_dt.timedelta(seconds=30),
-            allow_provisional_day0_replacement=True,
-            probability_use=era._CurrentProbabilityUse.REDUCE_ONLY_EXIT,
-        )
+    reduce_only_fallback = era._prepare_current_global_probability_family(
+        _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
+        forecast_conn=forecast,
+        topology_conn=forecast,
+        observation_conn=observations,
+        decision_time=_dt.datetime(
+            2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
+        ),
+        max_age=_dt.timedelta(seconds=30),
+        allow_provisional_day0_replacement=True,
+        probability_use=era._CurrentProbabilityUse.REDUCE_ONLY_EXIT,
+    )
     source_clock_available["value"] = True
     assert fallback_payload["_edli_day0_redecision_authority_scope"] == (
         "held_exposure_current_day0_only_v1"
@@ -8485,7 +8491,16 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
         "_edli_day0_provisional_boundary_survival_probability"
     ] == pytest.approx(0.6)
     assert fallback.posterior_id is None
-    assert revision_prior_permissions == [False, False, False, False, True, True]
+    assert reduce_only_fallback.posterior_id is None
+    assert revision_prior_permissions == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
 
     capture_time["value"] = "2026-07-11T17:31:00+00:00"
     recaptured_payload: dict[str, object] = {}
@@ -8515,6 +8530,7 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
         False,
         True,
         True,
+        True,
         False,
     ]
 
@@ -8531,6 +8547,52 @@ def test_current_day0_global_probability_uses_current_remaining_day_simplex(
             max_age=_dt.timedelta(seconds=30),
         )
     missing_observations.close()
+
+    monkeypatch.setattr(
+        era,
+        "_day0_remaining_global_probability_components",
+        remaining_day_unavailable,
+    )
+    pinned_reads: list[int] = []
+
+    def read_exact_held_pin(*_args, **kwargs):
+        pinned_reads.append(int(kwargs["posterior_id"]))
+        return SimpleNamespace(
+            ok=True,
+            bundle=source_clock_bundle,
+            reason_code="REPLACEMENT_POSTERIOR_READY",
+        )
+
+    monkeypatch.setattr(
+        bundle_reader,
+        "read_pinned_replacement_forecast_bundle",
+        read_exact_held_pin,
+    )
+    vector_gap_payload: dict[str, object] = {}
+    vector_gap_held = era._prepare_current_global_probability_family(
+        _global_day0_scope_event(city="Dallas", source_run_id="run-dallas"),
+        forecast_conn=forecast,
+        topology_conn=forecast,
+        observation_conn=observations,
+        decision_time=_dt.datetime(
+            2026, 7, 11, 18, 0, tzinfo=_dt.timezone.utc
+        ),
+        max_age=_dt.timedelta(seconds=30),
+        day0_payload_out=vector_gap_payload,
+        allow_provisional_day0_replacement=True,
+        probability_use=era._CurrentProbabilityUse.HELD_MONITOR,
+    )
+    assert pinned_reads == [17]
+    assert vector_gap_held.probability_witness.yes_point_q.tolist() == pytest.approx(
+        source_clock_q
+    )
+    assert vector_gap_payload["probability_authority"] == (
+        "day0_held_same_cycle_day0_recompute_v1"
+    )
+    assert vector_gap_payload["_edli_day0_held_pinned_recompute"] is True
+    assert vector_gap_payload["_edli_day0_held_pinned_fallback_reason"] == (
+        "current_remaining_vectors_unavailable"
+    )
     observations.close()
     forecast.close()
 

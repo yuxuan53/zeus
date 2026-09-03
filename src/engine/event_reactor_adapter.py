@@ -37959,7 +37959,7 @@ def _prepare_current_global_probability_family(
             return before_raw_input_hwm_read()
         return raw_input_hwm_deadline_monotonic
 
-    def _prepare_held_day0_fallback():
+    def _prepare_held_day0_fallback(*, pinned_bundle: object | None = None):
         return _prepare_current_global_probability_family(
             event,
             forecast_conn=forecast_conn,
@@ -37981,6 +37981,7 @@ def _prepare_current_global_probability_family(
             raw_input_hwm_read_max_seconds=raw_input_hwm_read_max_seconds,
             before_raw_input_hwm_read=before_raw_input_hwm_read,
             _force_day0_redecision_fallback=True,
+            pinned_complete_bundle=pinned_bundle,
         )
 
     if max_age <= timedelta(0):
@@ -38075,6 +38076,7 @@ def _prepare_current_global_probability_family(
             raise ValueError("GLOBAL_HELD_PINNED_POSTERIOR_IDENTITY_INCOMPLETE")
     day0_source_clock_bound_identity = ""
     current_day0_redecision_only = False
+    held_day0_current_bundle_pin_eligible = False
     direct_day0_entry_carrier: Mapping[str, object] | None = None
     if is_day0:
         city = runtime_cities_by_name().get(str(family.city))
@@ -38243,6 +38245,15 @@ def _prepare_current_global_probability_family(
                     )
         held_day0_redecision_fallback_eligible = False
         if final_daily_observation is None:
+            held_day0_current_bundle_pin_eligible = bool(
+                (provisional_day0_fact is not None or physical_day0_fact is not None)
+                and local_target == local_now.date()
+                and probability_use
+                in {
+                    _CurrentProbabilityUse.HELD_MONITOR,
+                    _CurrentProbabilityUse.REDUCE_ONLY_EXIT,
+                }
+            )
             held_day0_redecision_fallback_eligible = bool(
                 provisional_day0_fact is not None
                 and (
@@ -39081,16 +39092,64 @@ def _prepare_current_global_probability_family(
                 # consumes the current physical frontier; fast residual evidence
                 # is boundary/time evidence, never a frozen full-day action q.
                 # Entry authority remains blocked after local completion.
-                components = _day0_remaining_global_probability_components(
-                    event,
-                    forecast_conn=forecast_conn,
-                    calibration_conn=day0_observation_conn,
-                    family=family,
-                    payload=payload,
-                    decision_time=decision_time,
-                    snapshot=day0_snapshot,
-                    entry_authority=entry_authority,
-                )
+                try:
+                    components = _day0_remaining_global_probability_components(
+                        event,
+                        forecast_conn=forecast_conn,
+                        calibration_conn=day0_observation_conn,
+                        family=family,
+                        payload=payload,
+                        decision_time=decision_time,
+                        snapshot=day0_snapshot,
+                        entry_authority=entry_authority,
+                    )
+                except ValueError as exc:
+                    if (
+                        str(exc) != "DAY0_REMAINING_DAY_MEMBERS_UNAVAILABLE"
+                        or not held_day0_current_bundle_pin_eligible
+                        or pinned_complete_bundle is not None
+                        or bundle is None
+                    ):
+                        raise
+                    # The current source-clock posterior can remain a valid,
+                    # immutable reduce-only carrier while its successor hourly
+                    # vector tranche is temporarily incomplete.  Revalidate
+                    # that exact carrier with the strict held-pin contract,
+                    # then overlay the latest authorized monotone observation.
+                    # ENTRY never reaches this branch.  SCOPE: this held
+                    # city/date/metric family only.  DRAIN: the next complete
+                    # current vector revision restores the primary remaining-
+                    # path rebuild.  RESET: every monitor/submit redecision
+                    # retries current vectors before this typed fallback.
+                    held_pin = read_pinned_replacement_forecast_bundle(
+                        forecast_conn,
+                        posterior_id=int(bundle.posterior_id),
+                        city=family.city,
+                        target_date=family.target_date,
+                        temperature_metric=family.metric,
+                        decision_time=decision_time,
+                        current_bin_topology_hash=current_topology_hash,
+                        raw_input_hwm_conn=(
+                            raw_input_hwm_conn or forecast_conn
+                        ),
+                        raw_input_hwm_deadline_monotonic=(
+                            raw_input_hwm_deadline_monotonic
+                        ),
+                        raw_input_hwm_read_max_seconds=(
+                            raw_input_hwm_read_max_seconds
+                        ),
+                        authority_purpose=bundle_authority_purpose,
+                    )
+                    if not held_pin.ok or held_pin.bundle is None:
+                        raise
+                    prepared = _prepare_held_day0_fallback(
+                        pinned_bundle=held_pin.bundle,
+                    )
+                    if day0_payload_out is not None:
+                        day0_payload_out[
+                            "_edli_day0_held_pinned_fallback_reason"
+                        ] = "current_remaining_vectors_unavailable"
+                    return prepared
                 probability_authority = (
                     "day0_remaining_day_global_probability_v1"
                 )
