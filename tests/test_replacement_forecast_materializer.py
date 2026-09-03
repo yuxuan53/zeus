@@ -2084,11 +2084,12 @@ def test_materializer_hko_provisional_observation_does_not_truncate_support(
     q = json.loads(row["q_json"])
     q_lcb = json.loads(row["q_lcb_json"])
     provenance = json.loads(row["provenance_json"])
-    # The revision-aware remaining path can collapse an implausible tail below
-    # the executable floor without pretending the provisional HKO boundary is
-    # deterministic settlement truth.
-    assert q["target24"] < 0.05
-    assert q["25plus"] > 0.9
+    # HKO's oracle-truncate contract gives the 24C bin the physical preimage
+    # [24, 25), not WMO's [23.5, 24.5). The noisy 25.2C remaining member must
+    # therefore retain material 24C mass without treating the provisional
+    # 25.7C boundary as deterministic settlement truth.
+    assert 0.1 < q["target24"] < 0.25
+    assert q["25plus"] > 0.7
     assert q_lcb["target24"] >= 0.0
     assert provenance["day0_provisional_observation"]["support_truncation"] is False
     assert provenance["q_shape"] == "day0_remaining_shared_carrier_v1"

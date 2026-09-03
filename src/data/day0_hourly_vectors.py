@@ -54,6 +54,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 
+from src.contracts.settlement_semantics import SettlementSemantics
 from src.data.openmeteo_quota import quota_tracker
 
 logger = logging.getLogger(__name__)
@@ -483,6 +484,7 @@ def build_day0_remaining_probability_carrier(
     metric: str, path_error_sigma_c: float, instrument_sigma_c: float,
     bin_bounds_c: Iterable[tuple[float | None, float | None]], n_point: int,
     n_samples: int, identity_inputs: Mapping[str, object],
+    settlement_semantics: SettlementSemantics,
 ) -> dict[str, object]:
     """Pure ``extreme(boundary, noisy future)`` carrier for both Day0 readers.
 
@@ -506,6 +508,8 @@ def build_day0_remaining_probability_carrier(
     unit = str(identity_inputs.get("unit") or "").strip().upper()
     if unit not in {"C", "F"}:
         raise ValueError("DAY0_REMAINING_CARRIER_UNIT_INVALID")
+    if settlement_semantics.measurement_unit != unit:
+        raise ValueError("DAY0_REMAINING_CARRIER_SETTLEMENT_UNIT_MISMATCH")
     if any(
         (low is not None and not math.isclose(low, round(low), abs_tol=1e-9))
         or (high is not None and not math.isclose(high, round(high), abs_tol=1e-9))
@@ -542,9 +546,16 @@ def build_day0_remaining_probability_carrier(
         for key, value in identity_inputs.items()
         if key not in {"decision_time_utc", "probability_cutoff_utc"}
     }
-    content = {"v": 2, "metric": metric, "future": sorted(values.tolist()), "scenarios": scenarios,
+    content = {"v": 3, "metric": metric, "future": sorted(values.tolist()), "scenarios": scenarios,
                "path_sigma": path_error_sigma_c, "instrument_sigma": instrument_sigma_c,
-               "bins": bounds, "n_point": n_point, "n_samples": n_samples, "inputs": economic_identity_inputs}
+               "bins": bounds, "n_point": n_point, "n_samples": n_samples,
+               "settlement_semantics": {
+                   "resolution_source": settlement_semantics.resolution_source,
+                   "measurement_unit": settlement_semantics.measurement_unit,
+                   "precision": settlement_semantics.precision,
+                   "rounding_rule": settlement_semantics.rounding_rule,
+               },
+               "inputs": economic_identity_inputs}
     identity = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
     sigma = math.hypot(path_error_sigma_c, instrument_sigma_c)
     def draw(rows: int, seed: int) -> np.ndarray:
@@ -563,7 +574,7 @@ def build_day0_remaining_probability_carrier(
             else np.minimum(future, boundary)
         )
         final = np.where(has_boundary, bounded, future)
-        settled = np.floor(final + 0.5)
+        settled = settlement_semantics.round_values(final)
         out = np.empty((rows, len(bounds)), dtype=float)
         for i, (low, high) in enumerate(bounds):
             mask = np.ones(settled.shape, dtype=bool)

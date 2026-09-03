@@ -1327,6 +1327,7 @@ def _day0_noaa_preliminary_carrier(
     if future_members_c is None or len(future_members_c) == 0:
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_FUTURE_MEMBERS_MISSING")
     from src.config import runtime_cities_by_name
+    from src.contracts.settlement_semantics import SettlementSemantics
     from src.data.day0_hourly_vectors import (
         build_day0_remaining_probability_carrier,
         day0_remaining_carrier_identity_inputs,
@@ -1474,6 +1475,7 @@ def _day0_noaa_preliminary_carrier(
             station_id=station,
             preliminary_survival_identity=str(likelihood["identity_hash"]),
         ),
+        settlement_semantics=SettlementSemantics.for_city(city),
     )
     return carrier, likelihood
 

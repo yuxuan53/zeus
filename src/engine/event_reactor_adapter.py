@@ -43645,6 +43645,7 @@ def _day0_remaining_p_raw_vector(
                 station_id=configured_station,
                 preliminary_survival_identity=likelihood_identity,
             ),
+            settlement_semantics=settlement_semantics,
         )
         expected_identity = str(payload["_edli_day0_remaining_content_identity"]).strip()
         if expected_identity != str(carrier["content_identity"]):
@@ -44935,6 +44936,7 @@ def _rebuild_decision_time_day0_carrier(
             station_id=configured_station,
             preliminary_survival_identity=likelihood_identity,
         ),
+        settlement_semantics=SettlementSemantics.for_city(city),
     )
     payload.update(
         {

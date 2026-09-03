@@ -38,7 +38,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pytest
 
+from src.config import runtime_cities_by_name
 from src.contracts.execution_price import ExecutionPrice as EP
+from src.contracts.settlement_semantics import SettlementSemantics
 from src.data.day0_hourly_vectors import (
     build_day0_causal_evidence_bundle,
     Day0HourlyVector,
@@ -56,6 +58,10 @@ from src.data.day0_hourly_vectors import (
 from src.types.market import Bin
 
 UTC = timezone.utc
+
+
+def _settlement_semantics(city: str) -> SettlementSemantics:
+    return SettlementSemantics.for_city(runtime_cities_by_name()[city])
 
 # Pin the retention-prune clock so this suite is HERMETIC. The persisted-vector
 # fixtures use fixed captured_at timestamps on the 2026-06-10 target day; the
@@ -131,6 +137,7 @@ def test_shared_remaining_carrier_has_coherent_500_rows_and_identity(metric):
         n_point=1000,
         n_samples=500,
         identity_inputs={"city": "Tel Aviv", "unit": "C", "prior": "same_station_preliminary_report_survival_likelihood_v1"},
+        settlement_semantics=_settlement_semantics("Tel Aviv"),
     )
     assert carrier["sample_count"] == 500
     assert len(carrier["samples"]) == 500
@@ -146,6 +153,7 @@ def test_shared_remaining_carrier_has_coherent_500_rows_and_identity(metric):
         n_point=1000,
         n_samples=500,
         identity_inputs={"city": "Tel Aviv", "unit": "C", "prior": "same_station_preliminary_report_survival_likelihood_v1"},
+        settlement_semantics=_settlement_semantics("Tel Aviv"),
     )["content_identity"]
 
 
@@ -173,6 +181,7 @@ def test_remaining_carrier_decision_clock_is_provenance_not_probability_content(
     first = build_day0_remaining_probability_carrier(
         **common,
         identity_inputs=identity,
+        settlement_semantics=_settlement_semantics("Istanbul"),
     )
     later = build_day0_remaining_probability_carrier(
         **common,
@@ -181,6 +190,7 @@ def test_remaining_carrier_decision_clock_is_provenance_not_probability_content(
             "decision_time_utc": "2026-09-02T08:45:13+00:00",
             "probability_cutoff_utc": "2026-09-02T08:45:13+00:00",
         },
+        settlement_semantics=_settlement_semantics("Istanbul"),
     )
     changed_source = build_day0_remaining_probability_carrier(
         **common,
@@ -188,6 +198,7 @@ def test_remaining_carrier_decision_clock_is_provenance_not_probability_content(
             **identity,
             "preliminary_survival_identity": "likelihood-2",
         },
+        settlement_semantics=_settlement_semantics("Istanbul"),
     )
 
     assert later["content_identity"] == first["content_identity"]
@@ -217,6 +228,7 @@ def test_shared_remaining_carrier_rejects_invalid_settlement_topology(identity, 
             n_point=10,
             n_samples=500,
             identity_inputs=identity,
+            settlement_semantics=_settlement_semantics("Tel Aviv"),
         )
 
 
@@ -233,6 +245,7 @@ def test_shared_remaining_carrier_accepts_valid_market_order_and_preserves_align
         n_point=10,
         n_samples=5,
         identity_inputs={"city": "Tel Aviv", "unit": "C"},
+        settlement_semantics=_settlement_semantics("Tel Aviv"),
     )
 
     assert carrier["q"] == pytest.approx([1.0 / 3.0, 2.0 / 3.0, 0.0])
@@ -240,6 +253,34 @@ def test_shared_remaining_carrier_accepts_valid_market_order_and_preserves_align
         row == pytest.approx([1.0 / 3.0, 2.0 / 3.0, 0.0])
         for row in carrier["samples"]
     )
+
+
+def test_shared_remaining_carrier_uses_hko_oracle_truncation() -> None:
+    common = {
+        "future_extremes_c": [25.9],
+        "boundary_scenarios": ((25.9, 1.0),),
+        "metric": "low",
+        "path_error_sigma_c": 0.0,
+        "instrument_sigma_c": 0.0,
+        "bin_bounds_c": [(None, 24), (25, 25), (26, None)],
+        "n_point": 10,
+        "n_samples": 5,
+    }
+
+    hko = build_day0_remaining_probability_carrier(
+        **common,
+        identity_inputs={"city": "Hong Kong", "unit": "C"},
+        settlement_semantics=_settlement_semantics("Hong Kong"),
+    )
+    wmo = build_day0_remaining_probability_carrier(
+        **common,
+        identity_inputs={"city": "Tel Aviv", "unit": "C"},
+        settlement_semantics=_settlement_semantics("Tel Aviv"),
+    )
+
+    assert hko["q"] == pytest.approx([0.0, 1.0, 0.0])
+    assert wmo["q"] == pytest.approx([0.0, 0.0, 1.0])
+    assert hko["content_identity"] != wmo["content_identity"]
 
 
 def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
@@ -275,6 +316,7 @@ def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
                 station_id="LLBG",
                 preliminary_survival_identity="priorhash",
             ),
+            settlement_semantics=_settlement_semantics("Tel Aviv"),
         )
         payload = {
             "metric": "high",
@@ -1563,6 +1605,7 @@ def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units(
                 station_id="KATL",
                 preliminary_survival_identity="priorhash-f",
             ),
+            settlement_semantics=_settlement_semantics("Atlanta"),
         )
         payload = {
             "metric": "high",
