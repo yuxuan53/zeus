@@ -1311,31 +1311,44 @@ def _causal_market_velocity_1h(
         return None
 
 
-def _causal_deep_market_catastrophe_confirmations(
+def _causal_deep_market_catastrophe_evidence(
     conn: sqlite3.Connection | None,
     *,
     token_id: str,
     current_bid: float,
     observed_at: str | None,
-) -> int:
-    """Count consecutive causal deep-collapse quotes ending at ``observed_at``.
+) -> tuple[float | None, int]:
+    """Return one coherent velocity/confirmation catastrophe witness.
 
     Held positions are reconstructed from canonical DB truth on every monitor
     claim, so an in-memory counter cannot prove persistence across claims.  This
-    derives the confirmation count from the persisted token-price timeline
-    instead.  The current quote is counted once; earlier samples must have a
-    distinct evidence timestamp, be strictly causal, and independently cross
-    the same deep one-hour velocity bound.
+    derives both values from the same persisted token-price timeline.  Computing
+    velocity and confirmations in separate reads can split on a tight monitor
+    deadline: confirmations may prove catastrophe while a failed velocity read
+    is converted to zero and suppresses the exit.  The current quote is counted
+    once; earlier samples must have a distinct evidence timestamp, be strictly
+    causal, and independently cross the same deep one-hour velocity bound.
     """
     if conn is None or not observed_at or not token_id:
-        return 0
+        return None, 0
     try:
         as_of = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
         if as_of.tzinfo is None:
             as_of = as_of.replace(tzinfo=timezone.utc)
         as_of = as_of.astimezone(timezone.utc)
         required = max(1, int(flash_crash_confirmations()))
-        samples: list[tuple[float, str]] = [(float(current_bid), as_of.isoformat())]
+        current_velocity = _causal_market_velocity_1h(
+            conn,
+            token_id=token_id,
+            current_bid=current_bid,
+            observed_at=as_of.isoformat(),
+        )
+        threshold = float(flash_crash_catastrophe_velocity())
+        if current_velocity is None or current_velocity > threshold:
+            return current_velocity, 0
+        if required == 1:
+            return current_velocity, 1
+
         confirmation_start = (
             as_of - timedelta(seconds=_FLASH_CRASH_CONFIRMATION_MAX_GAP_SECONDS)
         ).isoformat()
@@ -1368,6 +1381,7 @@ def _causal_deep_market_catastrophe_confirmations(
             ),
         ).fetchall()
         seen_times = {as_of.isoformat()}
+        samples: list[tuple[float, str]] = []
         for row in rows:
             evidence_at = str(row["evidence_at"] or "")
             if not evidence_at or evidence_at in seen_times:
@@ -1376,15 +1390,14 @@ def _causal_deep_market_catastrophe_confirmations(
             if row["bid"] is None:
                 continue
             samples.append((float(row["bid"]), evidence_at))
-            if len(samples) >= required:
+            if len(samples) >= required - 1:
                 break
 
         # SCOPE: this held token's market-path exit authority only. DRAIN: the
         # live quote channel appends another causal sample and the recurring
         # monitor re-evaluates it. RESET: no latch exists; every decision
         # recomputes this bounded window and a gap/recovery returns zero/one.
-        count = 0
-        threshold = float(flash_crash_catastrophe_velocity())
+        count = 1
         for price, sample_at in samples:
             velocity = _causal_market_velocity_1h(
                 conn,
@@ -1395,9 +1408,28 @@ def _causal_deep_market_catastrophe_confirmations(
             if velocity is None or velocity > threshold:
                 break
             count += 1
-        return count
+            if count >= required:
+                break
+        return current_velocity, count
     except (TypeError, ValueError, sqlite3.Error):
-        return 0
+        return None, 0
+
+
+def _causal_deep_market_catastrophe_confirmations(
+    conn: sqlite3.Connection | None,
+    *,
+    token_id: str,
+    current_bid: float,
+    observed_at: str | None,
+) -> int:
+    """Compatibility projection of the coherent catastrophe witness."""
+
+    return _causal_deep_market_catastrophe_evidence(
+        conn,
+        token_id=token_id,
+        current_bid=current_bid,
+        observed_at=observed_at,
+    )[1]
 
 
 def _model_only_native_posterior(p_native: float) -> float:
@@ -7362,13 +7394,10 @@ def refresh_position(
     # Try fetching 1h velocity if we know the token
     tid = pos.token_id if pos.direction == "buy_yes" else pos.no_token_id
     if tid:
-        market_velocity_1h = _causal_market_velocity_1h(
-            conn,
-            token_id=tid,
-            current_bid=pos.last_monitor_best_bid,
-            observed_at=getattr(quote, "source_timestamp", None),
-        )
-        pos.flash_crash_count = _causal_deep_market_catastrophe_confirmations(
+        (
+            market_velocity_1h,
+            pos.flash_crash_count,
+        ) = _causal_deep_market_catastrophe_evidence(
             conn,
             token_id=tid,
             current_bid=pos.last_monitor_best_bid,

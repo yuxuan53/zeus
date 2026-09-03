@@ -22,6 +22,7 @@ import pytest
 from src.contracts.edge_context import EdgeContext
 from src.contracts.semantic_types import EntryMethod
 from src.engine.monitor_refresh import (
+    _causal_deep_market_catastrophe_evidence,
     _causal_deep_market_catastrophe_confirmations,
     _causal_market_velocity_1h,
 )
@@ -338,6 +339,32 @@ def test_causal_deep_catastrophe_confirmation_survives_position_reload():
     )
 
     assert count == flash_crash_confirmations()
+
+
+def test_causal_catastrophe_velocity_and_confirmations_share_one_witness():
+    """A proven confirmation cannot coexist with a missing/zero velocity."""
+
+    conn = _price_log_connection()
+    conn.executemany(
+        """
+        INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+        VALUES ('held', ?, ?, ?, ?)
+        """,
+        [
+            (0.25, 0.25, "2026-09-03T09:25:10+00:00", "2026-09-03T09:25:10+00:00"),
+            (0.10, 0.10, "2026-09-03T10:24:38+00:00", "2026-09-03T10:24:38+00:00"),
+        ],
+    )
+
+    velocity, confirmations = _causal_deep_market_catastrophe_evidence(
+        conn,
+        token_id="held",
+        current_bid=0.11,
+        observed_at="2026-09-03T10:25:19+00:00",
+    )
+
+    assert velocity == pytest.approx(-0.56)
+    assert confirmations == flash_crash_confirmations()
 
 
 def test_causal_deep_catastrophe_confirmation_stops_at_recovery():
