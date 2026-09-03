@@ -4448,6 +4448,97 @@ class TestRemainingDayMembers:
             "raw_model_forecast_id"
         ] == 11
 
+    def test_hko_low_provisional_rounding_does_not_preclamp_station_final_extreme(
+        self, monkeypatch
+    ):
+        """The survival mixture, not rounded_value, owns HKO FND revision risk."""
+        import src.engine.event_reactor_adapter as era
+
+        times = tuple(f"2026-09-03T{hour:02d}:00" for hour in range(24))
+        vectors = [
+            Day0HourlyVector(
+                model=model,
+                city="Hong Kong",
+                target_date="2026-09-03",
+                timezone_name="Asia/Hong_Kong",
+                captured_at="2026-09-03T05:20:00+00:00",
+                times=times,
+                temps_c=tuple(value for _ in times),
+            )
+            for model, value in (("ecmwf_ifs", 30.0), ("icon_global", 31.0))
+        ]
+        monkeypatch.setattr(
+            era,
+            "runtime_cities_by_name",
+            lambda: {
+                "Hong Kong": SimpleNamespace(
+                    name="Hong Kong",
+                    timezone="Asia/Hong_Kong",
+                    settlement_unit="C",
+                    settlement_source_type="hko",
+                )
+            },
+        )
+        monkeypatch.setattr(
+            "src.data.day0_hourly_vectors.day0_hourly_models_for_city",
+            lambda _city: ("ecmwf_ifs", "icon_global"),
+        )
+        monkeypatch.setattr(
+            "src.data.day0_hourly_vectors.read_freshest_day0_hourly_vectors",
+            lambda **_kwargs: vectors,
+        )
+        monkeypatch.setattr(
+            era,
+            "_day0_current_vector_witness",
+            lambda **_kwargs: {
+                "vector_id": "current-vector",
+                "vector_ids_by_model": {
+                    "ecmwf_ifs": "ecmwf-vector",
+                    "icon_global": "icon-vector",
+                },
+            },
+        )
+        monkeypatch.setattr(
+            era,
+            "_validate_day0_causal_bundle_successor",
+            lambda **kwargs: {
+                "carrier_vector_witness": kwargs["vector_witness"]
+            },
+        )
+        monkeypatch.setattr(
+            era,
+            "_pinned_station_extreme_providers_c",
+            lambda **_kwargs: (
+                {
+                    "model": "hko_fnd",
+                    "raw_model_forecast_id": 806554,
+                    "forecast_value_c": 26.0,
+                    "posterior_id": 499950,
+                },
+            ),
+        )
+        payload = {
+            "metric": "low",
+            "rounded_value": 25.0,
+            "low_so_far": 25.9,
+            "settlement_source": "hko_hourly_accumulator",
+            "observation_time": "2026-09-03T05:00:00+00:00",
+        }
+
+        members = era._day0_remaining_day_members(
+            payload=payload,
+            family=SimpleNamespace(
+                city="Hong Kong", target_date="2026-09-03", metric="low"
+            ),
+            unit="C",
+            decision_time=datetime(2026, 9, 3, 5, 30, tzinfo=UTC),
+            forecast_conn=object(),
+        )
+
+        assert members is not None
+        assert members.tolist() == [30.0, 31.0, 26.0]
+        assert "_edli_day0_probability_boundary_native" not in payload
+
     def test_current_vector_witness_mismatch_blocks_before_carrier_rebuild(
         self, monkeypatch, caplog
     ):

@@ -46218,7 +46218,35 @@ def _day0_remaining_day_members(
             represented_models=provider_models,
         )
         if station_extremes:
-            boundary_native = _day0_probability_boundary_native(payload, metric)
+            # A pinned station provider is already a forecast of the FINAL
+            # daily extreme.  Only a separately typed statistical physical
+            # boundary may constrain that forecast center here.  Falling back
+            # to ``rounded_value`` would apply a provisional settlement-view
+            # boundary before the carrier's survival mixture, erasing the
+            # no-survival branch (HKO LOW 26C -> 25C) and making held q diverge
+            # from the materialized source-clock carrier.
+            explicit_boundary_native = _optional_float(
+                payload.get("_edli_day0_probability_boundary_native")
+            )
+            resolved_boundary_native = (
+                _day0_probability_boundary_native(payload, metric)
+                if explicit_boundary_native is not None
+                else None
+            )
+            boundary_native = (
+                resolved_boundary_native
+                if (
+                    explicit_boundary_native is not None
+                    and resolved_boundary_native is not None
+                    and math.isclose(
+                        resolved_boundary_native,
+                        explicit_boundary_native,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                )
+                else None
+            )
             boundary_c = (
                 boundary_native
                 if boundary_native is None or str(unit).upper() == "C"
