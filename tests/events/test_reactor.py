@@ -4842,6 +4842,49 @@ def test_reactor_wake_priority_quadrants_keep_fresh_material_ahead_of_generic(
     assert selected == generic
 
 
+def test_family_scoped_completion_cannot_starve_behind_continuous_material(tmp_path):
+    """A held-family preparation cut rereads current q/book after selection."""
+
+    from src.runtime import reactor_wake
+
+    path = tmp_path / "wake.json"
+    family_completion = reactor_wake.publish_reactor_wake(
+        source="held_position_monitor",
+        reason=reactor_wake.GLOBAL_AUCTION_COMPLETION_WAKE_REASON,
+        path=path,
+        wake_id="held-family-preparation",
+        published_at=datetime(2026, 9, 2, 10, 25, tzinfo=timezone.utc),
+        forecast_families=(("Istanbul", "2026-09-02", "high"),),
+    )
+    reactor_wake.publish_reactor_wake(
+        source="price",
+        reason="market_price_advanced",
+        path=path,
+        wake_id="price-newer",
+        published_at=datetime(2026, 9, 2, 10, 25, 1, tzinfo=timezone.utc),
+    )
+    reactor_wake.publish_reactor_wake(
+        source="forecast",
+        reason="forecast_posterior_advanced",
+        path=path,
+        wake_id="forecast-newest",
+        published_at=datetime(2026, 9, 2, 10, 25, 2, tzinfo=timezone.utc),
+        forecast_families=(("Paris", "2026-09-02", "high"),),
+    )
+
+    assert reactor_wake.read_reactor_wake(path=path) == family_completion
+
+    fill = reactor_wake.publish_reactor_wake(
+        source="fill",
+        reason="position_fill_projected",
+        path=path,
+        wake_id="fill-capital-first",
+        published_at=datetime(2026, 9, 2, 10, 25, 3, tzinfo=timezone.utc),
+        event_ids=("fill-event",),
+    )
+    assert reactor_wake.read_reactor_wake(path=path) == fill
+
+
 def test_paused_forecast_carrier_priority_preserves_fill_and_exact_held_priority(tmp_path):
     """The paused carrier preference cannot outrank capital-at-risk wakes."""
 

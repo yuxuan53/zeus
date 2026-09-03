@@ -1164,9 +1164,10 @@ def read_reactor_wake(
     streams cannot starve capital already at risk. A confirmed fill changes the
     actual portfolio endowment. Fill, price, and probability are otherwise
     joint material inputs; their oldest unconsumed input gets one turn, so no
-    continuous stream can starve another. A generic auction-completion marker
-    follows those material inputs: without an exact held-SELL request, it must
-    not delay fresh executable evidence.
+    continuous stream can starve another. A family-scoped auction-completion
+    marker is unfinished held-capital preparation: after a confirmed fill it
+    precedes continuous price/forecast streams because its cut rebinds both.
+    A truly unscoped periodic fairness marker still follows material inputs.
     Forecast hints carry incremental family scopes; selecting the newest hint
     does not lose older scopes because same-reason wakes are coalesced and
     acknowledgement remains exact.
@@ -1269,6 +1270,28 @@ def read_reactor_wake(
             and wake.held_sell_reauction_requests
         ):
             return wake
+    family_completion = next(
+        (
+            wake
+            for _queue_file, wake in queued
+            if (
+                wake.reason == GLOBAL_AUCTION_COMPLETION_WAKE_REASON
+                and not wake.held_sell_reauction_requests
+                and bool(wake.forecast_families)
+            )
+        ),
+        None,
+    )
+    if family_completion is not None:
+        # SCOPE: one generic marker naming a concrete held family whose SELL
+        # still needs a complete global cut. DRAIN: first absorb any confirmed
+        # fill, then select this marker ahead of continuously arriving
+        # price/forecast hints; the cut rereads their latest durable truth.
+        # RESET: only a completed family preparation/cut acknowledges it.
+        for _queue_file, wake in queued:
+            if wake.reason == "position_fill_projected":
+                return wake
+        return family_completion
     for _queue_file, wake in queued:
         if wake.reason == "position_fill_projected":
             return wake
