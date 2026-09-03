@@ -2307,3 +2307,174 @@ def test_price_wake_dispatches_held_monitor_before_reactor(monkeypatch, tmp_path
         assert dispatched == ["market_price_advanced"]
     finally:
         main._forecast_exit_monitor_attempts.clear()
+
+
+def test_degraded_price_wake_retires_hint_after_held_monitor(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Non-GREEN BUY debt stays durable without replaying one monitor hint forever."""
+
+    from src.riskguard import riskguard
+    from src.riskguard.risk_level import RiskLevel
+
+    wake_path = tmp_path / reactor_wake.REACTOR_WAKE_FILENAME
+    family = ("Paris", "2026-07-30", "low")
+    monkeypatch.setattr(
+        "src.config.state_path",
+        lambda filename: tmp_path / filename,
+    )
+    monkeypatch.setattr(main, "_defer_for_held_position_monitor", lambda _job: False)
+    monkeypatch.setattr(main, "_exit_monitor_excluded_wake_ids", lambda: frozenset())
+    monkeypatch.setattr(
+        main,
+        "_price_wake_target_families",
+        lambda _event_ids: frozenset({family}),
+    )
+    monkeypatch.setattr(
+        main,
+        "_forecast_wake_held_families",
+        lambda _families: frozenset({family}),
+    )
+    monkeypatch.setattr(
+        main,
+        "_reactor_wake_event_state",
+        lambda _event_ids: main._ReactorWakeEventState(
+            ready=True,
+            finished=False,
+        ),
+    )
+    monkeypatch.setattr(main, "_reactor_wake_events_finished", lambda _ids: False)
+    monkeypatch.setattr(riskguard, "get_current_level", lambda: RiskLevel.DATA_DEGRADED)
+    monkeypatch.setattr(main, "_edli_event_reactor_cycle", lambda **_kwargs: True)
+    main._edli_initialize_reactor_wake_cursor()
+    main._forecast_exit_monitor_attempts.clear()
+
+    def _dispatch(wake_ids, _target_families, *, urgent_price=False):
+        assert urgent_price is True
+        with main._forecast_exit_monitor_attempts_lock:
+            for wake_id in wake_ids:
+                main._forecast_exit_monitor_attempts[wake_id] = True
+        return True
+
+    monkeypatch.setattr(main, "_dispatch_forecast_exit_monitor", _dispatch)
+    wake = reactor_wake.publish_reactor_wake(
+        source="price_channel",
+        reason="market_price_advanced",
+        path=wake_path,
+        wake_id="wake-price-degraded",
+        event_ids=("durable-price-event",),
+    )
+
+    try:
+        assert main._edli_reactor_wake_poll_once() is True
+        assert not reactor_wake._wake_queue_target(wake, path=wake_path).exists()
+        assert main._edli_reactor_wake_poll_once() is False
+    finally:
+        main._forecast_exit_monitor_attempts.clear()
+
+
+def test_green_price_wake_keeps_hint_until_entry_event_finishes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Normal BUY-capable operation retains the exact event-completion fence."""
+
+    from src.riskguard import riskguard
+    from src.riskguard.risk_level import RiskLevel
+
+    wake_path = tmp_path / reactor_wake.REACTOR_WAKE_FILENAME
+    monkeypatch.setattr(
+        "src.config.state_path",
+        lambda filename: tmp_path / filename,
+    )
+    monkeypatch.setattr(main, "_defer_for_held_position_monitor", lambda _job: False)
+    monkeypatch.setattr(main, "_exit_monitor_excluded_wake_ids", lambda: frozenset())
+    monkeypatch.setattr(
+        main,
+        "_price_wake_target_families",
+        lambda _event_ids: frozenset({("Paris", "2026-07-30", "low")}),
+    )
+    monkeypatch.setattr(
+        main,
+        "_forecast_wake_held_families",
+        lambda _families: frozenset(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_reactor_wake_event_state",
+        lambda _event_ids: main._ReactorWakeEventState(
+            ready=True,
+            finished=False,
+        ),
+    )
+    monkeypatch.setattr(main, "_reactor_wake_events_finished", lambda _ids: False)
+    monkeypatch.setattr(riskguard, "get_current_level", lambda: RiskLevel.GREEN)
+    monkeypatch.setattr(main, "_edli_event_reactor_cycle", lambda **_kwargs: True)
+    main._edli_initialize_reactor_wake_cursor()
+    wake = reactor_wake.publish_reactor_wake(
+        source="price_channel",
+        reason="market_price_advanced",
+        path=wake_path,
+        wake_id="wake-price-green",
+        event_ids=("unfinished-price-event",),
+    )
+
+    assert main._edli_reactor_wake_poll_once() is False
+    assert reactor_wake._wake_queue_target(wake, path=wake_path).exists()
+
+
+def test_degraded_day0_wake_retires_hint_after_held_monitor(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A completed hard-fact monitor must not replay behind blocked BUY work."""
+
+    from src.riskguard import riskguard
+    from src.riskguard.risk_level import RiskLevel
+
+    wake_path = tmp_path / reactor_wake.REACTOR_WAKE_FILENAME
+    family = ("Paris", "2026-07-30", "high")
+    monkeypatch.setattr(
+        "src.config.state_path",
+        lambda filename: tmp_path / filename,
+    )
+    monkeypatch.setattr(main, "_defer_for_held_position_monitor", lambda _job: False)
+    monkeypatch.setattr(main, "_exit_monitor_excluded_wake_ids", lambda: frozenset())
+    monkeypatch.setattr(main, "_day0_wake_requires_exit_monitor", lambda _scope: True)
+    monkeypatch.setattr(
+        main,
+        "_reactor_wake_event_state",
+        lambda _event_ids: main._ReactorWakeEventState(
+            ready=True,
+            finished=False,
+        ),
+    )
+    monkeypatch.setattr(main, "_reactor_wake_events_finished", lambda _ids: False)
+    monkeypatch.setattr(riskguard, "get_current_level", lambda: RiskLevel.YELLOW)
+    monkeypatch.setattr(main, "_edli_event_reactor_cycle", lambda **_kwargs: True)
+    main._edli_initialize_reactor_wake_cursor()
+    main._day0_exit_monitor_attempts.clear()
+
+    def _dispatch(wake_id, target_families):
+        assert target_families == frozenset({family})
+        with main._day0_exit_monitor_attempts_lock:
+            main._day0_exit_monitor_attempts[wake_id] = True
+        return True
+
+    monkeypatch.setattr(main, "_dispatch_day0_exit_monitor", _dispatch)
+    wake = reactor_wake.publish_reactor_wake(
+        source="day0",
+        reason="day0_extreme_event_committed",
+        path=wake_path,
+        wake_id="wake-day0-degraded",
+        event_ids=("durable-day0-event",),
+        forecast_families=(family,),
+    )
+
+    try:
+        assert main._edli_reactor_wake_poll_once() is True
+        assert not reactor_wake._wake_queue_target(wake, path=wake_path).exists()
+        assert main._edli_reactor_wake_poll_once() is False
+    finally:
+        main._day0_exit_monitor_attempts.clear()

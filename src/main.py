@@ -7289,11 +7289,62 @@ def _edli_reactor_wake_poll_once() -> bool:
         )
         return False
     if wake_event_ids and not _reactor_wake_events_finished(wake_event_ids):
-        _yield_incomplete_day0_after_monitor_once(
-            wake,
-            monitor_succeeded=day0_monitor_succeeded,
+        # A producer wake is a latency hint, not the durable entry obligation.
+        # Under non-GREEN risk, the reactor intentionally leaves BUY events in
+        # ``opportunity_event_processing`` for a later GREEN cut.  Once this
+        # wake's held-capital monitor obligation has completed, retaining the
+        # same hint cannot advance that durable entry work; it only re-runs the
+        # same monitor and starves newer price/Day0 facts.
+        #
+        # SCOPE: only price/Day0 hints whose exact held-monitor obligation is
+        # complete while RiskGuard currently blocks BUY. DRAIN: acknowledge
+        # those non-authoritative queue files; their canonical event rows stay
+        # pending for the ordinary reactor. RESET: GREEN risk restores the
+        # existing event-finished-before-ack rule, and every new producer fact
+        # has a new wake identity.
+        monitor_obligation_complete = (
+            day0_wake and day0_monitor_succeeded
+        ) or (
+            price_wake
+            and (
+                not forecast_monitor_families
+                or _forecast_exit_monitor_attempt_state(wake.wake_id)[1] is True
+            )
         )
-        return False
+        entry_risk_blocked = False
+        if monitor_obligation_complete:
+            try:
+                from src.riskguard.risk_level import RiskLevel
+                from src.riskguard.riskguard import get_current_level
+
+                entry_risk_blocked = get_current_level() is not RiskLevel.GREEN
+            except Exception:
+                logger.warning(
+                    "RiskGuard unreadable while separating serviced monitor "
+                    "hint from durable BUY debt; retaining wake",
+                    exc_info=True,
+                )
+        if not (monitor_obligation_complete and entry_risk_blocked):
+            _yield_incomplete_day0_after_monitor_once(
+                wake,
+                monitor_succeeded=day0_monitor_succeeded,
+            )
+            return False
+        if not _acknowledge_edli_reactor_wake_batch(
+            wake,
+            wakes,
+            day0_wake=day0_wake,
+            forecast_monitor_wake=bool(forecast_monitor_families),
+        ):
+            return False
+        logger.info(
+            "EDLI reactor retired serviced %s monitor hint while BUY events "
+            "remain durable under non-GREEN risk: wake=%s events=%d",
+            wake.reason,
+            wake.wake_id,
+            len(wake_event_ids),
+        )
+        return True
     if held_sell_reauction_requests and not held_sell_reauction_requests_completed(
         held_sell_reauction_requests
     ):
