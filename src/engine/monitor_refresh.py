@@ -1212,10 +1212,10 @@ def _causal_market_velocity_1h(
     conn: sqlite3.Connection | None,
     *,
     token_id: str,
-    current_price: float,
+    current_bid: float,
     observed_at: str | None,
 ) -> float | None:
-    """Return causal fractional drawdown from a bounded recent reference.
+    """Return held-side executable-bid drawdown from a causal reference.
 
     Prefer the latest quote from one-to-two hours ago so established positions
     retain a stable one-hour comparison.  A newly held token has no such row;
@@ -1234,7 +1234,7 @@ def _causal_market_velocity_1h(
         oldest_baseline = (as_of - timedelta(hours=2)).isoformat()
         row = conn.execute(
             """
-            SELECT price
+            SELECT bid
               FROM token_price_log
              WHERE token_id = ?
                AND COALESCE(
@@ -1257,7 +1257,7 @@ def _causal_market_velocity_1h(
         if row is None:
             row = conn.execute(
                 """
-                SELECT MAX(price) AS price
+                SELECT MAX(bid) AS bid
                   FROM token_price_log
                  WHERE token_id = ?
                    AND COALESCE(
@@ -1271,10 +1271,12 @@ def _causal_market_velocity_1h(
                 """,
                 (str(token_id), cutoff, as_of.isoformat()),
             ).fetchone()
-            if row is None or row["price"] is None:
+            if row is None or row["bid"] is None:
                 return None
-        old_price = float(row["price"])
-        now_price = float(current_price)
+        if row["bid"] is None:
+            return None
+        old_price = float(row["bid"])
+        now_price = float(current_bid)
         if (
             not (np.isfinite(old_price) and np.isfinite(now_price))
             or old_price <= 0.0
@@ -1290,7 +1292,7 @@ def _causal_deep_market_catastrophe_confirmations(
     conn: sqlite3.Connection | None,
     *,
     token_id: str,
-    current_price: float,
+    current_bid: float,
     observed_at: str | None,
 ) -> int:
     """Count consecutive causal deep-collapse quotes ending at ``observed_at``.
@@ -1310,13 +1312,13 @@ def _causal_deep_market_catastrophe_confirmations(
             as_of = as_of.replace(tzinfo=timezone.utc)
         as_of = as_of.astimezone(timezone.utc)
         required = max(1, int(flash_crash_confirmations()))
-        samples: list[tuple[float, str]] = [(float(current_price), as_of.isoformat())]
+        samples: list[tuple[float, str]] = [(float(current_bid), as_of.isoformat())]
         confirmation_start = (
             as_of - timedelta(seconds=_FLASH_CRASH_CONFIRMATION_MAX_GAP_SECONDS)
         ).isoformat()
         rows = conn.execute(
             """
-            SELECT price,
+            SELECT bid,
                    COALESCE(NULLIF(source_timestamp, ''), timestamp) AS evidence_at
               FROM token_price_log
              WHERE token_id = ?
@@ -1348,7 +1350,9 @@ def _causal_deep_market_catastrophe_confirmations(
             if not evidence_at or evidence_at in seen_times:
                 continue
             seen_times.add(evidence_at)
-            samples.append((float(row["price"]), evidence_at))
+            if row["bid"] is None:
+                continue
+            samples.append((float(row["bid"]), evidence_at))
             if len(samples) >= required:
                 break
 
@@ -1362,7 +1366,7 @@ def _causal_deep_market_catastrophe_confirmations(
             velocity = _causal_market_velocity_1h(
                 conn,
                 token_id=token_id,
-                current_price=price,
+                current_bid=price,
                 observed_at=sample_at,
             )
             if velocity is None or velocity > threshold:
@@ -7338,13 +7342,13 @@ def refresh_position(
         market_velocity_1h = _causal_market_velocity_1h(
             conn,
             token_id=tid,
-            current_price=current_p_market,
+            current_bid=pos.last_monitor_best_bid,
             observed_at=getattr(quote, "source_timestamp", None),
         )
         pos.flash_crash_count = _causal_deep_market_catastrophe_confirmations(
             conn,
             token_id=tid,
-            current_price=current_p_market,
+            current_bid=pos.last_monitor_best_bid,
             observed_at=getattr(quote, "source_timestamp", None),
         )
     else:

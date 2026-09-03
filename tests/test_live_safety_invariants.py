@@ -1,8 +1,8 @@
 # Created: 2026-03-31
-# Lifecycle: created=2026-03-31; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Lifecycle: created=2026-03-31; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Purpose: Lock live-money safety invariants across fill, exit, chain, and P&L flows.
 # Reuse: Run for execution finality, live exit, chain reconciliation, and safety invariant changes.
-# Last reused/audited: 2026-08-31
+# Last reused/audited: 2026-09-03
 # Authority basis: held-monitor canonical append liveness and atomicity incidents
 """Live safety invariant tests: relationship tests, not function tests.
 
@@ -25468,17 +25468,17 @@ def test_market_velocity_uses_causal_source_time_not_legacy_text_order(tmp_path)
     conn.executemany(
         """
         INSERT INTO token_price_log
-            (token_id, price, source_timestamp, timestamp)
-        VALUES (?, ?, ?, ?)
+            (token_id, price, bid, source_timestamp, timestamp)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        rows,
+        tuple((token, price, price, source_at, written_at) for token, price, source_at, written_at in rows),
     )
     conn.commit()
 
     velocity = _causal_market_velocity_1h(
         conn,
         token_id="held-token",
-        current_price=0.20,
+        current_bid=0.20,
         observed_at="2026-08-10T12:00:00+00:00",
     )
 
@@ -25491,7 +25491,7 @@ def test_market_velocity_without_trade_db_is_non_authoritative():
     assert _causal_market_velocity_1h(
         None,
         token_id="held-token",
-        current_price=0.20,
+        current_bid=0.20,
         observed_at="2026-08-10T12:00:00+00:00",
     ) is None
 
@@ -25506,7 +25506,7 @@ def test_market_velocity_without_executable_quote_time_is_non_authoritative(tmp_
     assert _causal_market_velocity_1h(
         conn,
         token_id="closed-held-token",
-        current_price=float("nan"),
+        current_bid=float("nan"),
         observed_at=None,
     ) is None
 

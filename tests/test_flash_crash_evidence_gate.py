@@ -1,5 +1,5 @@
 # Created: 2026-06-02
-# Last reused/audited: 2026-09-01 (scale-free causal drawdown restoration)
+# Last reused/audited: 2026-09-03 (held executable-bid carrier restoration)
 # Authority basis: BUG#127 (守護 SEV1, GOAL#36 "a short price change is NOT edge reversal");
 #   src/state/portfolio.py flash_crash_should_fire + Position.evaluate_exit (single live site)
 # Purpose: Lock the evidence gate on FLASH_CRASH_PANIC so a bare single-cycle quote wiggle
@@ -284,6 +284,7 @@ def _price_log_connection() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY,
             token_id TEXT NOT NULL,
             price REAL NOT NULL,
+            bid REAL,
             source_timestamp TEXT,
             timestamp TEXT NOT NULL
         )
@@ -296,21 +297,21 @@ def test_causal_deep_catastrophe_confirmation_survives_position_reload():
     conn = _price_log_connection()
     conn.executemany(
         """
-        INSERT INTO token_price_log(token_id, price, source_timestamp, timestamp)
-        VALUES ('held', ?, ?, ?)
+        INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+        VALUES ('held', ?, ?, ?, ?)
         """,
         [
-            (0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
-            (0.15, "2026-08-29T01:00:00+00:00", "2026-08-29T01:00:00+00:00"),
+            (0.60, 0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
+            (0.15, 0.15, "2026-08-29T01:00:00+00:00", "2026-08-29T01:00:00+00:00"),
             # Future evidence must not confirm the current decision.
-            (0.90, "2026-08-29T01:03:00+00:00", "2026-08-29T01:03:00+00:00"),
+            (0.90, 0.90, "2026-08-29T01:03:00+00:00", "2026-08-29T01:03:00+00:00"),
         ],
     )
 
     count = _causal_deep_market_catastrophe_confirmations(
         conn,
         token_id="held",
-        current_price=0.10,
+        current_bid=0.10,
         observed_at="2026-08-29T01:02:00+00:00",
     )
 
@@ -321,19 +322,19 @@ def test_causal_deep_catastrophe_confirmation_stops_at_recovery():
     conn = _price_log_connection()
     conn.executemany(
         """
-        INSERT INTO token_price_log(token_id, price, source_timestamp, timestamp)
-        VALUES ('held', ?, ?, ?)
+        INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+        VALUES ('held', ?, ?, ?, ?)
         """,
         [
-            (0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
-            (0.40, "2026-08-29T01:00:00+00:00", "2026-08-29T01:00:00+00:00"),
+            (0.60, 0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
+            (0.40, 0.40, "2026-08-29T01:00:00+00:00", "2026-08-29T01:00:00+00:00"),
         ],
     )
 
     count = _causal_deep_market_catastrophe_confirmations(
         conn,
         token_id="held",
-        current_price=0.10,
+        current_bid=0.10,
         observed_at="2026-08-29T01:02:00+00:00",
     )
 
@@ -343,15 +344,15 @@ def test_causal_deep_catastrophe_confirmation_stops_at_recovery():
 def test_causal_market_velocity_refuses_ancient_baseline_bridge():
     conn = _price_log_connection()
     conn.execute(
-        """INSERT INTO token_price_log(token_id, price, source_timestamp, timestamp)
-           VALUES ('held', 0.90, '2025-08-01T00:00:00+00:00',
+        """INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+           VALUES ('held', 0.90, 0.90, '2025-08-01T00:00:00+00:00',
                    '2025-08-01T00:00:00+00:00')"""
     )
 
     velocity = _causal_market_velocity_1h(
         conn,
         token_id="held",
-        current_price=0.10,
+        current_bid=0.10,
         observed_at="2026-08-29T01:00:00+00:00",
     )
 
@@ -361,18 +362,18 @@ def test_causal_market_velocity_refuses_ancient_baseline_bridge():
 def test_causal_market_velocity_uses_recent_high_for_new_low_price_holding():
     conn = _price_log_connection()
     conn.executemany(
-        """INSERT INTO token_price_log(token_id, price, source_timestamp, timestamp)
-           VALUES ('held', ?, ?, ?)""",
+        """INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+           VALUES ('held', ?, ?, ?, ?)""",
         [
-            (0.10, "2026-09-01T05:03:00+00:00", "2026-09-01T05:03:00+00:00"),
-            (0.07, "2026-09-01T05:20:00+00:00", "2026-09-01T05:20:00+00:00"),
+            (0.10, 0.10, "2026-09-01T05:03:00+00:00", "2026-09-01T05:03:00+00:00"),
+            (0.07, 0.07, "2026-09-01T05:20:00+00:00", "2026-09-01T05:20:00+00:00"),
         ],
     )
 
     velocity = _causal_market_velocity_1h(
         conn,
         token_id="held",
-        current_price=0.06,
+        current_bid=0.06,
         observed_at="2026-09-01T05:22:00+00:00",
     )
 
@@ -382,23 +383,52 @@ def test_causal_market_velocity_uses_recent_high_for_new_low_price_holding():
 def test_causal_catastrophe_confirmation_refuses_quote_gap():
     conn = _price_log_connection()
     conn.executemany(
-        """INSERT INTO token_price_log(token_id, price, source_timestamp, timestamp)
-           VALUES ('held', ?, ?, ?)""",
+        """INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+           VALUES ('held', ?, ?, ?, ?)""",
         [
-            (0.90, "2026-08-28T23:30:00+00:00", "2026-08-28T23:30:00+00:00"),
-            (0.40, "2026-08-29T00:50:00+00:00", "2026-08-29T00:50:00+00:00"),
-            (0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
+            (0.90, 0.90, "2026-08-28T23:30:00+00:00", "2026-08-28T23:30:00+00:00"),
+            (0.40, 0.40, "2026-08-29T00:50:00+00:00", "2026-08-29T00:50:00+00:00"),
+            (0.60, 0.60, "2026-08-29T00:00:00+00:00", "2026-08-29T00:00:00+00:00"),
         ],
     )
 
     count = _causal_deep_market_catastrophe_confirmations(
         conn,
         token_id="held",
-        current_price=0.10,
+        current_bid=0.10,
         observed_at="2026-08-29T01:00:00+00:00",
     )
 
     assert count == 1
+
+
+def test_causal_catastrophe_uses_executable_bid_not_ask_sensitive_mark():
+    """Production shape: stable mark must not hide a 9c to 5c held-bid collapse."""
+    conn = _price_log_connection()
+    conn.executemany(
+        """INSERT INTO token_price_log(token_id, price, bid, source_timestamp, timestamp)
+           VALUES ('held', ?, ?, ?, ?)""",
+        [
+            (0.136869, 0.09, "2026-09-01T14:54:40+00:00", "2026-09-01T14:54:40+00:00"),
+            (0.116425, 0.05, "2026-09-01T15:54:45+00:00", "2026-09-01T15:54:45+00:00"),
+        ],
+    )
+
+    velocity = _causal_market_velocity_1h(
+        conn,
+        token_id="held",
+        current_bid=0.05,
+        observed_at="2026-09-01T15:54:50+00:00",
+    )
+    confirmations = _causal_deep_market_catastrophe_confirmations(
+        conn,
+        token_id="held",
+        current_bid=0.05,
+        observed_at="2026-09-01T15:54:50+00:00",
+    )
+
+    assert velocity == pytest.approx((0.05 / 0.09) - 1.0)
+    assert confirmations == flash_crash_confirmations()
 
 
 def test_flash_catastrophe_preserves_immediate_reduce_only_authority():
