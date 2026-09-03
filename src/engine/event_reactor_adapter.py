@@ -9022,6 +9022,9 @@ def event_bound_live_adapter_from_trade_conn(
                 decision_time=at,
             ) or event
             held_is_day0 = held_event.event_type == "DAY0_EXTREME_UPDATED"
+            held_is_forecast_lane = (
+                held_event.event_type in _FORECAST_DECISION_EVENT_TYPES
+            )
             family_key = ""
             cache_metadata: dict[str, str] = {}
             if is_forecast_lane or held_is_day0:
@@ -9068,8 +9071,8 @@ def event_bound_live_adapter_from_trade_conn(
                     observation_conn=calibration_conn,
                     decision_time=at,
                     max_age=FRESHNESS_WINDOW_DEFAULT,
-                    allow_unobserved_day0_replacement=not is_forecast_lane,
-                    allow_provisional_day0_replacement=not is_forecast_lane,
+                    allow_unobserved_day0_replacement=not held_is_forecast_lane,
+                    allow_provisional_day0_replacement=not held_is_forecast_lane,
                     probability_use=_CurrentProbabilityUse.HELD_MONITOR,
                     cache_metadata_out=cache_metadata,
                 )

@@ -11202,7 +11202,14 @@ def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
 
     def prepare(event, *_args, **kwargs):
         kwargs["cache_metadata_out"]["family_binding_hash"] = "day0-binding"
-        prepare_calls.append((event, kwargs["decision_time"]))
+        prepare_calls.append(
+            (
+                event,
+                kwargs["decision_time"],
+                kwargs["allow_unobserved_day0_replacement"],
+                kwargs["allow_provisional_day0_replacement"],
+            )
+        )
         return prepared
 
     monkeypatch.setattr(era, "_prepare_current_global_probability_family", prepare)
@@ -11220,11 +11227,18 @@ def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
     callbacks["prepare_held_event"](forecast_event, first)
     callbacks["prepare_held_event"](forecast_event, second)
 
-    assert [event.event_id for event, _at in prepare_calls] == [
+    assert [row[0].event_id for row in prepare_calls] == [
         day0_event.event_id,
         day0_event.event_id,
     ]
-    assert [at for _event, at in prepare_calls] == [first, second]
+    assert [at for _event, at, _unobserved, _provisional in prepare_calls] == [
+        first,
+        second,
+    ]
+    assert all(
+        unobserved and provisional
+        for _event, _at, unobserved, provisional in prepare_calls
+    )
 
 
 def test_latest_causal_day0_family_event_respects_all_three_clocks():
