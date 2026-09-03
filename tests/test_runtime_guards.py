@@ -1504,6 +1504,51 @@ def test_canonical_monitor_book_prefers_fresher_independent_commit(tmp_path):
     caller.close()
 
 
+def test_canonical_monitor_book_accepts_one_sided_held_exit_snapshot(tmp_path):
+    from src.engine import monitor_refresh
+    from src.state.snapshot_repo import init_snapshot_schema
+
+    conn = get_connection(tmp_path / "canonical-monitor-one-sided.db")
+    init_schema(conn)
+    init_schema_trade_only(conn)
+    init_snapshot_schema(conn)
+    now_utc = datetime.now(timezone.utc)
+    _insert_executable_snapshot(
+        conn,
+        snapshot_id="canonical-monitor-one-sided",
+        selected_outcome_token_id="yes123",
+        yes_token_id="yes123",
+        no_token_id="no456",
+        condition_id="cond-canonical-monitor-one-sided",
+        top_bid="0.94",
+        top_ask="0.95",
+        orderbook_depth={
+            "asset_id": "yes123",
+            "bids": [{"price": "0.94", "size": "10"}],
+            "asks": [],
+        },
+        captured_at=now_utc - timedelta(seconds=1),
+        active=False,
+        accepting_orders=True,
+        executable_allowed=False,
+    )
+    conn.commit()
+    pos = _position(condition_id="cond-canonical-monitor-one-sided")
+
+    hit = monitor_refresh._fresh_canonical_monitor_orderbook(
+        conn,
+        pos,
+        "yes123",
+        now_utc=now_utc,
+    )
+
+    assert hit is not None
+    book, _source_timestamp = hit
+    assert book["bids"][0]["price"] == "0.94"
+    assert book["asks"] == []
+    conn.close()
+
+
 def test_canonical_monitor_book_rejects_stale_invalidated_and_wrong_token(tmp_path):
     from src.engine import monitor_refresh
     from src.state.snapshot_repo import (
@@ -2216,6 +2261,27 @@ def test_held_monitor_evidence_rejects_non_open_or_non_accepting_snapshot(
         active=active,
         closed=closed,
         accepting_orders=accepting_orders,
+    )
+
+
+def test_held_monitor_accepts_one_sided_non_executable_snapshot_for_sell_truth():
+    from src.engine.monitor_refresh import _monitor_snapshot_has_held_exit_evidence
+
+    assert _monitor_snapshot_has_held_exit_evidence(
+        active=False,
+        closed=False,
+        accepting_orders=1,
+        tradeability_status_json=json.dumps(
+            {
+                "accepting_orders": True,
+                "child_active": False,
+                "child_closed": None,
+                "clob_archived": False,
+                "clob_enable_order_book": True,
+                "executable_allowed": False,
+                "reason": "clob_no_ask_illiquid",
+            }
+        ),
     )
 
 

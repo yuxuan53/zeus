@@ -1824,6 +1824,7 @@ def _current_quote_only_repair_snapshot_ids(
             "orderbook_top_bid",
             "captured_at",
             "freshness_deadline",
+            "tradeability_status_json",
         }.issubset(snapshot_columns):
             return ()
         rows = conn.execute(
@@ -1839,7 +1840,8 @@ def _current_quote_only_repair_snapshot_ids(
                    snapshot.accepting_orders,
                    snapshot.orderbook_top_bid,
                    snapshot.captured_at,
-                   snapshot.freshness_deadline
+                   snapshot.freshness_deadline,
+                   snapshot.tradeability_status_json
               FROM position_current AS pc
               LEFT JOIN executable_market_snapshot_latest AS snapshot
                 ON snapshot.condition_id = pc.condition_id
@@ -1870,12 +1872,25 @@ def _current_quote_only_repair_snapshot_ids(
             held_bid = float(row["orderbook_top_bid"])
         except (TypeError, ValueError):
             continue
+        held_exit_open = row["active"] == 1
+        if not held_exit_open:
+            try:
+                status = json.loads(str(row["tradeability_status_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                status = None
+            held_exit_open = bool(
+                isinstance(status, dict)
+                and status.get("accepting_orders") is True
+                and status.get("clob_enable_order_book") is True
+                and status.get("clob_archived") is not True
+                and status.get("child_closed") is not True
+            )
         if (
             position_id not in wanted
             or position_id in proven
             or not held_token_id
             or selected_token_id != held_token_id
-            or row["active"] != 1
+            or not held_exit_open
             or row["closed"] != 0
             or row["accepting_orders"] != 1
             or captured_at is None
@@ -1883,7 +1898,7 @@ def _current_quote_only_repair_snapshot_ids(
             or captured_at > now_utc
             or freshness_deadline < now_utc
             or not math.isfinite(held_bid)
-            or not 0.05 <= held_bid <= 0.95
+            or not 0.0 <= held_bid <= 1.0
         ):
             continue
         proven.add(position_id)

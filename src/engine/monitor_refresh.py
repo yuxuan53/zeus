@@ -791,7 +791,29 @@ def _monitor_snapshot_has_held_exit_evidence(
         tradeability_status_json=tradeability_status_json,
     ):
         return True
-    return bool(active) and not bool(closed) and accepting_orders == 1
+    if bool(closed) or accepting_orders != 1:
+        return False
+    try:
+        status = (
+            tradeability_status_json
+            if isinstance(tradeability_status_json, dict)
+            else json.loads(str(tradeability_status_json))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        status = None
+    if isinstance(status, dict):
+        # ``active`` is an entry/executability projection and becomes false for
+        # a one-sided book. Held SELL monitoring needs only proof that this CLOB
+        # still accepts orders and exposes its book; the held bid/depth is
+        # validated separately below and submit authority remains JIT-gated.
+        if (
+            status.get("accepting_orders") is True
+            and status.get("clob_enable_order_book") is True
+            and status.get("clob_archived") is not True
+            and status.get("child_closed") is not True
+        ):
+            return True
+    return bool(active)
 
 
 def _book_min_order_size(book: dict | None) -> float | None:
@@ -899,6 +921,7 @@ def _fresh_canonical_monitor_orderbook(
                         active=row[4],
                         closed=row[5],
                         accepting_orders=row[6],
+                        tradeability_status_json=row[9],
                     ):
                         continue
                     captured_at = datetime.fromisoformat(
