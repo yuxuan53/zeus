@@ -7750,7 +7750,7 @@ class TestRequestHashProvenance:
 
         assert [c.name for c in rotated] == ["Wellington", "Paris", "London"]
 
-    def test_scheduler_readiness_probe_owns_same_hard_cycle_budget(
+    def test_scheduler_readiness_probe_reserves_one_provider_fetch_tranche(
         self, monkeypatch
     ):
         import src.config as config_module
@@ -7774,7 +7774,7 @@ class TestRequestHashProvenance:
 
         def probe(**kwargs):
             captured["deadline_monotonic"] = kwargs["deadline_monotonic"]
-            clock["now"] = 16.0
+            clock["now"] = kwargs["deadline_monotonic"]
             return reactor._Day0HourlyPriorityProbe()
 
         monkeypatch.setattr(
@@ -7782,17 +7782,30 @@ class TestRequestHashProvenance:
             "_edli_day0_hourly_refresh_due_families",
             probe,
         )
+        def refresh(*_args, **kwargs):
+            captured["fetch_budget_s"] = kwargs["budget_s"]
+            captured["fetch_timeout_s"] = kwargs["timeout_s"]
+            return SimpleNamespace(
+                vectors_written=0,
+                cities_attempted=1,
+                cities_skipped_throttle=0,
+                cities_skipped_quota=0,
+                incomplete_expected_bundles=1,
+                priority_reserve_exhausted=False,
+                budget_exhausted=False,
+            )
+
         monkeypatch.setattr(
             vectors_module,
             "maybe_refresh_day0_hourly_vectors",
-            lambda *_args, **_kwargs: pytest.fail(
-                "provider fetch must not start after readiness exhausts the cycle budget"
-            ),
+            refresh,
         )
 
         reactor.run_edli_day0_hourly_refresh_cycle(trading_lane_active=True)
 
-        assert captured["deadline_monotonic"] == 16.0
+        assert captured["deadline_monotonic"] == 12.0
+        assert captured["fetch_budget_s"] == 4.0
+        assert captured["fetch_timeout_s"] == 4.0
 
     def test_scheduler_rotates_held_cities_without_demoting_them(self):
         from src.events import reactor

@@ -6224,12 +6224,25 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         decision_time = datetime.now(timezone.utc)
         refresh_budget_seconds = _day0_hourly_refresh_budget_seconds()
         refresh_deadline_monotonic = time.monotonic() + refresh_budget_seconds
+        fetch_timeout_seconds = _day0_hourly_fetch_timeout_seconds()
+        # Discovery is scheduling evidence; the provider fetch is the operation
+        # that can restore probability authority.  Giving both the same terminal
+        # deadline let a large strict-readiness scan consume the entire cycle and
+        # made every known-stale held family wait forever.  Reserve one complete
+        # bounded fetch tranche, then spend only the remainder on discovery/HWM.
+        fetch_reserve_seconds = min(
+            fetch_timeout_seconds,
+            max(0.0, refresh_budget_seconds - 0.25),
+        )
+        preflight_deadline_monotonic = (
+            refresh_deadline_monotonic - fetch_reserve_seconds
+        )
         cities = _rc()
         held_families = sorted(_edli_current_held_position_family_keys())
         priority_probe = _edli_day0_hourly_refresh_due_families(
             cities=cities,
             decision_time=decision_time,
-            deadline_monotonic=refresh_deadline_monotonic,
+            deadline_monotonic=preflight_deadline_monotonic,
         )
         provider_run_hwm = {}
         release_due_city_dates = frozenset()
@@ -6242,7 +6255,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
             ]
             hwm_budget_seconds = min(
                 1.0,
-                max(0.0, refresh_deadline_monotonic - time.monotonic()),
+                max(0.0, preflight_deadline_monotonic - time.monotonic()),
             )
             if held_cities and hwm_budget_seconds >= 0.25:
                 provider_run_hwm = probe_day0_provider_run_hwm(
@@ -6396,7 +6409,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
             budget_s=remaining_budget_seconds,
             max_cities=max_cities,
             timeout_s=min(
-                _day0_hourly_fetch_timeout_seconds(),
+                fetch_timeout_seconds,
                 remaining_budget_seconds,
             ),
             quota_critical_cities=quota_critical_cities,
