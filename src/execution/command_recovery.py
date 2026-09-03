@@ -30183,81 +30183,10 @@ def _reconcile_passes_short_conn(
                 _recorded_exit_fill_projection_candidates(conn)
             )
             cancel_candidates = _capital_blocking_cancel_commands(conn)
-            terminal_candidates = _terminal_point_order_candidates(conn)
-            terminal_fact_candidates = _latest_terminal_order_fact_candidates(conn)
-            existing_position_terminal_cancel_ids = (
-                _existing_position_terminal_no_fill_cancel_command_ids(
-                    conn,
-                    terminal_fact_candidates,
-                )
-            )
-            cancel_candidates = [
-                candidate
-                for candidate in cancel_candidates
-                if str(candidate.get("command_id") or "")
-                not in existing_position_terminal_cancel_ids
-            ]
-            terminal_fact_candidates = [
-                candidate
-                for candidate in terminal_fact_candidates
-                if str(candidate.get("command_id") or "")
-                not in existing_position_terminal_cancel_ids
-            ]
-            stale_terminal_finding_candidates = (
-                _stale_local_orphan_terminal_no_fill_candidates(conn)
-            )
             terminal_late_fill_command_ids = (
                 _exchange_reconcile.persisted_terminal_late_entry_fill_command_ids(
                     conn
                 )
-            )
-            if cancel_candidates:
-                # Exact cancel uncertainty globally removes entry authority.
-                # Do not spend its bounded tick on the broader historical
-                # partial-remainder scan; that debt remains durable and gets
-                # its own pass as soon as the cancel set drains.
-                partial_candidates = []
-                summary["partial_remainder_scan_deferred_for_cancel"] = True
-            else:
-                partial_candidates = (
-                    _partial_remainder_candidates(
-                        conn,
-                        live_tick_scope=True,
-                    )
-                    if all(
-                        _table_exists(conn, table)
-                        for table in (
-                            "venue_commands",
-                            "venue_order_facts",
-                            "position_current",
-                        )
-                    )
-                    else []
-                )
-            obligation_states = tuple(
-                sorted(
-                    _TERMINAL_ENTRY_NO_FILL_COMMAND_STATES
-                    | _SETTLEMENT_ABSORBED_ENTRY_COMMAND_STATES
-                    | {CommandState.PARTIAL.value}
-                )
-            )
-            terminal_obligation_open = bool(
-                _table_exists(conn, "entry_exposure_obligations")
-                and conn.execute(
-                    f"""
-                    SELECT 1
-                      FROM entry_exposure_obligations obligation
-                      JOIN venue_commands command
-                        ON command.command_id = obligation.command_id
-                     WHERE obligation.status = 'OPEN'
-                       AND command.intent_kind = 'ENTRY'
-                       AND command.state IN (
-                           {','.join('?' for _ in obligation_states)}
-                       )
-                     LIMIT 1
-                    """,
-                    obligation_states,
-                ).fetchone()
             )
         terminal_fill_review_result = None
         if terminal_fill_review_command_ids:
@@ -30365,6 +30294,86 @@ def _reconcile_passes_short_conn(
                     advanced_key="projected",
                     fold_stayed=False,
                 )
+        # The selectors below include historical terminal-order joins.  Keep
+        # them behind the exact confirmed-fill projections above: on a large
+        # canonical DB, a deadline interrupt in one broad selector must not
+        # prevent already-known current-capital command ids from reaching
+        # their bounded APPLY transaction.
+        with open_tracked(
+            read_conn_factory,
+            label="recovery.capital_recovery_fast:maintenance_snapshot",
+        ) as conn:
+            terminal_candidates = _terminal_point_order_candidates(conn)
+            terminal_fact_candidates = _latest_terminal_order_fact_candidates(conn)
+            existing_position_terminal_cancel_ids = (
+                _existing_position_terminal_no_fill_cancel_command_ids(
+                    conn,
+                    terminal_fact_candidates,
+                )
+            )
+            cancel_candidates = [
+                candidate
+                for candidate in cancel_candidates
+                if str(candidate.get("command_id") or "")
+                not in existing_position_terminal_cancel_ids
+            ]
+            terminal_fact_candidates = [
+                candidate
+                for candidate in terminal_fact_candidates
+                if str(candidate.get("command_id") or "")
+                not in existing_position_terminal_cancel_ids
+            ]
+            stale_terminal_finding_candidates = (
+                _stale_local_orphan_terminal_no_fill_candidates(conn)
+            )
+            if cancel_candidates:
+                # Exact cancel uncertainty globally removes entry authority.
+                # Do not spend its bounded tick on the broader historical
+                # partial-remainder scan; that debt remains durable and gets
+                # its own pass as soon as the cancel set drains.
+                partial_candidates = []
+                summary["partial_remainder_scan_deferred_for_cancel"] = True
+            else:
+                partial_candidates = (
+                    _partial_remainder_candidates(
+                        conn,
+                        live_tick_scope=True,
+                    )
+                    if all(
+                        _table_exists(conn, table)
+                        for table in (
+                            "venue_commands",
+                            "venue_order_facts",
+                            "position_current",
+                        )
+                    )
+                    else []
+                )
+            obligation_states = tuple(
+                sorted(
+                    _TERMINAL_ENTRY_NO_FILL_COMMAND_STATES
+                    | _SETTLEMENT_ABSORBED_ENTRY_COMMAND_STATES
+                    | {CommandState.PARTIAL.value}
+                )
+            )
+            terminal_obligation_open = bool(
+                _table_exists(conn, "entry_exposure_obligations")
+                and conn.execute(
+                    f"""
+                    SELECT 1
+                      FROM entry_exposure_obligations obligation
+                      JOIN venue_commands command
+                        ON command.command_id = obligation.command_id
+                     WHERE obligation.status = 'OPEN'
+                       AND command.intent_kind = 'ENTRY'
+                       AND command.state IN (
+                           {','.join('?' for _ in obligation_states)}
+                       )
+                     LIMIT 1
+                    """,
+                    obligation_states,
+                ).fetchone()
+            )
         existing_position_terminal_cancel_result = None
         if existing_position_terminal_cancel_ids:
             terminal_cancel_deadline = _capital_deadline()

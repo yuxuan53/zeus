@@ -2086,6 +2086,11 @@ def test_live_tick_projects_confirmed_exit_before_general_budget_defer(monkeypat
         now[0] = 1.0
         raise sqlite3.OperationalError("interrupted")
 
+    def _broad_terminal_fact_scan(_conn):
+        assert calls == ["recorded_exit_fill_projection_fast"]
+        calls.append("broad_terminal_fact_scan")
+        return []
+
     monkeypatch.setattr(venue_sync_contract, "default_trade_conn_factory", _conn_factory)
     monkeypatch.setattr(command_recovery.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(
@@ -2105,6 +2110,11 @@ def test_live_tick_projects_confirmed_exit_before_general_budget_defer(monkeypat
     )
     monkeypatch.setattr(
         command_recovery,
+        "_latest_terminal_order_fact_candidates",
+        _broad_terminal_fact_scan,
+    )
+    monkeypatch.setattr(
+        command_recovery,
         "reconcile_review_required_matched_submit_trade_facts",
         _later_maintenance,
     )
@@ -2119,6 +2129,7 @@ def test_live_tick_projects_confirmed_exit_before_general_budget_defer(monkeypat
 
     assert calls == [
         "recorded_exit_fill_projection_fast",
+        "broad_terminal_fact_scan",
         "review_required_matched_submit_trade_fact",
     ]
     assert summary["recorded_exit_fill_projection_fast"]["projected"] == 1
