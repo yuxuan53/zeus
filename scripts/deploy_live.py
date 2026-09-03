@@ -1795,7 +1795,13 @@ def _current_quote_only_repair_snapshot_ids(
     position_ids: tuple[str, ...],
     now: datetime | None = None,
 ) -> tuple[str, ...]:
-    """Return quote-gap positions with exact current local held-book proof."""
+    """Return quote-gap positions with exact current local held-book proof.
+
+    A current empty bid side is a complete no-action witness for restart
+    permission: there is no executable SELL to abandon during the cutover.
+    It is deliberately not converted into a price and grants no venue
+    authority.
+    """
 
     wanted = tuple(dict.fromkeys(str(value).strip() for value in position_ids))
     if not wanted or any(not position_id for position_id in wanted):
@@ -1868,8 +1874,10 @@ def _current_quote_only_repair_snapshot_ids(
         selected_token_id = str(row["selected_outcome_token_id"] or "").strip()
         captured_at = _parse_iso_utc(row["captured_at"])
         freshness_deadline = _parse_iso_utc(row["freshness_deadline"])
+        raw_held_bid = str(row["orderbook_top_bid"] or "").strip()
+        no_executable_bid = raw_held_bid == "ABSENT"
         try:
-            held_bid = float(row["orderbook_top_bid"])
+            held_bid = math.nan if no_executable_bid else float(raw_held_bid)
         except (TypeError, ValueError):
             continue
         held_exit_open = row["active"] == 1
@@ -1897,8 +1905,13 @@ def _current_quote_only_repair_snapshot_ids(
             or freshness_deadline is None
             or captured_at > now_utc
             or freshness_deadline < now_utc
-            or not math.isfinite(held_bid)
-            or not 0.0 <= held_bid <= 1.0
+            or (
+                not no_executable_bid
+                and (
+                    not math.isfinite(held_bid)
+                    or not 0.0 <= held_bid <= 1.0
+                )
+            )
         ):
             continue
         proven.add(position_id)
@@ -1955,8 +1968,6 @@ def _quote_only_monitor_repair_handoff_admission(
         or int(handoff.get("reauction_handoff_position_count") or 0) != 0
         or handoff.get("quote_only_stale_shape_valid") is not True
         or handoff.get("fresh_failed_monitor_duplicate_position_ids")
-        or handoff.get("fresh_failed_monitor_timestamp_stale_position_ids")
-        or handoff.get("stale_classified_position_ids")
         or handoff.get("missing_monitor_timestamp_position_ids")
         or handoff.get("invalid_monitor_timestamp_position_ids")
     ):
@@ -1974,6 +1985,23 @@ def _quote_only_monitor_repair_handoff_admission(
     quote_set = {str(position_id).strip() for position_id in quote_ids}
     no_action_set = {str(position_id).strip() for position_id in no_action_ids}
     other_set = {str(position_id).strip() for position_id in other_ids}
+    settlement_ids = tuple(
+        handoff.get("settlement_recoverable_position_ids") or ()
+    )
+    settlement_set = {
+        str(position_id).strip() for position_id in settlement_ids
+    }
+    stale_timestamp_set = {
+        str(position_id).strip()
+        for position_id in tuple(
+            handoff.get("fresh_failed_monitor_timestamp_stale_position_ids")
+            or ()
+        )
+    }
+    stale_classified_set = {
+        str(position_id).strip()
+        for position_id in tuple(handoff.get("stale_classified_position_ids") or ())
+    }
     fresh_count = int(handoff.get("fresh_position_count") or 0)
     if (
         not quote_ids
@@ -1994,6 +2022,18 @@ def _quote_only_monitor_repair_handoff_admission(
         != open_count
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:open_partition_incomplete"
+    # Closed-market/settlement-recoverable positions do not acquire a newer
+    # executable quote by waiting.  Permit only that exact stale subset; an
+    # active position with stale monitor evidence still refuses the restart.
+    if (
+        len(settlement_ids)
+        != int(handoff.get("settlement_recoverable_position_count") or 0)
+        or len(settlement_set) != len(settlement_ids)
+        or not settlement_set.issubset(no_action_set)
+        or stale_timestamp_set != settlement_set
+        or stale_classified_set != settlement_set
+    ):
+        return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:stale_partition_invalid"
     restart_ids = {
         str(position_id).strip()
         for position_id in tuple(handoff.get("restart_blocking_position_ids") or ())
@@ -2025,6 +2065,7 @@ def _quote_only_monitor_repair_handoff_admission(
         "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_ADMITTED: "
         f"open_positions={open_count} fresh_positions={fresh_count} "
         f"quote_only_positions={len(quote_ids)} exact_held_books=current "
+        f"settlement_recoverable_positions={len(settlement_ids)} "
         "durable_entries_pause=true nonterminal_commands=0 "
         "restart_permission_only=true",
     )

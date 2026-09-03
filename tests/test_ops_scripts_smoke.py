@@ -4655,8 +4655,9 @@ def test_deploy_live_loaded_restart_admits_fresh_probability_and_no_action_mix(
     assert "probability_degraded_positions=1" in detail
 
 
+@pytest.mark.parametrize("held_bid", ("0.70", "ABSENT"))
 def test_deploy_live_quote_only_repair_handoff_requires_exact_current_held_book(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, held_bid
 ):
     dl = _load("deploy_live_restart_quote_only_repair", "deploy_live.py")
     trade_db = tmp_path / "zeus_trades.db"
@@ -4692,7 +4693,7 @@ def test_deploy_live_quote_only_repair_handoff_requires_exact_current_held_book(
         (
             "condition-quote",
             "no-token",
-            "0.70",
+            held_bid,
             now.isoformat(),
             (now + timedelta(minutes=3)).isoformat(),
             json.dumps({"executable_allowed": True}),
@@ -4738,6 +4739,72 @@ def test_deploy_live_quote_only_repair_handoff_requires_exact_current_held_book(
     assert "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_ADMITTED" in detail
 
     assert "exact_held_books=current" in detail
+
+
+def test_deploy_live_quote_only_repair_allows_only_stale_settlement_subset(
+    monkeypatch, tmp_path
+):
+    dl = _load("deploy_live_restart_quote_plus_settlement", "deploy_live.py")
+    position_ids = ("pos-fresh", "pos-quote", "pos-settlement")
+    handoff = _fresh_failed_monitor_handoff(
+        position_ids,
+        monitored_position_ids=position_ids,
+        fresh_position_count=1,
+        quote_only_stale_position_count=1,
+        quote_only_stale_position_ids=("pos-quote",),
+        fresh_failed_monitor_no_action_position_count=1,
+        fresh_failed_monitor_no_action_position_ids=("pos-settlement",),
+        fresh_failed_monitor_other_classified_position_ids=("pos-quote",),
+        fresh_failed_monitor_timestamp_stale_position_ids=("pos-settlement",),
+        restart_blocking_position_count=0,
+        restart_blocking_position_ids=(),
+        settlement_recoverable_position_count=1,
+        settlement_recoverable_position_ids=("pos-settlement",),
+        stale_classified_position_ids=("pos-settlement",),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_current_quote_only_repair_snapshot_ids",
+        lambda *_args, **_kwargs: ("pos-quote",),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_held_quote_sidecar_current_evidence",
+        lambda: {"current": True, "age_seconds": 1.0},
+    )
+
+    ok, detail = dl._quote_only_monitor_repair_handoff_admission(
+        trade_db=tmp_path / "zeus_trades.db",
+        obligations={
+            "open_position_count": len(position_ids),
+            "nonterminal_command_count": 0,
+            "all_open_position_ids": position_ids,
+        },
+        pause_state={"entries_paused": True},
+        handoff=handoff,
+        repair_pending={"pending": True},
+    )
+
+    assert ok is True
+    assert "settlement_recoverable_positions=1" in detail
+
+    handoff["fresh_failed_monitor_timestamp_stale_position_ids"] = (
+        "pos-settlement",
+        "pos-quote",
+    )
+    ok, detail = dl._quote_only_monitor_repair_handoff_admission(
+        trade_db=tmp_path / "zeus_trades.db",
+        obligations={
+            "open_position_count": len(position_ids),
+            "nonterminal_command_count": 0,
+            "all_open_position_ids": position_ids,
+        },
+        pause_state={"entries_paused": True},
+        handoff=handoff,
+        repair_pending={"pending": True},
+    )
+    assert ok is False
+    assert detail.endswith("stale_partition_invalid")
 
 
 def test_deploy_live_quote_only_repair_handoff_rejects_expired_held_book(
