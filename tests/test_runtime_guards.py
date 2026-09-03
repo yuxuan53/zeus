@@ -17730,7 +17730,183 @@ def test_global_sell_command_ownership_uses_event_sequence_not_caller_timestamp(
     conn.close()
 
 
-def test_late_command_after_v4_release_blocks_restart_enqueue_and_preserves_debt(tmp_path):
+def test_filled_capital_reduction_releases_only_its_positive_residual(tmp_path):
+    conn = get_connection(tmp_path / "filled-capital-reduction-release.db")
+    init_schema(conn)
+    init_schema_trade_only(conn)
+    pos = _position(
+        trade_id="filled-capital-reduction-release",
+        state="day0_window",
+        shares=5.0,
+        size_usd=0.6,
+        cost_basis_usd=0.6,
+        token_id="held-yes",
+        no_token_id="held-no",
+        exit_reason="GLOBAL_CAPITAL_OPTIMAL_SELL",
+    )
+
+    def insert_command(command_id, *, state, venue_order_id, size):
+        conn.execute(
+            """
+            INSERT INTO venue_commands (
+                command_id, snapshot_id, envelope_id, position_id, decision_id,
+                idempotency_key, intent_kind, market_id, token_id, side, size,
+                price, state, venue_order_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'EXIT', ?, ?, 'SELL', ?, 0.20,
+                      ?, ?, ?, ?)
+            """,
+            (
+                command_id,
+                f"snapshot-{command_id}",
+                f"envelope-{command_id}",
+                pos.trade_id,
+                f"decision-{command_id}",
+                f"idem-{command_id}",
+                pos.market_id,
+                pos.token_id,
+                size,
+                state,
+                venue_order_id,
+                "2026-09-03T13:29:21+00:00",
+                "2026-09-03T13:29:25+00:00",
+            ),
+        )
+
+    def insert_event(
+        sequence_no,
+        event_type,
+        *,
+        phase_before,
+        phase_after,
+        payload,
+        command_id=None,
+        order_id=None,
+        caused_by="test_capital_reduction_release",
+    ):
+        conn.execute(
+            """
+            INSERT INTO position_events (
+                event_id, position_id, event_version, sequence_no, event_type,
+                occurred_at, phase_before, phase_after, strategy_key, command_id,
+                order_id, caused_by, idempotency_key, source_module, payload_json, env
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'src.execution.exit_lifecycle', ?, 'live')
+            """,
+            (
+                f"{pos.trade_id}:{event_type}:{sequence_no}",
+                pos.trade_id,
+                sequence_no,
+                event_type,
+                f"2026-09-03T13:29:{20 + sequence_no:02d}+00:00",
+                phase_before,
+                phase_after,
+                pos.strategy_key,
+                command_id,
+                order_id,
+                caused_by,
+                f"{pos.trade_id}:{event_type}:{sequence_no}",
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+
+    insert_event(
+        1,
+        "EXIT_INTENT",
+        phase_before="day0_window",
+        phase_after="pending_exit",
+        payload={"exit_intent_reason": "GLOBAL_CAPITAL_OPTIMAL_SELL"},
+    )
+    insert_command(
+        "filled-command",
+        state="FILLED",
+        venue_order_id="filled-order",
+        size=21.25,
+    )
+    insert_event(
+        2,
+        "EXIT_ORDER_POSTED",
+        phase_before="pending_exit",
+        phase_after="pending_exit",
+        payload={},
+        command_id="filled-command",
+        order_id="filled-order",
+    )
+    insert_event(
+        3,
+        "MONITOR_REFRESHED",
+        phase_before="pending_exit",
+        phase_after="pending_exit",
+        payload={
+            "semantic_event": "CAPITAL_REDUCTION_FILLED",
+            "order_id": "filled-order",
+            "filled_shares": "21.25",
+            "remaining_shares": "5",
+        },
+        order_id="filled-order",
+        caused_by="partial_exit_fill",
+    )
+
+    # A reduction event alone cannot release the command; the canonical batch
+    # must include its immediately following active-position release.
+    assert (
+        exit_lifecycle_module._canonical_global_sell_command_ownership(
+            conn, pos, require_pending_exit=False
+        )
+        == "COMMAND_OWNED"
+    )
+    insert_event(
+        4,
+        "EXIT_RETRY_RELEASED",
+        phase_before="pending_exit",
+        phase_after="day0_window",
+        payload={
+            "release_reason": "CAPITAL_REDUCTION_FILLED",
+            "status": "ready",
+        },
+        caused_by="capital_reduction_filled",
+    )
+    assert (
+        exit_lifecycle_module._canonical_global_sell_command_ownership(
+            conn, pos, require_pending_exit=False
+        )
+        == "GLOBAL_NO_COMMAND"
+    )
+    pos.shares = 4.5
+    assert (
+        exit_lifecycle_module._canonical_global_sell_command_ownership(
+            conn, pos, require_pending_exit=False
+        )
+        == "COMMAND_OWNED"
+    )
+    pos.shares = 5.0
+
+    # The reset is command-specific. A later live command still owns the SELL.
+    insert_command(
+        "later-command",
+        state="INTENT_CREATED",
+        venue_order_id="",
+        size=5.0,
+    )
+    insert_event(
+        5,
+        "EXIT_ORDER_POSTED",
+        phase_before="day0_window",
+        phase_after="pending_exit",
+        payload={},
+        command_id="later-command",
+    )
+    assert (
+        exit_lifecycle_module._canonical_global_sell_command_ownership(
+            conn, pos, require_pending_exit=False
+        )
+        == "COMMAND_OWNED"
+    )
+    conn.close()
+
+
+def test_late_command_after_v4_release_blocks_restart_enqueue_and_preserves_debt(
+    tmp_path,
+):
     from src.engine.lifecycle_events import build_position_current_projection
     from src.state.projection import upsert_position_current
 

@@ -1577,6 +1577,113 @@ def has_proven_sync_no_side_effect_sell_reauction(
     return False
 
 
+def _capital_reduction_released_global_sell_command(
+    conn: sqlite3.Connection,
+    position: Position,
+    *,
+    command_id: str,
+    binding_sequence: int,
+) -> bool:
+    """Prove that a FILLED SELL released its positive residual for reauction.
+
+    SCOPE: one command on one held position. DRAIN: the partial-fill writer
+    atomically appends CAPITAL_REDUCTION_FILLED then EXIT_RETRY_RELEASED.
+    RESET: only that exact pair plus the matching positive current residual
+    releases the old command; later commands remain independently owned.
+    """
+
+    raw_direction = getattr(position, "direction", "")
+    direction = str(getattr(raw_direction, "value", raw_direction) or "").lower()
+    held_token_id = str(
+        getattr(position, "no_token_id", "")
+        if direction == "buy_no"
+        else getattr(position, "token_id", "")
+    ).strip()
+    position_id = str(getattr(position, "trade_id", "") or "").strip()
+    if not position_id or not held_token_id:
+        return False
+    try:
+        command = conn.execute(
+            """
+            SELECT venue_order_id
+              FROM venue_commands
+             WHERE command_id = ?
+               AND position_id = ?
+               AND intent_kind = 'EXIT'
+               AND side = 'SELL'
+               AND state = 'FILLED'
+             LIMIT 1
+            """,
+            (command_id, position_id),
+        ).fetchone()
+        venue_order_id = str(command[0] or "").strip() if command is not None else ""
+        if not venue_order_id or not _is_exact_held_sell_command(
+            conn,
+            position_id=position_id,
+            command_id=command_id,
+            held_token_id=held_token_id,
+            venue_order_id=venue_order_id,
+            expected_state="FILLED",
+        ):
+            return False
+        row = conn.execute(
+            """
+            SELECT reduced.sequence_no, reduced.order_id, reduced.payload_json,
+                   released.sequence_no, released.phase_after,
+                   released.caused_by, released.payload_json
+              FROM position_events reduced
+              JOIN position_events released
+                ON released.position_id = reduced.position_id
+               AND released.sequence_no = reduced.sequence_no + 1
+               AND released.event_type = 'EXIT_RETRY_RELEASED'
+               AND released.source_module = 'src.execution.exit_lifecycle'
+             WHERE reduced.position_id = ?
+               AND reduced.sequence_no > ?
+               AND reduced.event_type = 'MONITOR_REFRESHED'
+               AND reduced.caused_by = 'partial_exit_fill'
+               AND reduced.source_module = 'src.execution.exit_lifecycle'
+               AND LOWER(COALESCE(reduced.order_id, '')) = LOWER(?)
+             ORDER BY reduced.sequence_no DESC
+             LIMIT 1
+            """,
+            (position_id, binding_sequence, venue_order_id),
+        ).fetchone()
+        if row is None:
+            return False
+        reduction_payload = json.loads(str(row[2] or "{}"))
+        release_payload = json.loads(str(row[6] or "{}"))
+        remaining_shares = Decimal(str(reduction_payload.get("remaining_shares")))
+        effective_shares = Decimal(str(position.effective_exposure().shares))
+        if not remaining_shares.is_finite() or not effective_shares.is_finite():
+            return False
+    except (
+        AttributeError,
+        InvalidOperation,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+    share_tolerance = Decimal("0.011")
+    return bool(
+        isinstance(reduction_payload, dict)
+        and isinstance(release_payload, dict)
+        and int(row[3]) == int(row[0]) + 1
+        and str(row[1] or "").lower() == venue_order_id.lower()
+        and str(reduction_payload.get("order_id") or "").lower()
+        == venue_order_id.lower()
+        and reduction_payload.get("semantic_event") == "CAPITAL_REDUCTION_FILLED"
+        and str(row[4] or "") != LifecyclePhase.PENDING_EXIT.value
+        and str(row[5] or "") == "capital_reduction_filled"
+        and release_payload.get("release_reason") == "CAPITAL_REDUCTION_FILLED"
+        and release_payload.get("status") == "ready"
+        and remaining_shares > 0
+        and effective_shares > 0
+        and abs(effective_shares - remaining_shares) <= share_tolerance
+    )
+
+
 def _canonical_global_sell_command_ownership(
     conn: sqlite3.Connection | None,
     position: Position,
@@ -1676,7 +1783,17 @@ def _canonical_global_sell_command_ownership(
             ).fetchone()
         except sqlite3.Error:
             return "UNKNOWN"
-        if binding is None or int(binding[0]) > intent_sequence:
+        if binding is None:
+            return "COMMAND_OWNED"
+        binding_sequence = int(binding[0])
+        if binding_sequence > intent_sequence and not (
+            _capital_reduction_released_global_sell_command(
+                conn,
+                position,
+                command_id=command_id,
+                binding_sequence=binding_sequence,
+            )
+        ):
             return "COMMAND_OWNED"
     return "GLOBAL_NO_COMMAND"
 
