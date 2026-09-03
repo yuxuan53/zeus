@@ -35797,13 +35797,14 @@ def _global_day0_execution_payload(
         _latest_authorized_day0_fact,
     )
     from src.events.day0_authority import (
+        DAY0_PROVISIONAL_CURRENT_SNAPSHOT,
         assert_live_day0_payload_authority,
         day0_evidence_finality,
     )
 
     carrier = _payload(event)
     assert_live_day0_payload_authority(carrier)
-    fact = _latest_authorized_day0_fact(
+    settlement_fact = _latest_authorized_day0_fact(
         observation_conn,
         city=str(getattr(family, "city", "") or ""),
         target_date=str(getattr(family, "target_date", "") or ""),
@@ -35811,8 +35812,6 @@ def _global_day0_execution_payload(
         decision_time=decision_time,
         require_settlement_channel=True,
     )
-    if fact is None:
-        raise ValueError("GLOBAL_DAY0_CURRENT_OBSERVATION_MISSING")
     physical_fact = _latest_authorized_day0_fact(
         observation_conn,
         city=str(getattr(family, "city", "") or ""),
@@ -35821,6 +35820,20 @@ def _global_day0_execution_payload(
         decision_time=decision_time,
         require_settlement_channel=False,
     )
+    city = runtime_cities_by_name().get(str(getattr(family, "city", "") or ""))
+    if city is None:
+        raise ValueError("GLOBAL_DAY0_CITY_CONFIG_MISSING")
+    physical_only_statistical = bool(
+        settlement_fact is None
+        and physical_fact is not None
+        and str(getattr(city, "settlement_source_type", "") or "")
+        .strip()
+        .lower()
+        == "noaa"
+    )
+    fact = physical_fact if physical_only_statistical else settlement_fact
+    if fact is None:
+        raise ValueError("GLOBAL_DAY0_CURRENT_OBSERVATION_MISSING")
 
     def utc(value: object, *, reason: str) -> datetime:
         try:
@@ -35959,10 +35972,34 @@ def _global_day0_execution_payload(
             # Carrier source and row count are provenance, not state variables.
             # A supplied posterior may bind the same station-time extreme
             # through a different durable surface or cumulative row count.
-            if (
-                not math.isclose(
-                    observed_c, conditioned_c, rel_tol=0.0, abs_tol=1e-9
+            conditioning_value_matches = math.isclose(
+                observed_c,
+                conditioned_c,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            same_source_monotone_advance = bool(
+                physical_only_statistical
+                and allow_equivalent_conditioning_clock_advance
+                and conditioning_source
+                == str(fact.get("observation_source") or "").strip().lower()
+                and (
+                    (
+                        str(getattr(family, "metric", "") or "").strip().lower()
+                        == "high"
+                        and observed_c > conditioned_c
+                    )
+                    or (
+                        str(getattr(family, "metric", "") or "")
+                        .strip()
+                        .lower()
+                        == "low"
+                        and observed_c < conditioned_c
+                    )
                 )
+            )
+            if (
+                not (conditioning_value_matches or same_source_monotone_advance)
                 or str(conditioning.get("unit") or "").strip().upper() != unit
             ):
                 raise ValueError("GLOBAL_DAY0_CONDITIONING_OBSERVATION_MISMATCH")
@@ -35979,19 +36016,22 @@ def _global_day0_execution_payload(
                     (conditioning_at - conditioned_at).total_seconds()
                 )
                 conditioning_clock_role = (
-                    "same_extreme_newer_observation_clock"
-                    if conditioned_at < conditioning_at
-                    else "same_extreme_conditioning_ahead_of_reader_clock"
+                    "same_source_monotone_observation_advance"
+                    if same_source_monotone_advance
+                    else (
+                        "same_extreme_newer_observation_clock"
+                        if conditioned_at < conditioning_at
+                        else "same_extreme_conditioning_ahead_of_reader_clock"
+                    )
                 )
 
     station_id = str(fact.get("station_id") or "").strip().upper()
     observation_source = str(fact.get("observation_source") or "").strip()
-    evidence_finality = day0_evidence_finality(
-        {"settlement_source": observation_source}
+    evidence_finality = (
+        DAY0_PROVISIONAL_CURRENT_SNAPSHOT
+        if physical_only_statistical
+        else day0_evidence_finality({"settlement_source": observation_source})
     )
-    city = runtime_cities_by_name().get(str(getattr(family, "city", "") or ""))
-    if city is None:
-        raise ValueError("GLOBAL_DAY0_CITY_CONFIG_MISSING")
     from src.events.triggers.day0_extreme_updated import _expected_station_for_city
 
     expected_station = _expected_station_for_city(city)
@@ -36039,6 +36079,10 @@ def _global_day0_execution_payload(
         "raw_payload_sha256": raw_payload_sha256,
         "evidence_finality": evidence_finality,
     }
+    if physical_only_statistical:
+        binding["observation_authority_role"] = (
+            "same_station_fast_statistical_only"
+        )
     binding["day0_observation_provenance_hash"] = stable_hash(
         {
             "city": binding["city"],
@@ -36201,6 +36245,8 @@ def _global_day0_execution_payload(
         "observation_context_id": "global_current_day0:" + stable_hash(binding),
         "_edli_global_day0_binding": binding,
     }
+    if physical_only_statistical:
+        payload["_edli_day0_physical_only_statistical_authority"] = True
     if isinstance(remaining_witness, Mapping):
         payload["_edli_day0_remaining_vector_witness"] = dict(remaining_witness)
         provider_cycle = remaining_witness.get("provider_source_cycle_time_utc")
@@ -36780,6 +36826,13 @@ def _day0_absorbing_exact_probability_components(
 ) -> tuple[np.ndarray, np.ndarray, str] | None:
     """Return exact q when a running extreme has entered an absorbing shoulder."""
 
+    from src.events.day0_authority import (
+        DAY0_ABSORBING_FINALITIES,
+        day0_evidence_finality,
+    )
+
+    if day0_evidence_finality(payload) not in DAY0_ABSORBING_FINALITIES:
+        return None
     rounded = _optional_float(payload.get("rounded_value"))
     metric = _nonnull(payload.get("metric") or payload.get("temperature_metric"))
     candidates = tuple(getattr(family, "candidates", ()) or ())

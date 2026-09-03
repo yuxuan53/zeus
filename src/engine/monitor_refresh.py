@@ -225,12 +225,12 @@ def _pinned_complete_bundle_matches_current_day0_event(
     metric: str,
     settlement_unit: str,
 ) -> bool:
-    """Whether a prior-complete carrier names this event's exact provisional fact.
+    """Whether a prior carrier can be causally overlaid by this Day0 event.
 
     A prior carrier may bridge an incomplete forecast wave for a held family, but
-    it cannot bridge a newer Day0 observation.  Returning ``False`` deliberately
-    sends the caller through the current bundle/current-observation path, whose
-    missing-materialization handling remains fail-closed.
+    only for the same source/metric/unit and a later monotone extreme. A same-clock
+    value change is a correction, not an advance, and returns ``False`` so the
+    current bundle path must establish a new source identity.
     """
 
     provenance = getattr(bundle, "provenance_json", None) or {}
@@ -275,21 +275,40 @@ def _pinned_complete_bundle_matches_current_day0_event(
     if expected_unit == "F":
         expected_value_c = (expected_value_c - 32.0) * 5.0 / 9.0
 
+    prior_time_text = str(provisional.get("observation_time") or "").strip()
+    try:
+        current_time = datetime.fromisoformat(expected_time.replace("Z", "+00:00"))
+        prior_time = datetime.fromisoformat(prior_time_text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if current_time.tzinfo is None or prior_time.tzinfo is None:
+        return False
+    current_time = current_time.astimezone(timezone.utc)
+    prior_time = prior_time.astimezone(timezone.utc)
+    same_value = math.isclose(
+        observed_value_c,
+        expected_value_c,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    )
+    monotone_advance = bool(
+        current_time > prior_time
+        and (
+            (expected_metric == "high" and expected_value_c >= observed_value_c)
+            or (expected_metric == "low" and expected_value_c <= observed_value_c)
+        )
+    )
+
     return bool(
         expected_metric == str(metric).strip().lower()
         and str(provisional.get("metric") or "").strip().lower() == expected_metric
         and expected_source
         and str(provisional.get("source") or "").strip().lower() == expected_source
         and expected_time
-        and str(provisional.get("observation_time") or "").strip() == expected_time
+        and current_time >= prior_time
         and expected_unit
         and str(provisional.get("unit") or "").strip().upper() == expected_unit
-        and math.isclose(
-            observed_value_c,
-            expected_value_c,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        )
+        and (same_value or monotone_advance)
     )
 
 
@@ -5588,26 +5607,38 @@ def _day0_family_snapshot_covers_condition(
     return str(matched[0].bin_id) in exact_bin_ids
 
 
-def _target_day_has_canonical_observation(conn, position: Position) -> bool:
-    attached = {
-        str(row[1]) for row in conn.execute("PRAGMA database_list").fetchall()
-    }
-    table_ref = (
-        "world.observation_instants"
-        if "world" in attached
-        else "observation_instants"
+def _target_day_has_canonical_observation(
+    conn,
+    position: Position,
+    *,
+    decision_time: datetime | None = None,
+) -> bool:
+    """Read the same causal observation authority used to build current q.
+
+    ``DAY0_EXTREME_UPDATED`` is a committed observation carrier even before
+    the optional ``observation_instants`` projection contains a row.  Counting
+    only that projection mislabeled live event evidence as an unobserved prefix,
+    so the pinned full-day path skipped current-observation conditioning and
+    the held monitor rejected its own q as provenance-incomplete.
+    """
+
+    from src.data.replacement_forecast_current_target_plan import (
+        _latest_authorized_day0_fact,
     )
-    return (
-        conn.execute(
-            f"""
-            SELECT 1
-              FROM {table_ref}
-             WHERE city = ?
-               AND target_date = ?
-             LIMIT 1
-            """,
-            (str(position.city), str(position.target_date)),
-        ).fetchone()
+
+    now = decision_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("monitor observation decision_time must be timezone-aware")
+    metric = resolve_position_metric(position)[0]
+    return bool(
+        _latest_authorized_day0_fact(
+            conn,
+            city=str(position.city),
+            target_date=str(position.target_date),
+            temperature_metric=metric,
+            decision_time=now.astimezone(timezone.utc),
+            require_settlement_channel=False,
+        )
         is not None
     )
 
@@ -6003,7 +6034,11 @@ def _build_current_global_day0_family_snapshot(
             ).fetchone()
             _raise_if_day0_snapshot_read_deadline_elapsed(deadline_monotonic)
             if row is None:
-                if not _target_day_has_canonical_observation(world, position):
+                if not _target_day_has_canonical_observation(
+                    world,
+                    position,
+                    decision_time=now,
+                ):
                     raise _Day0UnobservedPrefixUnavailable(
                         "current global Day0 family event unavailable: "
                         "zero target-date canonical observations"
@@ -6025,7 +6060,11 @@ def _build_current_global_day0_family_snapshot(
             city = cities_by_name.get(str(position.city))
             unobserved_prefix = bool(
                 city is not None
-                and not _target_day_has_canonical_observation(world, position)
+                and not _target_day_has_canonical_observation(
+                    world,
+                    position,
+                    decision_time=now,
+                )
             )
             pinned_result = read_prior_complete_replacement_forecast_bundle(
                 forecasts,
@@ -6145,7 +6184,11 @@ def _build_current_global_day0_family_snapshot(
             except ValueError as exc:
                 if (
                     str(exc) == "GLOBAL_DAY0_CURRENT_OBSERVATION_MISSING"
-                    and not _target_day_has_canonical_observation(world, position)
+                    and not _target_day_has_canonical_observation(
+                        world,
+                        position,
+                        decision_time=now,
+                    )
                 ):
                     raise _Day0UnobservedPrefixUnavailable(
                         "current global Day0 probability unavailable: "

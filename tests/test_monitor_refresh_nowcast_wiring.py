@@ -483,6 +483,11 @@ def test_day0_monitor_reads_exact_current_global_probability_witness(
         "get_forecasts_connection_read_only",
         lambda **_kwargs: forecasts,
     )
+    monkeypatch.setattr(
+        monitor_refresh_module,
+        "_target_day_has_canonical_observation",
+        lambda *_args, **_kwargs: True,
+    )
     from src.data import replacement_forecast_bundle_reader as bundle_reader
 
     monkeypatch.setattr(
@@ -636,6 +641,56 @@ def test_day0_prior_complete_carrier_must_match_latest_authorized_event(
     assert monitor_refresh_module._pinned_complete_bundle_matches_current_day0_event(
         carrier(current_value),
         event,
+        metric=metric,
+        settlement_unit="C",
+    )
+
+
+@pytest.mark.parametrize(
+    ("metric", "prior_value", "current_value", "reverse_value"),
+    (("high", 23.0, 25.0, 22.0), ("low", 18.0, 16.0, 19.0)),
+)
+def test_day0_prior_carrier_accepts_only_later_monotone_observation_overlay(
+    metric: str,
+    prior_value: float,
+    current_value: float,
+    reverse_value: float,
+) -> None:
+    def event(value: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            payload_json=json.dumps(
+                {
+                    "metric": metric,
+                    "settlement_source": "aviationweather_metar",
+                    "observation_time": "2026-09-03T00:30:00+00:00",
+                    "raw_value": value,
+                    "settlement_unit": "C",
+                }
+            )
+        )
+
+    carrier = SimpleNamespace(
+        provenance_json={
+            "day0_provisional_observation": {
+                "active": True,
+                "metric": metric,
+                "source": "aviationweather_metar",
+                "observation_time": "2026-09-03T00:00:00+00:00",
+                "observed_extreme_c": prior_value,
+                "unit": "C",
+            }
+        }
+    )
+
+    assert monitor_refresh_module._pinned_complete_bundle_matches_current_day0_event(
+        carrier,
+        event(current_value),
+        metric=metric,
+        settlement_unit="C",
+    )
+    assert not monitor_refresh_module._pinned_complete_bundle_matches_current_day0_event(
+        carrier,
+        event(reverse_value),
         metric=metric,
         settlement_unit="C",
     )
@@ -879,6 +934,144 @@ def test_unobserved_prefix_monitor_uses_predictive_point_not_confidence_sample_m
         in refreshed.applied_validations
     )
     assert receipt["remaining_window"] is None
+
+
+def test_target_day_observation_uses_causal_event_authority_not_projection_count(
+    monkeypatch,
+) -> None:
+    decision_time = datetime(2026, 9, 3, 0, 24, tzinfo=timezone.utc)
+    position = SimpleNamespace(
+        city="Beijing",
+        target_date="2026-09-03",
+        temperature_metric="high",
+    )
+    calls = []
+
+    def latest_fact(conn, **kwargs):
+        calls.append((conn, kwargs))
+        return {
+            "observation_time": "2026-09-03T00:00:00+00:00",
+            "observation_source": "aviationweather_metar",
+        }
+
+    monkeypatch.setattr(
+        "src.data.replacement_forecast_current_target_plan._latest_authorized_day0_fact",
+        latest_fact,
+    )
+    sentinel = object()
+
+    assert monitor_refresh_module._target_day_has_canonical_observation(
+        sentinel,
+        position,
+        decision_time=decision_time,
+    )
+    assert calls == [
+        (
+            sentinel,
+            {
+                "city": "Beijing",
+                "target_date": "2026-09-03",
+                "temperature_metric": "high",
+                "decision_time": decision_time,
+                "require_settlement_channel": False,
+            },
+        )
+    ]
+
+
+def test_noaa_fast_fact_updates_held_q_without_becoming_settlement_truth(
+    monkeypatch,
+) -> None:
+    import src.engine.event_reactor_adapter as era
+    from src.events.day0_authority import DAY0_PROVISIONAL_CURRENT_SNAPSHOT
+    from src.events.opportunity_event import make_opportunity_event
+
+    decision_time = datetime(2026, 9, 3, 0, 40, tzinfo=timezone.utc)
+    physical_fact = {
+        "observed_extreme_native": 25.0,
+        "observation_time": "2026-09-03T00:30:00+00:00",
+        "sample_count": 1,
+        "observation_source": "aviationweather_metar",
+        "station_id": "ZBAA",
+        "unit": "C",
+        "observation_available_at": "2026-09-03T00:35:00+00:00",
+        "raw_payload_sha256": "a" * 64,
+    }
+
+    monkeypatch.setattr(
+        "src.data.replacement_forecast_current_target_plan._latest_authorized_day0_fact",
+        lambda _conn, **kwargs: (
+            None if kwargs["require_settlement_channel"] else physical_fact
+        ),
+    )
+    event = make_opportunity_event(
+        event_type="DAY0_EXTREME_UPDATED",
+        entity_key="Beijing|2026-09-03|high|ZBAA",
+        source="day0_fast_observation",
+        observed_at="2026-09-03T00:30:00+00:00",
+        available_at="2026-09-03T00:35:00+00:00",
+        received_at="2026-09-03T00:35:00+00:00",
+        payload={
+            "city": "Beijing",
+            "target_date": "2026-09-03",
+            "metric": "high",
+            "station_id": "ZBAA",
+            "settlement_source": "aviationweather_metar",
+            "settlement_unit": "C",
+            "observation_time": "2026-09-03T00:30:00+00:00",
+            "observation_available_at": "2026-09-03T00:35:00+00:00",
+            "raw_value": 25.0,
+            "rounded_value": 25,
+            "high_so_far": 25.0,
+            "source_match_status": "MATCH",
+            "local_date_status": "MATCH",
+            "station_match_status": "MATCH",
+            "dst_status": "UNAMBIGUOUS",
+            "metric_match_status": "MATCH",
+            "rounding_status": "MATCH",
+            "source_authorized_status": "AUTHORIZED",
+            "live_authority_status": "live",
+        },
+        causal_snapshot_id="beijing-fast-fact",
+    )
+
+    payload = era._global_day0_execution_payload(
+        event,
+        family=SimpleNamespace(
+            city="Beijing",
+            target_date="2026-09-03",
+            metric="high",
+        ),
+        resolution=SimpleNamespace(measurement_unit="C", station_id="ZBAA"),
+        conditioning={
+            "active": True,
+            "metric": "high",
+            "unit": "C",
+            "source": "aviationweather_metar",
+            "observation_time": "2026-09-03T00:00:00+00:00",
+            "observed_extreme_c": 23.0,
+        },
+        observation_conn=object(),
+        decision_time=decision_time,
+        posterior_id=498284,
+        allow_equivalent_conditioning_clock_advance=True,
+    )
+
+    binding = payload["_edli_global_day0_binding"]
+    assert payload["evidence_finality"] == DAY0_PROVISIONAL_CURRENT_SNAPSHOT
+    assert payload["_edli_day0_physical_only_statistical_authority"] is True
+    assert binding["observation_authority_role"] == (
+        "same_station_fast_statistical_only"
+    )
+    assert binding["conditioning_clock_role"] == (
+        "same_source_monotone_observation_advance"
+    )
+    assert binding["observed_extreme_native"] == 25.0
+    assert era._day0_absorbing_exact_probability_components(
+        omega=SimpleNamespace(bins=()),
+        family=SimpleNamespace(candidates=()),
+        payload=payload,
+    ) is None
 
 
 def test_conditioned_replacement_monitor_preserves_q_and_exit_maturity_authority() -> None:
