@@ -105,6 +105,10 @@ DAY0_HOURLY_BUNDLE_MAX_AGE_HOURS = 3.0
 DAY0_HOURLY_REFRESH_HEADROOM_HOURS = 1.0
 DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES = 60.0
 DAY0_HOURLY_FORECAST_HOURS = 72
+# The current observation can fall between provider grid hours.  Keep the last
+# real provider hour so current-state conditioning has a causal innovation
+# anchor after a refresh; never interpolate or stitch one across runs.
+DAY0_HOURLY_PAST_HOURS = 1
 INCOMPLETE_BUNDLE_RETRY_INTERVAL_S = 45.0
 INCOMPLETE_BUNDLE_RETRY_MAX_INTERVAL_S = DEFAULT_REFRESH_INTERVAL_S
 INCOMPLETE_BUNDLE_CRITICAL_RETRY_MAX_INTERVAL_S = 600.0
@@ -1055,6 +1059,7 @@ def _day0_exact_run_payloads(
         "timezone": location[2],
         "hourly": "temperature_2m",
         "forecast_hours": DAY0_HOURLY_FORECAST_HOURS,
+        "past_hours": DAY0_HOURLY_PAST_HOURS,
         "temperature_unit": "celsius",
         "cell_selection": "land",
         "models": [],
@@ -1091,6 +1096,7 @@ def _day0_exact_run_payloads(
                 models=[model], locations=[location], run=run,
                 forecast_hours=DAY0_HOURLY_FORECAST_HOURS,
                 deadline_monotonic=deadline_monotonic,
+                past_hours=DAY0_HOURLY_PAST_HOURS,
             )
             payload = payloads[0]
         except Exception as single_exc:
@@ -1100,6 +1106,7 @@ def _day0_exact_run_payloads(
                     source_available_at=available_at,
                     forecast_hours=DAY0_HOURLY_FORECAST_HOURS,
                     deadline_monotonic=deadline_monotonic,
+                    past_hours=DAY0_HOURLY_PAST_HOURS,
                 )
                 payload = payloads[0]
                 run = transport.run.astimezone(UTC)

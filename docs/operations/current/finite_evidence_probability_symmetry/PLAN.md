@@ -5675,3 +5675,20 @@ and canonical convergence of the observed Mexico fill.
 
 Allowed files for this hot-fix are `src/execution/command_recovery.py`,
 `tests/test_command_recovery.py`, and this plan.
+
+### 2026-09-03 Day0 current-state anchor preservation hot-fix
+
+- Money-path seam: `forecast signal -> held-position probability redecision`.
+- Defect: an hourly refresh requested only future hours.  Once a current-day
+  provider stopped returning the elapsed grid hour, strict current-state
+  conditioning had no real model value at or before the observation and the
+  complete held probability became unavailable.
+- Fix: every exact-run Day0 deterministic request carries one real provider
+  `past_hours` anchor and binds that parameter into request provenance.  No
+  interpolation, extrapolation, or cross-run stitching is permitted.
+- SCOPE: the Day0 deterministic hourly carrier for one refreshed city/date;
+  settlement and observation truth are unchanged.
+- DRAIN: the next ordinary/provider-HWM Day0 refresh persists an anchor-bearing
+  complete bundle; held monitor consumes it on its next redecision cycle.
+- RESET: every later refresh independently requests and validates its own real
+  anchor; an incomplete response remains fail-closed.

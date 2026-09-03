@@ -739,6 +739,7 @@ def _fetch_standard_meta_stamped_payloads(
     source_available_at: datetime | str | None,
     forecast_hours: int,
     deadline_monotonic: float | None,
+    past_hours: int = 0,
 ) -> tuple[tuple[Mapping[str, object], ...], _StandardMetaStampedTransport]:
     """Fetch one current model from the standard API under an atomic metadata window."""
 
@@ -787,6 +788,8 @@ def _fetch_standard_meta_stamped_payloads(
         "timezone": ",".join(timezone_name for _, _, timezone_name, _ in locations),
         "cell_selection": BAYES_PRECISION_FUSION_CELL_SELECTION,
     }
+    if past_hours:
+        params["past_hours"] = int(past_hours)
     payload = fetch(
         STANDARD_FORECAST_URL,
         params,
@@ -1137,6 +1140,7 @@ def _fetch_single_runs_hourly_payloads_batched(
     run: datetime,
     forecast_hours: int,
     deadline_monotonic: float | None = None,
+    past_hours: int = 0,
 ) -> tuple[Mapping[str, object], ...]:
     """Fetch raw, exact-run hourly payloads using the canonical BPF transport.
 
@@ -1163,6 +1167,8 @@ def _fetch_single_runs_hourly_payloads_batched(
         "timezone": ",".join(timezone_name for _, _, timezone_name, _ in locations),
         "cell_selection": BAYES_PRECISION_FUSION_CELL_SELECTION,
     }
+    if past_hours:
+        params["past_hours"] = int(past_hours)
     payload = fetch(
         SINGLE_RUNS_FORECAST_URL,
         params,

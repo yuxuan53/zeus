@@ -2443,6 +2443,7 @@ def test_day0_exact_run_uses_one_deadline_across_models_and_fallback(
     models = ["ecmwf_ifs", "icon_global"]
     deadline_calls: list[float | None] = []
     fallback_calls: list[float | None] = []
+    requested_past_hours: list[int] = []
     metadata_timeouts: list[float] = []
     monkeypatch.setattr(
         "src.data.openmeteo_model_updates.fetch_model_updates",
@@ -2462,12 +2463,14 @@ def test_day0_exact_run_uses_one_deadline_across_models_and_fallback(
 
     def single_runs(**kwargs):
         deadline_calls.append(kwargs["deadline_monotonic"])
+        requested_past_hours.append(kwargs["past_hours"])
         if kwargs["models"] == ["icon_global"]:
             raise RuntimeError("force standard fallback")
         return ({"hourly": {}},)
 
     def standard(**kwargs):
         fallback_calls.append(kwargs["deadline_monotonic"])
+        requested_past_hours.append(kwargs["past_hours"])
         return (
             ({"hourly": {}},),
             SimpleNamespace(
@@ -2481,12 +2484,14 @@ def test_day0_exact_run_uses_one_deadline_across_models_and_fallback(
     monkeypatch.setattr(download, "_fetch_standard_meta_stamped_payloads", standard)
     from src.data.day0_hourly_vectors import _day0_exact_run_payloads
 
-    fetched, _identity = _day0_exact_run_payloads(
+    fetched, identity = _day0_exact_run_payloads(
         city=_paris(), models=models, decision_time=now, timeout_s=2.0
     )
     assert len(fetched) == 2
     assert len(deadline_calls) == 2
     assert fallback_calls and deadline_calls[0] == deadline_calls[1] == fallback_calls[0]
+    assert requested_past_hours == [1, 1, 1]
+    assert identity["past_hours"] == 1
     assert metadata_timeouts and 0.0 < metadata_timeouts[0] <= 2.0
 
 

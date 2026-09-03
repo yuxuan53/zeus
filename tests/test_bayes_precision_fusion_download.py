@@ -848,6 +848,55 @@ def test_nbm_meta_stamped_transport_is_persisted_as_physical_identity(
     assert all('"forecast_hours":120' in row[4] for row in rows)
 
 
+def test_hourly_transports_forward_real_provider_past_hour_anchor(monkeypatch) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+    import src.data.openmeteo_model_updates as metadata
+    from src.data.openmeteo_model_updates import OpenMeteoModelUpdate
+
+    run = datetime(2026, 9, 3, 0, tzinfo=UTC)
+    available = datetime(2026, 9, 3, 3, tzinfo=UTC)
+    modified = datetime(2026, 9, 3, 3, 1, tzinfo=UTC)
+    seen: list[dict[str, object]] = []
+
+    def fetch(_url, params, **_kwargs):
+        seen.append(dict(params))
+        return {"hourly": {}}
+
+    monkeypatch.setattr(client, "fetch", fetch)
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=("ecmwf_ifs",),
+        locations=((41.9, -87.6, "America/Chicago", (date(2026, 9, 3),)),),
+        run=run,
+        forecast_hours=72,
+        past_hours=1,
+    )
+
+    monkeypatch.setattr(
+        metadata,
+        "fetch_model_updates",
+        lambda *_args, **_kwargs: (
+            OpenMeteoModelUpdate(
+                model="ncep_nbm_conus",
+                last_run_initialisation_time=run,
+                last_run_availability_time=available,
+                last_run_modification_time=modified,
+            ),
+        ),
+    )
+    dl._fetch_standard_meta_stamped_payloads(
+        model="ncep_nbm_conus",
+        locations=((41.9, -87.6, "America/Chicago", (date(2026, 9, 3),)),),
+        run=run,
+        source_available_at=available,
+        forecast_hours=72,
+        deadline_monotonic=None,
+        past_hours=1,
+    )
+
+    assert [params["past_hours"] for params in seen] == [1, 1]
+
+
 def test_source_clock_download_reuses_one_multi_location_response(
     tmp_path, monkeypatch
 ) -> None:
