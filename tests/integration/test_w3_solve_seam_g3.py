@@ -11168,8 +11168,14 @@ def test_live_adapter_keeps_held_forecast_q_outside_entry_phase_gate(
     )
 
 
+@pytest.mark.parametrize(
+    ("has_canonical_observation", "allow_unobserved"),
+    ((True, False), (False, True)),
+)
 def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
     monkeypatch,
+    has_canonical_observation,
+    allow_unobserved,
 ):
     trade = sqlite3.connect(":memory:")
     forecast = sqlite3.connect(":memory:")
@@ -11198,6 +11204,11 @@ def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
             and decision_time.tzinfo is not None
             else None
         ),
+    )
+    monkeypatch.setattr(
+        era,
+        "_held_day0_has_canonical_observation",
+        lambda *_args, **_kwargs: has_canonical_observation,
     )
 
     def prepare(event, *_args, **kwargs):
@@ -11236,7 +11247,7 @@ def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
         second,
     ]
     assert all(
-        unobserved and provisional
+        unobserved is allow_unobserved and provisional
         for _event, _at, unobserved, provisional in prepare_calls
     )
 

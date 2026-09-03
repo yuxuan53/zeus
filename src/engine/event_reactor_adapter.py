@@ -9025,6 +9025,14 @@ def event_bound_live_adapter_from_trade_conn(
             held_is_forecast_lane = (
                 held_event.event_type in _FORECAST_DECISION_EVENT_TYPES
             )
+            held_unobserved_prefix = bool(
+                held_is_day0
+                and not _held_day0_has_canonical_observation(
+                    calibration_conn,
+                    event=held_event,
+                    decision_time=at,
+                )
+            )
             family_key = ""
             cache_metadata: dict[str, str] = {}
             if is_forecast_lane or held_is_day0:
@@ -9071,7 +9079,7 @@ def event_bound_live_adapter_from_trade_conn(
                     observation_conn=calibration_conn,
                     decision_time=at,
                     max_age=FRESHNESS_WINDOW_DEFAULT,
-                    allow_unobserved_day0_replacement=not held_is_forecast_lane,
+                    allow_unobserved_day0_replacement=held_unobserved_prefix,
                     allow_provisional_day0_replacement=not held_is_forecast_lane,
                     probability_use=_CurrentProbabilityUse.HELD_MONITOR,
                     cache_metadata_out=cache_metadata,
@@ -37691,6 +37699,39 @@ def _latest_causal_day0_family_event(
         else dict(zip(columns, row, strict=True))
     )
     return OpportunityEvent(**values)
+
+
+def _held_day0_has_canonical_observation(
+    conn: sqlite3.Connection,
+    *,
+    event: OpportunityEvent,
+    decision_time: datetime,
+) -> bool:
+    """Use observation truth, not carrier type, to identify an empty prefix."""
+
+    if decision_time.tzinfo is None:
+        raise ValueError("GLOBAL_HELD_DAY0_OBSERVATION_TIME_NAIVE")
+    payload = _payload(event)
+    city = str(payload.get("city") or "").strip()
+    target_date = str(payload.get("target_date") or "").strip()
+    metric = str(payload.get("metric") or "").strip().lower()
+    if not city or not target_date or metric not in {"high", "low"}:
+        return False
+    from src.data.replacement_forecast_current_target_plan import (
+        _latest_authorized_day0_fact,
+    )
+
+    return bool(
+        _latest_authorized_day0_fact(
+            conn,
+            city=city,
+            target_date=target_date,
+            temperature_metric=metric,
+            decision_time=decision_time.astimezone(UTC),
+            require_settlement_channel=False,
+        )
+        is not None
+    )
 
 
 def _day0_redecision_authority_scope(
