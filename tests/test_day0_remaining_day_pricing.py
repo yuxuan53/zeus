@@ -63,6 +63,49 @@ UTC = timezone.utc
 def _settlement_semantics(city: str) -> SettlementSemantics:
     return SettlementSemantics.for_city(runtime_cities_by_name()[city])
 
+
+def _noaa_test_likelihood(
+    *,
+    station: str,
+    cutoff: str,
+    survival: float = 0.95,
+) -> dict[str, object]:
+    station = station.upper()
+    likelihood: dict[str, object] = {
+        "semantics": "same_station_preliminary_report_survival_likelihood_v1",
+        "cutoff": cutoff,
+        "successes": 19,
+        "failures": 1,
+        "unconfirmed_awc_ids": [],
+        "alpha": 19.5,
+        "beta": 1.5,
+        "station_id": station,
+        "source_channel_pair": {
+            "awc": "aviationweather_metar",
+            "ogimet": f"ogimet_metar_{station.lower()}",
+        },
+        "boundary_survival_probability": survival,
+    }
+    identity_fields = (
+        "semantics",
+        "cutoff",
+        "successes",
+        "failures",
+        "unconfirmed_awc_ids",
+        "alpha",
+        "beta",
+        "station_id",
+        "source_channel_pair",
+    )
+    likelihood["identity_hash"] = hashlib.sha256(
+        json.dumps(
+            {field: likelihood[field] for field in identity_fields},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return likelihood
+
 # Pin the retention-prune clock so this suite is HERMETIC. The persisted-vector
 # fixtures use fixed captured_at timestamps on the 2026-06-10 target day; the
 # prune cutoff is `now - retention_days`. Without a pinned `now`, the prune uses
@@ -283,12 +326,9 @@ def test_shared_remaining_carrier_uses_hko_oracle_truncation() -> None:
     assert hko["content_identity"] != wmo["content_identity"]
 
 
-def test_hko_monitor_remaining_operator_matches_materialized_carrier(
-    monkeypatch,
-) -> None:
-    """Held recompute and materialization must share HKO's settlement preimage."""
+def test_hko_provisional_replay_requires_persisted_carrier() -> None:
+    """HKO held redecision cannot invent a second provisional carrier."""
     import src.engine.event_reactor_adapter as era
-    from src.types.temperature import TemperatureDelta
 
     bins = [
         Bin(None, 24, "C", "24C or below"),
@@ -304,19 +344,18 @@ def test_hko_monitor_remaining_operator_matches_materialized_carrier(
         "_edli_day0_probability_boundary_native": 25.9,
         "_edli_day0_provisional_boundary_survival_probability": 0.9,
     }
-    monkeypatch.setattr(
-        "src.signal.ensemble_signal.sigma_instrument_for_city",
-        lambda _city: TemperatureDelta(0.0, "C"),
-    )
-
-    monitor_q = era._day0_remaining_p_raw_vector(
-        np.asarray([25.9], dtype=float),
-        city=_hong_kong(),
-        settlement_semantics=_settlement_semantics("Hong Kong"),
-        bins=bins,
-        payload=payload,
-        extra_member_sigma=0.0,
-    )
+    with pytest.raises(
+        ValueError,
+        match="DAY0_NOAA_PRELIMINARY_CARRIER_DECISION_TIME_MISSING",
+    ):
+        era._day0_remaining_p_raw_vector(
+            np.asarray([25.9], dtype=float),
+            city=_hong_kong(),
+            settlement_semantics=_settlement_semantics("Hong Kong"),
+            bins=bins,
+            payload=payload,
+            extra_member_sigma=0.0,
+        )
     materialized = build_day0_remaining_probability_carrier(
         future_extremes_c=[25.9],
         boundary_scenarios=((25.9, 0.9), (None, 0.1)),
@@ -342,7 +381,6 @@ def test_hko_monitor_remaining_operator_matches_materialized_carrier(
         settlement_semantics=_settlement_semantics("Tel Aviv"),
     )
 
-    assert monitor_q.tolist() == pytest.approx(materialized["q"])
     assert materialized["q"] == pytest.approx([0.0, 1.0, 0.0])
     assert legacy_half_up["q"] == pytest.approx([0.0, 0.0, 1.0])
     assert materialized["content_identity"] != legacy_half_up["content_identity"]
@@ -359,6 +397,41 @@ def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
     future = tuple(31.0 + (index % 5) * 0.25 for index in range(29))
     cutoff = "2026-08-24T09:30:00+00:00"
     decision_time = datetime(2026, 8, 24, 9, 30, tzinfo=UTC)
+    likelihood = {
+        "semantics": "same_station_preliminary_report_survival_likelihood_v1",
+        "cutoff": cutoff,
+        "successes": 19,
+        "failures": 1,
+        "unconfirmed_awc_ids": [],
+        "alpha": 19.5,
+        "beta": 1.5,
+        "station_id": "LLBG",
+        "source_channel_pair": {
+            "awc": "aviationweather_metar",
+            "ogimet": "ogimet_metar_llbg",
+        },
+        "boundary_survival_probability": 0.95,
+    }
+    likelihood["identity_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                field: likelihood[field]
+                for field in (
+                    "semantics",
+                    "cutoff",
+                    "successes",
+                    "failures",
+                    "unconfirmed_awc_ids",
+                    "alpha",
+                    "beta",
+                    "station_id",
+                    "source_channel_pair",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(
         "src.signal.ensemble_signal.sigma_instrument_for_city",
@@ -379,7 +452,7 @@ def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
                 unit="C",
                 decision_time_utc=cutoff,
                 station_id="LLBG",
-                preliminary_survival_identity="priorhash",
+                preliminary_survival_identity=str(likelihood["identity_hash"]),
             ),
             settlement_semantics=_settlement_semantics("Tel Aviv"),
         )
@@ -390,15 +463,7 @@ def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
             "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
             "_edli_day0_probability_boundary_native": 33.0,
             "_edli_day0_provisional_boundary_survival_probability": 0.95,
-            "_edli_day0_provisional_revision_likelihood": {
-                "identity_hash": "priorhash",
-                "boundary_survival_probability": 0.95,
-                "station_id": "LLBG",
-                "source_channel_pair": {
-                    "awc": "aviationweather_metar",
-                    "ogimet": "ogimet_metar_llbg",
-                },
-            },
+            "_edli_day0_provisional_revision_likelihood": likelihood,
             "_edli_day0_probability_operator": expected["operator"],
             "_edli_day0_remaining_probability_sample_count": 500,
             "_edli_day0_remaining_probability_samples": expected["samples"],
@@ -441,6 +506,29 @@ def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
         assert payload["_edli_day0_remaining_carrier_q"] == expected["q"]
         assert payload["_edli_day0_remaining_probability_samples"] == expected["samples"]
         assert payload["_edli_day0_remaining_probability_sample_count"] == 500
+        invalid_identity = dict(payload)
+        invalid_identity["_edli_day0_provisional_revision_likelihood"] = {
+            **likelihood,
+            "identity_hash": "0" * 64,
+        }
+        with pytest.raises(
+            ValueError,
+            match="DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID",
+        ):
+            era._day0_remaining_p_raw_vector(
+                np.asarray(future),
+                city=city,
+                settlement_semantics=SettlementSemantics.for_city(city),
+                bins=[
+                    Bin(None, 30, "C", "30C or below"),
+                    Bin(31, 31, "C", "31C"),
+                    Bin(32, 32, "C", "32C"),
+                    Bin(33, None, "C", "33C or above"),
+                ],
+                payload=invalid_identity,
+                extra_member_sigma=0.0,
+                decision_time=decision_time,
+            )
         ogimet_payload = {
             **payload,
             "settlement_source": "ogimet_metar_llbg",
@@ -609,6 +697,249 @@ def test_noaa_carrier_replay_requires_typed_decision_time():
             ],
             payload={"metric": "high", "settlement_source": "aviationweather_metar"},
             extra_member_sigma=0.0,
+        )
+
+
+def test_hko_adapter_replays_materialized_carrier_identity_and_q(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HKO held redecision must use the exact materialized provisional q."""
+    import src.engine.event_reactor_adapter as era
+    from src.config import ensemble_n_mc
+    from src.types.temperature import TemperatureDelta
+
+    city = runtime_cities_by_name()["Hong Kong"]
+    future = (25.4, 25.8, 28.4, 26.0)
+    cutoff = "2026-09-03T04:58:45+00:00"
+    decision_time = datetime(2026, 9, 3, 4, 58, 45, tzinfo=UTC)
+    likelihood = {
+        "semantics": "hko_provisional_monotonic_survival_beta_jeffreys_v1",
+        "lookback_start": "2026-08-04",
+        "lookback_end": "2026-09-03",
+        "transition_count": 30,
+        "retraction_count": 0,
+        "median_update_seconds": 600.0,
+        "projected_remaining_updates": 5,
+        "boundary_survival_probability": 0.97,
+    }
+    identity_fields = (
+        "semantics",
+        "lookback_start",
+        "lookback_end",
+        "transition_count",
+        "retraction_count",
+        "median_update_seconds",
+        "projected_remaining_updates",
+    )
+    likelihood["identity_hash"] = hashlib.sha256(
+        json.dumps(
+            {field: likelihood[field] for field in identity_fields},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(
+        "src.signal.ensemble_signal.sigma_instrument_for_city",
+        lambda _city: TemperatureDelta(0.0, "C"),
+    )
+    path_sigma = float(np.std(np.asarray(future), ddof=0))
+    expected = build_day0_remaining_probability_carrier(
+        future_extremes_c=future,
+        boundary_scenarios=((25.9, 0.97), (None, 1.0 - 0.97)),
+        metric="low",
+        path_error_sigma_c=path_sigma,
+        instrument_sigma_c=0.0,
+        bin_bounds_c=[(None, 23), (24, 24), (25, 25), (26, None)],
+        n_point=ensemble_n_mc(),
+        n_samples=500,
+        identity_inputs=day0_remaining_carrier_identity_inputs(
+            city="Hong Kong",
+            unit="C",
+            decision_time_utc=cutoff,
+            station_id="HKO",
+            preliminary_survival_identity=str(likelihood["identity_hash"]),
+        ),
+        settlement_semantics=SettlementSemantics.for_city(city),
+    )
+    payload = {
+        "city": "Hong Kong",
+        "target_date": "2026-09-03",
+        "metric": "low",
+        "rounded_value": 25.0,
+        "low_so_far": 25.9,
+        "settlement_source": "hko_hourly_accumulator",
+        "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
+        "_edli_day0_probability_boundary_native": 25.9,
+        "_edli_day0_provisional_boundary_survival_probability": 0.97,
+        "_edli_day0_provisional_revision_likelihood": likelihood,
+        "_edli_day0_probability_operator": expected["operator"],
+        "_edli_day0_remaining_probability_sample_count": 500,
+        "_edli_day0_remaining_probability_samples": expected["samples"],
+        "_edli_day0_remaining_carrier_future_extremes_c": list(future),
+        "_edli_day0_remaining_carrier_path_error_sigma_c": path_sigma,
+        "_edli_day0_remaining_carrier_probability_cutoff_utc": cutoff,
+        "_edli_day0_remaining_carrier_q": expected["q"],
+        "_edli_day0_remaining_content_identity": expected["content_identity"],
+        "_edli_day0_remaining_vector_witness": {
+            "vector_id": "hko-vector",
+            "expected_models": ["ecmwf_ifs"],
+            "actual_models": ["ecmwf_ifs"],
+            "capture_times_by_model_utc": {"ecmwf_ifs": cutoff},
+            "provider_source_cycle_time_by_model_utc": {"ecmwf_ifs": cutoff},
+            "provider_source_available_at_by_model_utc": {"ecmwf_ifs": cutoff},
+            "source_run_id_by_model": {"ecmwf_ifs": "source-run"},
+            "provider_run_id_by_model": {"ecmwf_ifs": "provider-run"},
+            "request_hash_by_model": {"ecmwf_ifs": "request-hash"},
+        },
+    }
+
+    replay = era._day0_remaining_p_raw_vector(
+        np.asarray(future),
+        city=city,
+        settlement_semantics=SettlementSemantics.for_city(city),
+        bins=[
+            Bin(None, 23, "C", "23C or below"),
+            Bin(24, 24, "C", "24C"),
+            Bin(25, 25, "C", "25C"),
+            Bin(26, None, "C", "26C or above"),
+        ],
+        payload=payload,
+        extra_member_sigma=0.0,
+        decision_time=decision_time,
+    )
+
+    assert replay.tolist() == pytest.approx(expected["q"])
+    missing_identity_field = dict(payload)
+    missing_identity_field["_edli_day0_provisional_revision_likelihood"] = {
+        "identity_hash": hashlib.sha256(
+            json.dumps(
+                {field: None for field in identity_fields},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "boundary_survival_probability": 0.97,
+    }
+    with pytest.raises(
+        ValueError,
+        match="DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID",
+    ):
+        era._day0_remaining_p_raw_vector(
+            np.asarray(future),
+            city=city,
+            settlement_semantics=SettlementSemantics.for_city(city),
+            bins=[
+                Bin(None, 23, "C", "23C or below"),
+                Bin(24, 24, "C", "24C"),
+                Bin(25, 25, "C", "25C"),
+                Bin(26, None, "C", "26C or above"),
+            ],
+            payload=missing_identity_field,
+            extra_member_sigma=0.0,
+            decision_time=decision_time,
+        )
+    fractional_identity = dict(likelihood)
+    fractional_identity.update(
+        transition_count=30.5,
+        retraction_count=0.5,
+        projected_remaining_updates=5.9,
+    )
+    fractional_identity["identity_hash"] = hashlib.sha256(
+        json.dumps(
+            {field: fractional_identity[field] for field in identity_fields},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    malformed_payload = dict(payload)
+    malformed_payload["_edli_day0_provisional_revision_likelihood"] = (
+        fractional_identity
+    )
+    with pytest.raises(
+        ValueError,
+        match="DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID",
+    ):
+        era._day0_remaining_p_raw_vector(
+            np.asarray(future),
+            city=city,
+            settlement_semantics=SettlementSemantics.for_city(city),
+            bins=[
+                Bin(None, 23, "C", "23C or below"),
+                Bin(24, 24, "C", "24C"),
+                Bin(25, 25, "C", "25C"),
+                Bin(26, None, "C", "26C or above"),
+            ],
+            payload=malformed_payload,
+            extra_member_sigma=0.0,
+            decision_time=decision_time,
+        )
+    previous_q = list(payload["_edli_day0_remaining_carrier_q"])
+    changed_future = (24.9, 25.1, 26.0, 26.0)
+    monkeypatch.setattr(
+        era,
+        "_day0_extra_member_sigma_native",
+        lambda **_kwargs: path_sigma,
+    )
+    payload["_edli_day0_redecision_authority_scope"] = (
+        "held_exposure_current_bundle_day0_only_v1"
+    )
+    family = SimpleNamespace(
+        city="Hong Kong",
+        target_date="2026-09-03",
+        metric="low",
+        candidates=[
+            SimpleNamespace(bin=Bin(None, 23, "C", "23C or below")),
+            SimpleNamespace(bin=Bin(24, 24, "C", "24C")),
+            SimpleNamespace(bin=Bin(25, 25, "C", "25C")),
+            SimpleNamespace(bin=Bin(26, None, "C", "26C or above")),
+        ],
+    )
+    next_decision_time = decision_time + timedelta(minutes=1)
+    era._rebuild_decision_time_day0_carrier(
+        payload=payload,
+        family=family,
+        unit="C",
+        decision_time=next_decision_time,
+        future_extremes_c=changed_future,
+        authority_kind="held_current_remaining_path",
+        entry_authority=False,
+    )
+    rebuilt = era._day0_remaining_p_raw_vector(
+        np.asarray(changed_future),
+        city=city,
+        settlement_semantics=SettlementSemantics.for_city(city),
+        bins=[candidate.bin for candidate in family.candidates],
+        payload=payload,
+        extra_member_sigma=0.0,
+        decision_time=next_decision_time,
+    )
+    assert payload["_edli_day0_remaining_carrier_future_extremes_c"] == list(
+        changed_future
+    )
+    assert rebuilt.tolist() == pytest.approx(
+        payload["_edli_day0_remaining_carrier_q"]
+    )
+    assert rebuilt.tolist() != pytest.approx(previous_q)
+
+    mutated = dict(payload)
+    mutated["_edli_day0_remaining_carrier_q"] = [1.0, 0.0, 0.0, 0.0]
+    with pytest.raises(
+        ValueError,
+        match="DAY0_NOAA_PRELIMINARY_CARRIER_Q_MISMATCH",
+    ):
+        era._day0_remaining_p_raw_vector(
+            np.asarray(changed_future),
+            city=city,
+            settlement_semantics=SettlementSemantics.for_city(city),
+            bins=[
+                Bin(None, 23, "C", "23C or below"),
+                Bin(24, 24, "C", "24C"),
+                Bin(25, 25, "C", "25C"),
+                Bin(26, None, "C", "26C or above"),
+            ],
+            payload=mutated,
+            extra_member_sigma=0.0,
+            decision_time=next_decision_time,
         )
 
 
@@ -1245,16 +1576,10 @@ def test_held_a_prime_rebuilds_real_tel_aviv_eleven_bin_carrier():
         ),
         "_edli_day0_source_clock_predictive_sigma_native": 1.2,
         "_edli_day0_provisional_boundary_survival_probability": 0.95,
-        "_edli_day0_provisional_revision_likelihood": {
-            "semantics": "same_station_preliminary_report_survival_likelihood_v1",
-            "identity_hash": "tel-aviv-prior-identity",
-            "boundary_survival_probability": 0.95,
-            "station_id": "LLBG",
-            "source_channel_pair": {
-                "awc": "aviationweather_metar",
-                "ogimet": "ogimet_metar_llbg",
-            },
-        },
+        "_edli_day0_provisional_revision_likelihood": _noaa_test_likelihood(
+            station="LLBG",
+            cutoff="2026-08-24T12:30:00+00:00",
+        ),
     }
     payload = dict(base_payload)
     era._rebuild_held_day0_shared_carrier(
@@ -1362,6 +1687,41 @@ def test_entry_current_state_rebuilds_effective_carrier_without_widening_held_au
     decision_time = datetime(2026, 8, 24, 12, 30, tzinfo=UTC)
     source_clock_vector = [27.0, 27.5, 28.0, 28.5]
     current_vector = (28.5, 29.0, 30.5, 31.25)
+    likelihood = {
+        "semantics": "same_station_preliminary_report_survival_likelihood_v1",
+        "cutoff": decision_time.isoformat(),
+        "successes": 19,
+        "failures": 1,
+        "unconfirmed_awc_ids": [],
+        "alpha": 19.5,
+        "beta": 1.5,
+        "station_id": "LLBG",
+        "source_channel_pair": {
+            "awc": "aviationweather_metar",
+            "ogimet": "ogimet_metar_llbg",
+        },
+        "boundary_survival_probability": 0.95,
+    }
+    likelihood["identity_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                field: likelihood[field]
+                for field in (
+                    "semantics",
+                    "cutoff",
+                    "successes",
+                    "failures",
+                    "unconfirmed_awc_ids",
+                    "alpha",
+                    "beta",
+                    "station_id",
+                    "source_channel_pair",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     payload = {
         "metric": "high",
         "rounded_value": 33.0,
@@ -1370,16 +1730,7 @@ def test_entry_current_state_rebuilds_effective_carrier_without_widening_held_au
         "_edli_day0_probability_boundary_native": 33.0,
         "_edli_day0_source_clock_predictive_sigma_native": 1.2,
         "_edli_day0_provisional_boundary_survival_probability": 0.95,
-        "_edli_day0_provisional_revision_likelihood": {
-            "semantics": "same_station_preliminary_report_survival_likelihood_v1",
-            "identity_hash": "entry-empirical-likelihood",
-            "boundary_survival_probability": 0.95,
-            "station_id": "LLBG",
-            "source_channel_pair": {
-                "awc": "aviationweather_metar",
-                "ogimet": "ogimet_metar_llbg",
-            },
-        },
+        "_edli_day0_provisional_revision_likelihood": likelihood,
         "_edli_day0_remaining_content_identity": "source-clock-identity",
         "_edli_day0_probability_operator": "source-clock-operator",
         "_edli_day0_remaining_carrier_q": [1.0],
@@ -1483,16 +1834,10 @@ def test_canonical_entry_seam_rebuilds_changed_current_state_carrier(monkeypatch
         "_edli_day0_probability_boundary_native": 33.0,
         "_edli_day0_source_clock_predictive_sigma_native": 1.2,
         "_edli_day0_provisional_boundary_survival_probability": 0.95,
-        "_edli_day0_provisional_revision_likelihood": {
-            "semantics": "same_station_preliminary_report_survival_likelihood_v1",
-            "identity_hash": "entry-empirical-likelihood",
-            "boundary_survival_probability": 0.95,
-            "station_id": "LLBG",
-            "source_channel_pair": {
-                "awc": "aviationweather_metar",
-                "ogimet": "ogimet_metar_llbg",
-            },
-        },
+        "_edli_day0_provisional_revision_likelihood": _noaa_test_likelihood(
+            station="LLBG",
+            cutoff=decision_time.isoformat(),
+        ),
         "_edli_day0_remaining_content_identity": "source-clock-identity",
         "_edli_day0_probability_operator": "source-clock-operator",
         "_edli_day0_remaining_carrier_q": [1.0],
@@ -1650,6 +1995,7 @@ def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units(
     decision_time = datetime(2026, 8, 24, 9, 30, tzinfo=UTC)
     from src.signal.ensemble_signal import sigma_instrument_for_city
 
+    likelihood = _noaa_test_likelihood(station="KATL", cutoff=cutoff)
     real_sigma = sigma_instrument_for_city(city)
     assert real_sigma.unit == "F"
     assert real_sigma.value == pytest.approx(0.5)
@@ -1668,7 +2014,7 @@ def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units(
                 unit="F",
                 decision_time_utc=cutoff,
                 station_id="KATL",
-                preliminary_survival_identity="priorhash-f",
+                preliminary_survival_identity=str(likelihood["identity_hash"]),
             ),
             settlement_semantics=_settlement_semantics("Atlanta"),
         )
@@ -1679,15 +2025,7 @@ def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units(
             "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
             "_edli_day0_probability_boundary_native": 80.0,
             "_edli_day0_provisional_boundary_survival_probability": 0.95,
-            "_edli_day0_provisional_revision_likelihood": {
-                "identity_hash": "priorhash-f",
-                "boundary_survival_probability": 0.95,
-                "station_id": "KATL",
-                "source_channel_pair": {
-                    "awc": "aviationweather_metar",
-                    "ogimet": "ogimet_metar_katl",
-                },
-            },
+            "_edli_day0_provisional_revision_likelihood": likelihood,
             "_edli_day0_probability_operator": expected["operator"],
             "_edli_day0_remaining_probability_sample_count": 500,
             "_edli_day0_remaining_probability_samples": expected["samples"],
@@ -5040,21 +5378,18 @@ class TestRemainingDayMembers:
         assert q[2] > 0.99
 
     @pytest.mark.parametrize(
-        ("metric", "future", "boundary_bin", "retracted_bin"),
+        ("metric", "future"),
         (
-            ("high", [24.0, 25.0], 1, 0),
-            ("low", [31.0, 32.0], 1, 2),
+            ("high", [24.0, 25.0]),
+            ("low", [31.0, 32.0]),
         ),
     )
-    def test_provisional_boundary_is_revision_mixture_not_static_or_ignored(
+    def test_hko_provisional_boundary_without_carrier_fails_closed(
         self,
-        monkeypatch,
         metric,
         future,
-        boundary_bin,
-        retracted_bin,
     ):
-        """7/24 HKO class: current extreme must dominate q without q=1."""
+        """HKO cannot rebuild an unbound second q from partial carrier fields."""
         import src.engine.event_reactor_adapter as era
         from src.contracts.settlement_semantics import SettlementSemantics
 
@@ -5076,80 +5411,18 @@ class TestRemainingDayMembers:
             "_edli_day0_provisional_boundary_survival_probability": survival,
         }
 
-        q = era._day0_remaining_p_raw_vector(
-            np.asarray(future, dtype=float),
-            city=_hong_kong(),
-            settlement_semantics=SettlementSemantics.for_city(_hong_kong()),
-            bins=bins,
-            payload=payload,
-            extra_member_sigma=0.0,
-        )
-
-        assert q[boundary_bin] == pytest.approx(survival, abs=0.03)
-        assert q[retracted_bin] == pytest.approx(1.0 - survival, abs=0.03)
-        assert payload["_edli_day0_probability_operator"] == (
-            "revision_mixture_extreme_observed_then_noisy_future_v2"
-        )
-
-        quoted_payload = {
-            **payload,
-            "best_bid": 0.001,
-            "best_ask": 0.999,
-            "entry_price": 0.338,
-            "unrealized_pnl": -7.13,
-        }
-        quoted_q = era._day0_remaining_p_raw_vector(
-            np.asarray(future, dtype=float),
-            city=_hong_kong(),
-            settlement_semantics=SettlementSemantics.for_city(_hong_kong()),
-            bins=bins,
-            payload=quoted_payload,
-            extra_member_sigma=0.0,
-        )
-        assert quoted_q.tolist() == pytest.approx(q.tolist())
-
-        monkeypatch.setattr(
-            era,
-            "_day0_process_sigma_native",
-            lambda **_kwargs: 0.0,
-        )
-        monkeypatch.setattr(
-            era,
-            "_day0_absorbing_mask",
-            lambda **_kwargs: np.ones(3, dtype=float),
-        )
-        sampler = era._make_day0_bootstrap_sampler(
-            members_native=np.asarray(future, dtype=float),
-            payload=payload,
-            family=SimpleNamespace(
-                city="Hong Kong",
-                target_date="2026-07-24",
-                metric=metric,
-            ),
-            unit="C",
-            decision_time=datetime(2026, 7, 24, 15, 50, tzinfo=UTC),
-        )
-        assert sampler is not None
-        assert sampler.rounded == pytest.approx(28.1)
-        assert sampler.boundary_survival_probability == pytest.approx(
-            survival
-        )
-        semantics = SettlementSemantics.for_city(_hong_kong())
-        analysis = SimpleNamespace(
-            _rng=np.random.default_rng(17),
-            _settle=semantics.round_values,
-            bins=bins,
-            p_cal=q,
-        )
-        sampled = sampler.sample_matrix(
-            analysis,
-            n_samples=4000,
-            n_members=1,
-        )
-        assert sampled.mean(axis=0).tolist() == pytest.approx(
-            q.tolist(),
-            abs=0.03,
-        )
+        with pytest.raises(
+            ValueError,
+            match="DAY0_NOAA_PRELIMINARY_CARRIER_DECISION_TIME_MISSING",
+        ):
+            era._day0_remaining_p_raw_vector(
+                np.asarray(future, dtype=float),
+                city=_hong_kong(),
+                settlement_semantics=SettlementSemantics.for_city(_hong_kong()),
+                bins=bins,
+                payload=payload,
+                extra_member_sigma=0.0,
+            )
 
     def test_members_use_observation_time_after_local_midnight(self, monkeypatch):
         import src.engine.event_reactor_adapter as era

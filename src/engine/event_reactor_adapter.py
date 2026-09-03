@@ -34791,6 +34791,143 @@ def _day0_probability_conditioning_source(
     ).strip()
 
 
+def _day0_is_shared_provisional_carrier_source(source: object) -> bool:
+    """Return whether the source persists a revision-weighted Day0 carrier."""
+
+    from src.events.day0_authority import day0_is_noaa_preliminary_source
+
+    normalized = str(source or "").strip().lower()
+    return day0_is_noaa_preliminary_source(normalized) or normalized.startswith(
+        "hko_hourly_accumulator"
+    )
+
+
+def _day0_provisional_carrier_station(
+    *,
+    city: object,
+    source: object,
+    likelihood: Mapping[str, object],
+    target_date: object | None = None,
+) -> str:
+    """Validate source-specific carrier identity and return its station key."""
+
+    normalized = str(source or "").strip().lower()
+    if normalized.startswith("hko_hourly_accumulator"):
+        identity_fields = (
+            "semantics",
+            "lookback_start",
+            "lookback_end",
+            "transition_count",
+            "retraction_count",
+            "median_update_seconds",
+            "projected_remaining_updates",
+        )
+        if any(
+            field not in likelihood or likelihood[field] is None
+            for field in identity_fields
+        ) or any(
+            type(likelihood[field]) is not int
+            for field in (
+                "transition_count",
+                "retraction_count",
+                "projected_remaining_updates",
+            )
+        ):
+            raise ValueError(
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID"
+            )
+        try:
+            lookback_start = date.fromisoformat(str(likelihood["lookback_start"]))
+            lookback_end = date.fromisoformat(str(likelihood["lookback_end"]))
+            transition_count = likelihood["transition_count"]
+            retraction_count = likelihood["retraction_count"]
+            median_update_seconds = float(likelihood["median_update_seconds"])
+            projected_remaining_updates = likelihood[
+                "projected_remaining_updates"
+            ]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID"
+            ) from exc
+        if (
+            target_date is None
+            or lookback_end != date.fromisoformat(str(target_date)[:10])
+            or lookback_start > lookback_end
+            or transition_count <= 0
+            or not 0 <= retraction_count <= transition_count
+            or not math.isfinite(median_update_seconds)
+            or median_update_seconds <= 0.0
+            or projected_remaining_updates < 1
+        ):
+            raise ValueError(
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID"
+            )
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                {field: likelihood.get(field) for field in identity_fields},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(getattr(city, "settlement_source_type", "") or "")
+            .strip()
+            .lower()
+            != "hko"
+            or str(likelihood.get("semantics") or "")
+            != "hko_provisional_monotonic_survival_beta_jeffreys_v1"
+            or str(likelihood.get("identity_hash") or "").strip().lower()
+            != expected_hash
+        ):
+            raise ValueError(
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID"
+            )
+        return "HKO"
+
+    configured_station = str(
+        getattr(city, "wu_station", "") or ""
+    ).strip().upper()
+    expected_source_pair = {
+        "awc": "aviationweather_metar",
+        "ogimet": f"ogimet_metar_{configured_station.lower()}",
+    }
+    identity_fields = (
+        "semantics",
+        "cutoff",
+        "successes",
+        "failures",
+        "unconfirmed_awc_ids",
+        "alpha",
+        "beta",
+        "station_id",
+        "source_channel_pair",
+    )
+    if "evidence_basis" in likelihood:
+        identity_fields = identity_fields + ("evidence_basis",)
+    if any(
+        field not in likelihood or likelihood[field] is None
+        for field in identity_fields
+    ):
+        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID")
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            {field: likelihood[field] for field in identity_fields},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        not configured_station
+        or str(likelihood.get("station_id") or "").strip().upper()
+        != configured_station
+        or likelihood.get("source_channel_pair") != expected_source_pair
+        or str(likelihood.get("identity_hash") or "").strip().lower()
+        != expected_hash
+    ):
+        raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID")
+    return configured_station
+
+
 def _provisional_day0_revision_likelihood(
     conn: sqlite3.Connection,
     *,
@@ -43418,10 +43555,8 @@ def _day0_remaining_p_raw_vector(
     """
 
     if decision_time is None:
-        from src.events.day0_authority import day0_is_noaa_preliminary_source
-
         source_hint = _day0_probability_conditioning_source(payload)
-        if day0_is_noaa_preliminary_source(source_hint):
+        if _day0_is_shared_provisional_carrier_source(source_hint):
             raise ValueError(
                 "DAY0_NOAA_PRELIMINARY_CARRIER_DECISION_TIME_MISSING"
             )
@@ -43474,20 +43609,21 @@ def _day0_remaining_p_raw_vector(
             extra_member_sigma,
         )
     )
-    # A NOAA preliminary peak is not an exact peak-set atom.  It must retain
-    # its report-survival scenarios in the shared remaining-path carrier.
+    # A provisional source boundary is not an exact peak-set atom. It must
+    # retain its revision-survival scenarios in the shared remaining carrier.
     # Only the separately typed fast-residual mixture keeps its own operator.
     from src.events.day0_authority import (
         DAY0_MONOTONE_SETTLEMENT_BOUND,
-        day0_is_noaa_preliminary_source,
     )
-    noaa_preliminary = (
+    source = _day0_probability_conditioning_source(payload)
+    hko_provisional = str(source).strip().lower().startswith(
+        "hko_hourly_accumulator"
+    )
+    shared_provisional_carrier = (
         finality in {"PROVISIONAL_CURRENT_SNAPSHOT", DAY0_MONOTONE_SETTLEMENT_BOUND}
-        and day0_is_noaa_preliminary_source(
-            _day0_probability_conditioning_source(payload)
-        )
+        and _day0_is_shared_provisional_carrier_source(source)
     )
-    if noaa_preliminary:
+    if shared_provisional_carrier:
         from src.data.day0_hourly_vectors import (
             build_day0_remaining_probability_carrier,
             day0_remaining_carrier_identity_inputs,
@@ -43520,18 +43656,12 @@ def _day0_remaining_p_raw_vector(
             raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_PERSISTED_FIELDS_INVALID") from exc
         if not likelihood_identity or not 0.0 < survival < 1.0:
             raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_LIKELIHOOD_INVALID")
-        configured_station = str(getattr(city, "wu_station", "") or "").strip().upper()
-        expected_source_pair = {
-            "awc": "aviationweather_metar",
-            "ogimet": f"ogimet_metar_{configured_station.lower()}",
-        }
-        if (
-            not configured_station
-            or str(likelihood.get("station_id") or "").strip().upper()
-            != configured_station
-            or likelihood.get("source_channel_pair") != expected_source_pair
-        ):
-            raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_SOURCE_IDENTITY_INVALID")
+        configured_station = _day0_provisional_carrier_station(
+            city=city,
+            source=source,
+            likelihood=likelihood,
+            target_date=payload.get("target_date"),
+        )
         try:
             payload_survival = float(
                 payload["_edli_day0_provisional_boundary_survival_probability"]
@@ -43611,11 +43741,17 @@ def _day0_remaining_p_raw_vector(
             )
         ):
             raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_WITNESS_INVALID")
-        boundary_scenarios = _day0_probability_boundary_scenarios_native(
-            payload,
-            metric=metric,
-            unit=str(getattr(city, "settlement_unit", "") or ""),
-        )
+        if hko_provisional:
+            boundary_scenarios = (
+                (float(probability_boundary), survival),
+                (None, 1.0 - survival),
+            )
+        else:
+            boundary_scenarios = _day0_probability_boundary_scenarios_native(
+                payload,
+                metric=metric,
+                unit=str(getattr(city, "settlement_unit", "") or ""),
+            )
         native_scale = 1.0 if carrier_unit == "C" else 9.0 / 5.0
         native_offset = 0.0 if carrier_unit == "C" else 32.0
         future_native = tuple(value * native_scale + native_offset for value in future_c)
@@ -44842,13 +44978,12 @@ def _rebuild_decision_time_day0_carrier(
     from src.events.day0_authority import (
         DAY0_MONOTONE_SETTLEMENT_BOUND,
         day0_evidence_finality,
-        day0_is_noaa_preliminary_source,
     )
     from src.signal.ensemble_signal import sigma_instrument_for_city
 
     source = _day0_probability_conditioning_source(payload).lower()
     finality = day0_evidence_finality(payload)
-    if not day0_is_noaa_preliminary_source(source) or finality not in {
+    if not _day0_is_shared_provisional_carrier_source(source) or finality not in {
         "PROVISIONAL_CURRENT_SNAPSHOT",
         DAY0_MONOTONE_SETTLEMENT_BOUND,
     }:
@@ -44876,18 +45011,12 @@ def _rebuild_decision_time_day0_carrier(
     city = runtime_cities_by_name().get(str(family.city))
     if city is None:
         raise ValueError("DAY0_HELD_SHARED_CARRIER_CITY_INVALID")
-    configured_station = str(getattr(city, "wu_station", "") or "").strip().upper()
-    expected_source_pair = {
-        "awc": "aviationweather_metar",
-        "ogimet": f"ogimet_metar_{configured_station.lower()}",
-    }
-    if (
-        not configured_station
-        or str(likelihood.get("station_id") or "").strip().upper()
-        != configured_station
-        or likelihood.get("source_channel_pair") != expected_source_pair
-    ):
-        raise ValueError("DAY0_HELD_SHARED_CARRIER_SOURCE_IDENTITY_INVALID")
+    configured_station = _day0_provisional_carrier_station(
+        city=city,
+        source=source,
+        likelihood=likelihood,
+        target_date=getattr(family, "target_date", None),
+    )
     carrier_unit = str(unit or getattr(city, "settlement_unit", "") or "").strip().upper()
     if carrier_unit not in {"C", "F"}:
         raise ValueError("DAY0_HELD_SHARED_CARRIER_UNIT_INVALID")
@@ -44910,11 +45039,23 @@ def _rebuild_decision_time_day0_carrier(
         )
         for candidate in family.candidates
     )
-    boundary_scenarios = _day0_probability_boundary_scenarios_native(
-        payload,
-        metric=str(family.metric).strip().lower(),
-        unit=carrier_unit,
-    )
+    if source.startswith("hko_hourly_accumulator"):
+        probability_boundary = _day0_probability_boundary_native(
+            payload,
+            str(family.metric).strip().lower(),
+        )
+        if probability_boundary is None:
+            raise ValueError("DAY0_HELD_SHARED_CARRIER_BOUNDARY_MISSING")
+        boundary_scenarios = (
+            (float(probability_boundary), survival),
+            (None, 1.0 - survival),
+        )
+    else:
+        boundary_scenarios = _day0_probability_boundary_scenarios_native(
+            payload,
+            metric=str(family.metric).strip().lower(),
+            unit=carrier_unit,
+        )
     cutoff = decision_time.astimezone(UTC).isoformat()
     carrier = build_day0_remaining_probability_carrier(
         future_extremes_c=values_native,
@@ -46201,15 +46342,13 @@ def _day0_remaining_day_members(
         payload["_edli_day0_unclamped_remaining_extrema_native"] = [
             float(value) for value in values.tolist()
         ]
-        from src.events.day0_authority import day0_is_noaa_preliminary_source
-
-        is_noaa_preliminary = day0_is_noaa_preliminary_source(
+        is_shared_provisional_carrier = _day0_is_shared_provisional_carrier_source(
             _day0_probability_conditioning_source(payload)
         )
         has_likelihood = isinstance(
             payload.get("_edli_day0_provisional_revision_likelihood"), Mapping
         )
-        if entry_authority and is_noaa_preliminary and has_likelihood:
+        if entry_authority and is_shared_provisional_carrier and has_likelihood:
             _rebuild_decision_time_day0_carrier(
                 payload=payload,
                 family=family,
@@ -46222,7 +46361,7 @@ def _day0_remaining_day_members(
         elif (
             payload.get("_edli_day0_redecision_authority_scope")
             == "held_exposure_current_bundle_day0_only_v1"
-            and is_noaa_preliminary
+            and is_shared_provisional_carrier
             and has_likelihood
         ):
             _rebuild_decision_time_day0_carrier(
@@ -46237,7 +46376,7 @@ def _day0_remaining_day_members(
         elif (
             payload.get("_edli_day0_redecision_authority_scope")
             == "held_exposure_current_day0_only_v1"
-            and is_noaa_preliminary
+            and is_shared_provisional_carrier
             and has_likelihood
         ):
             _rebuild_held_day0_shared_carrier(
