@@ -4671,6 +4671,38 @@ def test_post_terminal_day0_cleanup_gives_one_turn_to_material_input(tmp_path):
     assert selected.wake_id == "fill-newest"
 
 
+def test_failed_day0_yield_selects_price_without_advancing_forecast(tmp_path):
+    from src.runtime import reactor_wake
+
+    path = tmp_path / "wake.json"
+    day0 = reactor_wake.publish_reactor_wake(
+        source="day0",
+        reason="day0_extreme_event_committed",
+        path=path,
+        wake_id="day0-first",
+    )
+    price = reactor_wake.publish_reactor_wake(
+        source="price",
+        reason="market_price_advanced",
+        path=path,
+        wake_id="price-capital",
+    )
+    reactor_wake.publish_reactor_wake(
+        source="forecast",
+        reason="forecast_posterior_advanced",
+        path=path,
+        wake_id="forecast-carrier",
+        forecast_families=(("Paris", "2026-07-26", "high"),),
+    )
+
+    assert reactor_wake.read_reactor_wake(path=path) == day0
+    assert reactor_wake.read_reactor_wake(
+        path=path,
+        prefer_price_progress=True,
+        prefer_forecast_carrier_progress=True,
+    ) == price
+
+
 def test_reactor_wake_fill_is_bounded_fair_with_continuous_joint_inputs(tmp_path):
     from src.runtime import reactor_wake
 
@@ -4972,6 +5004,23 @@ def test_paused_forecast_yield_requires_successful_day0_monitor():
         main._edli_initialize_reactor_wake_cursor()
 
 
+def test_failed_owned_day0_monitor_arms_price_only_fairness_turn():
+    import src.main as main
+
+    main._edli_initialize_reactor_wake_cursor()
+    with main._day0_exit_monitor_attempts_lock:
+        main._day0_exit_monitor_attempts["day0-failed"] = None
+    try:
+        main._complete_day0_exit_monitor_attempt(
+            "day0-failed",
+            succeeded=False,
+        )
+        assert main._edli_failed_day0_price_yield.is_set()
+        assert main._edli_paused_forecast_post_monitor_yield.wake_ids == frozenset()
+    finally:
+        main._edli_initialize_reactor_wake_cursor()
+
+
 def test_paused_empty_exposure_selects_forecast_carrier_without_day0_yield(
     monkeypatch,
 ):
@@ -5123,11 +5172,12 @@ def test_paused_open_exposure_selects_forecast_after_day0_monitor_yield(
         assert main._edli_reactor_wake_poll_once() is True
         assert selections == [
             {
-                "exclude_wake_ids": frozenset({day0.wake_id}),
-                "prefer_exact_held_sell": True,
-                "prefer_forecast_carrier_progress": True,
-                "fail_on_error": True,
-            }
+                    "exclude_wake_ids": frozenset({day0.wake_id}),
+                    "prefer_exact_held_sell": True,
+                    "prefer_forecast_carrier_progress": True,
+                    "prefer_price_progress": True,
+                    "fail_on_error": True,
+                }
         ]
         assert cycle_kwargs["producer_wake_ids"] == (forecast.wake_id,)
         assert cycle_kwargs["allow_paused_forecast_snapshot_completion"] is True

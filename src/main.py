@@ -162,6 +162,7 @@ _edli_global_completion_yield = _OneTurnWakeExclusion()
 _edli_day0_post_monitor_yield = _OneTurnWakeExclusion()
 _edli_paused_forecast_post_monitor_yield = _OneTurnWakeExclusion()
 _edli_terminal_day0_cleanup_yield = threading.Event()
+_edli_failed_day0_price_yield = threading.Event()
 _HELD_POSITION_MONITOR_DEFER_JOBS = frozenset(
     {
         "edli_event_reactor",
@@ -4977,6 +4978,7 @@ def _edli_initialize_reactor_wake_cursor() -> None:
     _edli_day0_post_monitor_yield.reset()
     _edli_paused_forecast_post_monitor_yield.reset()
     _edli_terminal_day0_cleanup_yield.clear()
+    _edli_failed_day0_price_yield.clear()
     _edli_collateral_authority_wake_backoff_until.clear()
     _edli_last_collateral_authority_captured_at = None
     _day0_urgent_wake_pending.clear()
@@ -5517,9 +5519,15 @@ def _periodic_exit_monitor_should_yield(urgent_pending: bool) -> bool:
 
 
 def _complete_day0_exit_monitor_attempt(wake_id: str, *, succeeded: bool) -> None:
+    failed_owned_attempt = False
     with _day0_exit_monitor_attempts_lock:
         if wake_id in _day0_exit_monitor_attempts:
             _day0_exit_monitor_attempts[wake_id] = bool(succeeded)
+            failed_owned_attempt = not succeeded
+    if failed_owned_attempt:
+        # The Day0 wake stays durable and keeps first-turn priority, but one
+        # failed attempt cannot indefinitely starve persisted fill/price facts.
+        _edli_failed_day0_price_yield.set()
 
 
 def _record_day0_no_monitor_completion(wake_id: str) -> bool:
@@ -5894,6 +5902,8 @@ def _position_fill_wake_held_families(
 def _dispatch_forecast_exit_monitor(
     wake_ids: tuple[str, ...],
     target_families: frozenset[tuple[str, str, str]] | None,
+    *,
+    urgent_price: bool = False,
 ) -> bool:
     """Run held-family belief re-decision independently of entry event admission."""
 
@@ -5920,6 +5930,7 @@ def _dispatch_forecast_exit_monitor(
                 _exit_monitor_cycle(
                     target_families=target_families,
                     urgent_forecast=True,
+                    urgent_price=urgent_price,
                 )
                 is True
             )
@@ -6781,6 +6792,14 @@ def _edli_reactor_wake_poll_once() -> bool:
     )
     terminal_day0_cleanup_yield = _edli_terminal_day0_cleanup_yield.is_set()
     _edli_terminal_day0_cleanup_yield.clear()
+    failed_day0_price_yield = _edli_failed_day0_price_yield.is_set()
+    _edli_failed_day0_price_yield.clear()
+    prefer_price_progress = bool(
+        day0_post_monitor_yield_ids or failed_day0_price_yield
+    )
+    price_progress_kwargs = (
+        {"prefer_price_progress": True} if prefer_price_progress else {}
+    )
     paused_forecast_carrier_priority_allowed = (
         _paused_forecast_carrier_priority_allowed(
             exposure_priority_served=bool(
@@ -6802,6 +6821,7 @@ def _edli_reactor_wake_poll_once() -> bool:
                 exclude_wake_ids=excluded_wake_ids,
                 prefer_exact_held_sell=True,
                 prefer_forecast_carrier_progress=prefer_forecast_carrier_progress,
+                **price_progress_kwargs,
                 fail_on_error=True,
             )
         else:
@@ -6815,6 +6835,7 @@ def _edli_reactor_wake_poll_once() -> bool:
                         else {}
                     ),
                     prefer_forecast_carrier_progress=prefer_forecast_carrier_progress,
+                    **price_progress_kwargs,
                     fail_on_error=(
                         prefer_forecast_carrier_progress
                         or prefer_exact_held_sell
@@ -6828,6 +6849,7 @@ def _edli_reactor_wake_poll_once() -> bool:
                         else {}
                     ),
                     prefer_forecast_carrier_progress=prefer_forecast_carrier_progress,
+                    **price_progress_kwargs,
                     fail_on_error=(
                         prefer_forecast_carrier_progress
                         or prefer_exact_held_sell
@@ -6844,6 +6866,7 @@ def _edli_reactor_wake_poll_once() -> bool:
                     else {}
                 ),
                 prefer_forecast_carrier_progress=prefer_forecast_carrier_progress,
+                **price_progress_kwargs,
                 fail_on_error=(
                     prefer_forecast_carrier_progress
                     or prefer_exact_held_sell
@@ -6873,6 +6896,8 @@ def _edli_reactor_wake_poll_once() -> bool:
             # preference after one selection; empty exact debt never arms it.
             _edli_day0_post_monitor_yield.arm(wake.wake_id)
     except (OSError, ValueError):
+        if failed_day0_price_yield:
+            _edli_failed_day0_price_yield.set()
         logger.warning(
             "paused forecast carrier selection unavailable; retaining wake debt",
             exc_info=True,
@@ -7168,6 +7193,7 @@ def _edli_reactor_wake_poll_once() -> bool:
             _dispatch_forecast_exit_monitor(
                 tuple(queued.wake_id for queued in wakes),
                 forecast_monitor_families,
+                **({"urgent_price": True} if price_wake else {}),
             )
         _started, result = _forecast_exit_monitor_attempt_state(wake.wake_id)
         if result is not True:
@@ -9866,6 +9892,7 @@ def _exit_monitor_cycle(
     target_families: frozenset[tuple[str, str, str]] | None = None,
     urgent_day0: bool = False,
     urgent_forecast: bool = False,
+    urgent_price: bool = False,
     recovery_full_book: bool = False,
 ) -> bool:
     """Scheduler hook — body owned by src.execution.exit_lifecycle (R4-b
@@ -9925,7 +9952,7 @@ def _exit_monitor_cycle(
         )
 
     periodic_full_book = target_families is None and not urgent_fact
-    if urgent_forecast and (
+    if urgent_forecast and not urgent_price and (
         _day0_exit_monitor_priority_pending()
         or _day0_held_monitor_preempt_requested.is_set()
     ):
@@ -10108,7 +10135,7 @@ def _exit_monitor_cycle(
             # missing fresh belief authority and the scan returns incomplete.
             _periodic_held_position_monitor_fairness_debt.clear()
         _held_position_monitor_handoff_pending.clear()
-        if urgent_forecast and (
+        if urgent_forecast and not urgent_price and (
             _day0_exit_monitor_priority_pending()
             or _day0_held_monitor_preempt_requested.is_set()
         ):
@@ -10129,7 +10156,7 @@ def _exit_monitor_cycle(
             )
             return True
         should_preempt_for_urgent_day0 = None
-        if urgent_forecast:
+        if urgent_forecast and not urgent_price:
             from src.runtime.reactor_wake import read_reactor_wake
 
             def _day0_wake_pending() -> bool:
@@ -10145,6 +10172,11 @@ def _exit_monitor_cycle(
                 )
 
             should_preempt_for_urgent_day0 = _day0_wake_pending
+        elif urgent_price:
+            # Price and Day0 are both live-capital inputs. Once a failed Day0
+            # cut yields its bounded fairness turn, finish this targeted
+            # current-book redecision before returning to Day0-first service.
+            should_preempt_for_urgent_day0 = lambda: False
         elif urgent_day0:
             # Same-priority Day0 wakes are durable and run next.  Preempting an
             # in-flight urgent batch on every newer observation creates a

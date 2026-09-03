@@ -2280,8 +2280,8 @@ def test_price_wake_dispatches_held_monitor_before_reactor(monkeypatch, tmp_path
     monitored = []
     dispatched = []
 
-    def _dispatch(wake_ids, target_families):
-        monitored.append((wake_ids, target_families))
+    def _dispatch(wake_ids, target_families, *, urgent_price=False):
+        monitored.append((wake_ids, target_families, urgent_price))
         with main._forecast_exit_monitor_attempts_lock:
             for wake_id in wake_ids:
                 main._forecast_exit_monitor_attempts[wake_id] = True
@@ -2303,7 +2303,7 @@ def test_price_wake_dispatches_held_monitor_before_reactor(monkeypatch, tmp_path
 
     try:
         assert main._edli_reactor_wake_poll_once() is True
-        assert monitored == [((wake.wake_id,), frozenset({family}))]
+        assert monitored == [((wake.wake_id,), frozenset({family}), True)]
         assert dispatched == ["market_price_advanced"]
     finally:
         main._forecast_exit_monitor_attempts.clear()

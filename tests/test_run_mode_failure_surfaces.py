@@ -9528,6 +9528,46 @@ def test_claim_busy_urgent_forecast_leaves_stable_preemption_debt() -> None:
         main_module._forecast_held_monitor_preempt_requested.clear()
 
 
+def test_urgent_price_monitor_completes_bounded_turn_despite_day0_pending(
+    monkeypatch,
+) -> None:
+    import src.execution.exit_lifecycle as exit_module
+    import src.main as main_module
+
+    class ReactorGate:
+        def acquire(self, *, timeout: float) -> bool:
+            return True
+
+        def release(self) -> None:
+            pass
+
+    calls: list[str] = []
+
+    def _run(**kwargs) -> bool:
+        calls.append("run")
+        assert kwargs["should_preempt_for_urgent_day0"]() is False
+        kwargs["mark_held_position_monitor_complete"]()
+        return True
+
+    main_module._held_position_monitor_active.clear()
+    main_module._day0_held_monitor_preempt_requested.set()
+    with main_module._day0_exit_monitor_attempts_lock:
+        main_module._day0_exit_monitor_attempts["day0-pending"] = None
+    monkeypatch.setattr(main_module, "_edli_reactor_active_lock", ReactorGate())
+    monkeypatch.setattr(exit_module, "run_exit_monitor_cycle", _run)
+    try:
+        assert main_module._exit_monitor_cycle(
+            target_families=frozenset({("Lucknow", "2026-09-03", "high")}),
+            urgent_forecast=True,
+            urgent_price=True,
+        ) is True
+        assert calls == ["run"]
+    finally:
+        main_module._day0_held_monitor_preempt_requested.clear()
+        main_module._day0_exit_monitor_attempts.clear()
+        main_module._held_position_monitor_active.clear()
+
+
 def test_periodic_exit_monitor_preempts_inflight_for_forecast_debt(
     monkeypatch,
 ) -> None:
