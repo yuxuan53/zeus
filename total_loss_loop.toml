@@ -15,8 +15,8 @@ floor_config_key = "execution.absolute_live_unit_price_min"
 hard_slots = 1
 precursor_slots = 1
 max_evidence_rows_per_table = 250000
-evidence_source_rows = 64
-evidence_build_budget_ms = 3000
+evidence_source_rows = 16
+evidence_build_budget_ms = 10000
 
 [active]
 profile = "frontier_current"

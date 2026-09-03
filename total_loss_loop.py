@@ -2725,7 +2725,9 @@ def _retry_committed_receipt(cfg: Mapping[str, Any], deadline: float) -> None:
         _TRIGGER_DEADLINE = previous_deadline
 
 
-def detect(cfg: Mapping[str, Any]) -> list[str]:
+def detect(
+    cfg: Mapping[str, Any], *, capture_evidence: bool = True
+) -> list[str]:
     global _LAST_EVIDENCE_CYCLE
     _LAST_EVIDENCE_CYCLE = {"built": [], "deferred": [], "attempted": 0, "validated": 0, "bytes": 0}
     trigger_deadline = time.monotonic() + max(0.01, float(cfg["loop"].get("trigger_budget_ms", 100.0))) / 1000.0
@@ -2751,11 +2753,12 @@ def detect(cfg: Mapping[str, Any]) -> list[str]:
         # Both trigger connections are closed before this independent local
         # snapshot transaction begins.  Keep the cycle to one shared-budget
         # evidence capture, even when maintenance is interrupted.
-        _capture_hard_evidence(
-            cfg,
-            trigger_created,
-            budget=_new_evidence_budget(cfg),
-        )
+        if capture_evidence:
+            _capture_hard_evidence(
+                cfg,
+                trigger_created,
+                budget=_new_evidence_budget(cfg),
+            )
         return list(dict.fromkeys(trigger_created))
     maintenance_ids = list(maintenance_result)
     created = list(dict.fromkeys([*maintenance_ids, *trigger_created]))
@@ -2779,11 +2782,12 @@ def detect(cfg: Mapping[str, Any]) -> list[str]:
     # before trigger/maintenance made ordinary detector work consume the whole
     # evidence budget, so hard incidents entered the expired recovery path
     # without ever attempting a snapshot.
-    _capture_hard_evidence(
-        cfg,
-        created,
-        budget=_new_evidence_budget(cfg),
-    )
+    if capture_evidence:
+        _capture_hard_evidence(
+            cfg,
+            created,
+            budget=_new_evidence_budget(cfg),
+        )
     return list(dict.fromkeys(created))
 
 
@@ -2916,12 +2920,19 @@ def _quote_payload_bytes(row: Mapping[str, Any]) -> int:
 
 def _monitor_anchor_signature(row: sqlite3.Row) -> tuple[Any, ...]:
     payload = read_json_text(str(row["payload_json"] or "{}"))
+    validations = payload.get("applied_validations")
+    validation_identity = (
+        digest(json.dumps(validations, sort_keys=True, default=str))
+        if isinstance(validations, list)
+        else None
+    )
     return (
         payload.get("exit_decision_should_exit"),
         payload.get("exit_decision_reason"),
         payload.get("exit_decision_trigger"),
         next((payload.get(key) for key in ("q_version", "posterior_id", "posterior_revision", "probability_identity") if key in payload), None),
         next((payload.get(key) for key in ("last_monitor_prob_is_fresh", "probability_is_fresh", "source_available", "availability_state") if key in payload), None),
+        validation_identity,
     )
 
 
@@ -2940,39 +2951,27 @@ def _compact_monitor_event(row: Mapping[str, Any], payload: Mapping[str, Any]) -
     receipt = receipt if isinstance(receipt, Mapping) else {}
     observation = receipt.get("observation")
     observation = observation if isinstance(observation, Mapping) else {}
-    event = {key: value for key, value in row.items() if key != "payload_json"}
-    compact_payload = {
+    compact_payload: dict[str, Any] = {
+        "phase_before": row.get("phase_before"),
+        "phase_after": row.get("phase_after"),
+    }
+    compact_payload["decision"] = {
         key: payload.get(key)
         for key in (
-            "applied_validations",
-            "exit_decision_available",
             "exit_decision_reason",
-            "exit_decision_selected_method",
             "exit_decision_should_exit",
             "exit_decision_trigger",
-            "exit_decision_urgency",
-            "hold_reason",
-            "last_monitor_best_ask",
-            "last_monitor_best_bid",
-            "last_monitor_edge",
-            "last_monitor_market_price",
-            "last_monitor_market_price_is_fresh",
-            "last_monitor_prob",
-            "last_monitor_prob_is_fresh",
-            "phase_after",
-            "q_version",
-            "selected_method",
         )
         if key in payload
     }
+    validations = payload.get("applied_validations")
+    if isinstance(validations, list):
+        compact_payload["applied_validations_identity"] = digest(
+            json.dumps(validations, sort_keys=True, default=str)
+        )
     compact_payload["probability_receipt"] = {
         key: receipt.get(key)
         for key in (
-            "held_direction",
-            "held_pinned_recompute",
-            "held_side_probability",
-            "pinned_complete_posterior_id",
-            "pinned_complete_posterior_identity",
             "probability_authority",
             "probability_content_identity",
             "probability_witness_identity",
@@ -2989,16 +2988,12 @@ def _compact_monitor_event(row: Mapping[str, Any], payload: Mapping[str, Any]) -
             "evidence_finality",
             "observation_available_at",
             "observation_time",
-            "observed_extreme_native",
-            "posterior_id",
-            "probability_base_identity",
-            "probability_conditioning_observation_time",
             "settlement_source",
             "station_id",
         )
         if key in observation
     }
-    return json.dumps({"event": event, "payload": compact_payload}, default=str)
+    return json.dumps(compact_payload, default=str)
 
 
 def _monitor_is_red_or_exit(row: sqlite3.Row) -> bool:
@@ -3175,7 +3170,10 @@ def _select_evidence_quotes(
                 label=f"clock_{side}",
             )
     trajectory_rows = 0
+    trajectory_rows_seen = 0
+    trajectory_unchanged_top_omitted = 0
     trajectory_reason: str | None = None
+    previous_top_by_direction: dict[str, tuple[Any, Any]] = {}
     cursor = trades.execute(
         "SELECT rowid,evidence_id,event_id,condition_id,token_id,outcome_label,direction,quote_seen_at,"
         "book_hash_before,best_bid_before,best_ask_before,LENGTH(depth_before_json) AS depth_bytes,created_at,schema_version "
@@ -3202,7 +3200,15 @@ def _select_evidence_quotes(
             if time.monotonic() >= float(budget["deadline"]):
                 trajectory_reason = "deadline"
                 break
+            trajectory_rows_seen += 1
+            direction = str(meta["direction"] or "")
+            top = (meta["best_bid_before"], meta["best_ask_before"])
+            previous_top = previous_top_by_direction.get(direction)
+            previous_top_by_direction[direction] = top
             if int(meta["rowid"]) in selected:
+                continue
+            if previous_top == top:
+                trajectory_unchanged_top_omitted += 1
                 continue
             if not retain(meta, required=False, label="trajectory"):
                 trajectory_reason = "source_payload_limit"
@@ -3212,11 +3218,13 @@ def _select_evidence_quotes(
         trajectory_reason = "row_limit"
     rows = [*sorted((row for row in selected.values() if str(row["evidence_id"]) in critical_ids), key=lambda row: (str(row["quote_seen_at"]), str(row["evidence_id"]))), *sorted((row for row in selected.values() if str(row["evidence_id"]) not in critical_ids), key=lambda row: (str(row["quote_seen_at"]), str(row["evidence_id"])))]
     return rows, {
-        "strategy": "metadata_first_critical_brackets_then_batched_trajectory",
+        "strategy": "critical_brackets_plus_top_of_book_change_points",
         "causal_completeness": "complete" if trajectory_reason is None else "sampled_not_complete",
         "truncation_reason": trajectory_reason,
         "critical_rows": len(critical_ids),
         "trajectory_rows": trajectory_rows,
+        "trajectory_rows_seen": trajectory_rows_seen,
+        "trajectory_unchanged_top_rows_omitted": trajectory_unchanged_top_omitted,
         "trajectory_row_cap": row_limit,
         "critical_rows_reserved_outside_trajectory_cap": len(critical_ids),
         "critical_crossing_required": required_crossing,
@@ -3438,6 +3446,7 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                 noncritical_depth_omitted += 1
         quote_selection["noncritical_depth_rows_omitted"] = noncritical_depth_omitted
         critical_monitor_times = set(clock_times)
+        full_monitor_receipts_retained = 0
         for raw in events:
             _budget_check(evidence, out)
             row = dict(raw)
@@ -3455,23 +3464,34 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                 )
             if row["event_type"] == "MONITOR_REFRESHED":
                 occurred_at = parse_time(str(row["occurred_at"] or ""))
-                monitor_json = (
-                    packed
-                    if occurred_at in critical_monitor_times
-                    else _compact_monitor_event(row, payload)
-                )
-                _budget_check(evidence, out, extra_bytes=len(monitor_json.encode()))
-                out.execute(
-                    "INSERT INTO monitor_events VALUES (?,?,?)",
-                    (row["event_id"], row["occurred_at"], monitor_json),
-                )
+                compact_monitor_json = _compact_monitor_event(row, payload)
+                if occurred_at in critical_monitor_times:
+                    _budget_check(evidence, out, extra_bytes=len(packed.encode()))
+                    out.execute(
+                        "INSERT INTO monitor_events VALUES (?,?,?)",
+                        (row["event_id"], row["occurred_at"], packed),
+                    )
+                    full_monitor_receipts_retained += 1
                 probability = _json_number(payload, ("last_monitor_prob", "p_posterior", "held_probability", "probability", "q"))
                 edge = _json_number(payload, ("last_monitor_edge", "edge", "held_edge"))
                 market_price = _json_number(payload, ("last_monitor_market_price", "market_price", "best_bid", "held_bid"))
                 fresh = _json_number(payload, ("last_monitor_prob_is_fresh", "probability_is_fresh", "is_fresh"))
+                _budget_check(
+                    evidence,
+                    out,
+                    extra_bytes=len(compact_monitor_json.encode()),
+                )
                 out.execute(
                     "INSERT INTO probability_ticks VALUES (?,?,?,?,?,?,?)",
-                    (row["event_id"], row["occurred_at"], probability, edge, market_price, int(bool(fresh)) if fresh is not None else None, json.dumps({"monitor_event_id": row["event_id"]})),
+                    (
+                        row["event_id"],
+                        row["occurred_at"],
+                        probability,
+                        edge,
+                        market_price,
+                        int(bool(fresh)) if fresh is not None else None,
+                        compact_monitor_json,
+                    ),
                 )
             if row["event_type"] in {"MONITOR_REFRESHED", "EXIT_INTENT", "EXIT_ORDER_POSTED", "EXIT_ORDER_FILLED", "EXIT_ORDER_REJECTED", "EXIT_RETRY_RELEASED"}:
                 decision_json = packed
@@ -3488,6 +3508,12 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                     )
                 _budget_check(evidence, out, extra_bytes=len(decision_json.encode()))
                 out.execute("INSERT INTO exit_decisions VALUES (?,?,?,?,?)", (row["event_id"], row["occurred_at"], row["event_type"], row.get("command_id"), decision_json))
+        quote_selection["full_monitor_receipts_retained"] = (
+            full_monitor_receipts_retained
+        )
+        quote_selection["continuous_probability_ticks_retained"] = sum(
+            1 for row in events if str(row["event_type"]) == "MONITOR_REFRESHED"
+        )
         for raw in commands:
             _budget_check(evidence, out)
             row = dict(raw)
@@ -8494,6 +8520,65 @@ def _spawn_dispatch_worker(cfg: Mapping[str, Any]) -> subprocess.Popen[Any]:
         handle.close()
 
 
+def _spawn_evidence_worker(cfg: Mapping[str, Any]) -> subprocess.Popen[Any]:
+    logs = runtime_dir(cfg) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"evidence-{os.getpid()}-{time.monotonic_ns()}.log"
+    handle = log_path.open("wb")
+    try:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--config",
+                str(cfg.get("_config_path") or CONFIG_PATH),
+                "evidence-once",
+            ],
+            cwd=ROOT,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        handle.close()
+
+
+def evidence_once(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Drain one bounded evidence tranche outside the detector clock."""
+
+    run = runtime_dir(cfg)
+    run.mkdir(parents=True, exist_ok=True)
+    lock = (run / "evidence.lock").open("w")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return {"status": "busy", "built": [], "deferred": []}
+    status_path = run / "evidence-worker-status.json"
+    atomic_json(
+        status_path,
+        {"status": "running", "pid": os.getpid(), "at": iso()},
+    )
+    try:
+        result = _capture_hard_evidence(cfg, scan_all=True)
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "pid": os.getpid(),
+            "at": iso(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        atomic_json(status_path, payload)
+        raise
+    payload = {
+        "status": "complete",
+        "pid": os.getpid(),
+        "at": iso(),
+        **result,
+    }
+    atomic_json(status_path, payload)
+    return payload
+
+
 def daemon(cfg: Mapping[str, Any]) -> int:
     run = runtime_dir(cfg)
     run.mkdir(parents=True, exist_ok=True)
@@ -8549,9 +8634,11 @@ def daemon(cfg: Mapping[str, Any]) -> int:
         _STARTUP_BUDGET = None
     poll = max(0.05, float(cfg["loop"].get("poll_ms", 250)) / 1000.0)
     dispatch_worker: subprocess.Popen[Any] | None = None
+    evidence_worker: subprocess.Popen[Any] | None = None
     dispatch_error: str | None = None
     capabilities_ready = False
     next_debt_check_at = 0.0
+    next_evidence_check_at = 0.0
     while not stopping and not (run / "HALT").exists():
         cycle_started = time.monotonic()
         detector_elapsed = 0.0
@@ -8626,7 +8713,10 @@ def daemon(cfg: Mapping[str, Any]) -> int:
         )
         try:
             detector_started = time.monotonic()
-            created = detect(cfg)
+            # Crossing persistence owns the sub-second detector clock. Evidence
+            # reconstruction runs in its own worker and cannot delay the next
+            # market observation.
+            created = detect(cfg, capture_evidence=False)
             detector_elapsed = time.monotonic() - detector_started
         except Exception as exc:  # the detector remains restartable and evidence-backed
             error = f"{type(exc).__name__}: {exc}"
@@ -8649,6 +8739,11 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                     if dispatch_worker is not None and dispatch_worker.poll() is None
                     else None
                 ),
+                "evidence_worker_pid": (
+                    evidence_worker.pid
+                    if evidence_worker is not None and evidence_worker.poll() is None
+                    else None
+                ),
                 "error": error,
                 "dispatch_error": dispatch_error,
                 "provider_backoff": _provider_backoff(cfg),
@@ -8656,6 +8751,17 @@ def daemon(cfg: Mapping[str, Any]) -> int:
         )
         if error is None and not startup_pending and not _startup_debt_pending(cfg):
             try:
+                evidence_worker_exited = (
+                    evidence_worker is not None and evidence_worker.poll() is not None
+                )
+                if (
+                    evidence_worker is None or evidence_worker_exited
+                ) and (
+                    bool(created)
+                    or time.monotonic() >= next_evidence_check_at
+                ):
+                    evidence_worker = _spawn_evidence_worker(cfg)
+                    next_evidence_check_at = time.monotonic() + 5.0
                 running = _running(cfg)
                 completed = poll_runs(cfg, running)
                 if completed:
@@ -8712,6 +8818,8 @@ def daemon(cfg: Mapping[str, Any]) -> int:
             time.sleep(poll - elapsed)
     if dispatch_worker is not None and dispatch_worker.poll() is None:
         _terminate_process_group(dispatch_worker.pid)
+    if evidence_worker is not None and evidence_worker.poll() is None:
+        _terminate_process_group(evidence_worker.pid)
     terminated: list[str] = []
     for active in _running(cfg):
         _terminate_process_group(int(active["pid"]))
@@ -8735,6 +8843,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("bootstrap")
     sub.add_parser("probe")
     sub.add_parser("scan-once")
+    sub.add_parser("evidence-once")
     sub.add_parser("dispatch-once")
     sub.add_parser("daemon")
     sub.add_parser("status")
@@ -8763,6 +8872,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "scan-once":
         bootstrap(cfg)
         print(json.dumps({"created": detect(cfg)}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "evidence-once":
+        bootstrap(cfg)
+        print(json.dumps(evidence_once(cfg), ensure_ascii=False, indent=2))
         return 0
     if args.command == "dispatch-once":
         bootstrap(cfg)

@@ -1352,7 +1352,7 @@ def test_daemon_publishes_fresh_status_before_slow_evidence_maintenance(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def slow_detect(_cfg: dict) -> list[str]:
+    def slow_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         payload = json.loads((runtime / "status.json").read_text())
         observed.append(payload)
         assert payload["alive"] is True
@@ -1420,7 +1420,7 @@ def test_daemon_startup_status_precedes_bounded_large_run_reconcile(
         read_count["value"] += 1
         return original_metadata(path)
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         payload = json.loads((runtime / "status.json").read_text())
         observed.append(payload)
         assert payload["alive"] is True
@@ -1530,7 +1530,7 @@ def test_startup_schema_fast_path_handles_live_scale_without_repeating_ddl(
             real_sleep(0.3)
         original_bootstrap_memory(local_cfg)
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         status = json.loads((runtime / "status.json").read_text())
         cursor_path = runtime / "startup-cursor.json"
         if cursor_path.is_file():
@@ -1806,6 +1806,29 @@ def test_detect_starts_evidence_budget_after_maintenance(
     assert captured_remaining == [1.0]
 
 
+def test_detector_can_commit_crossing_without_waiting_for_evidence_worker(
+    cfg: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _position(cfg)
+    _quote(cfg, "async-evidence-crossing", "2026-08-22T09:00:02+00:00", 0.01)
+    monkeypatch.setattr(
+        loop,
+        "_capture_hard_evidence",
+        lambda *_args, **_kwargs: pytest.fail("detector must not build evidence"),
+    )
+
+    created = loop.detect(cfg, capture_evidence=False)
+
+    assert len(created) == 1
+    with loop.memory(cfg) as mem:
+        incident = mem.execute(
+            "SELECT status,stage FROM incidents WHERE incident_id=?",
+            (created[0],),
+        ).fetchone()
+    assert tuple(incident) == ("queued", "blind")
+
+
 def test_evidence_queue_cursor_bounds_provider_backoff_capture(
     cfg: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1999,7 +2022,7 @@ def test_startup_locked_reconcile_keeps_same_batch_for_next_cycle(
     (codex_home / "auth.json").write_text("{}\n")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         payload = json.loads((runtime / "status.json").read_text())
         observed.append(payload)
         if len(observed) == 1:
@@ -3039,7 +3062,7 @@ def test_daemon_keeps_detecting_while_dispatch_worker_is_busy(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         detected.append(len(detected) + 1)
         if len(detected) == 2:
             (runtime / "HALT").touch()
@@ -3075,7 +3098,7 @@ def test_daemon_does_not_spawn_dispatch_worker_without_durable_debt(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         detected.append(len(detected) + 1)
         if len(detected) == 3:
             (runtime / "HALT").touch()
@@ -3116,7 +3139,7 @@ def test_daemon_owns_missing_capability_probe_before_dispatch(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         detected.append(len(detected) + 1)
         if len(detected) == 3:
             (runtime / "HALT").touch()
@@ -3159,7 +3182,7 @@ def test_model_completion_wakes_eligible_dispatch_once(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         detected.append(len(detected) + 1)
         if len(detected) == 2:
             (runtime / "HALT").touch()
@@ -3263,7 +3286,7 @@ def test_daemon_records_dispatch_failures_without_blocking_next_detect(
         runtime.mkdir(parents=True, exist_ok=True)
         return {"runtime": str(runtime)}
 
-    def fake_detect(_cfg: dict) -> list[str]:
+    def fake_detect(_cfg: dict, **_kwargs: object) -> list[str]:
         detected.append(len(detected) + 1)
         if len(detected) == 4:
             (runtime / "HALT").touch()
@@ -4283,6 +4306,25 @@ def test_evidence_db_exposes_timeline_tables_without_copying_canonical_db(cfg: d
     _quote(cfg, "q-low", "2026-08-22T09:00:02+00:00", 0.01)
     _quote(cfg, "q-after", "2026-08-22T09:00:03+00:00", 0.02, latest=False)
     _quote(cfg, "q-trajectory", "2026-08-22T09:00:04+00:00", 0.03, latest=False)
+    _quote(cfg, "q-trajectory-repeat", "2026-08-22T09:00:04.500000+00:00", 0.03, latest=False)
+    _quote(cfg, "q-monitor-pre", "2026-08-22T09:00:05+00:00", 0.03, latest=False)
+    for index in range(3):
+        _event(
+            cfg,
+            f"monitor-evidence-{index}",
+            "p1",
+            10 + index,
+            "MONITOR_REFRESHED",
+            f"2026-08-22T09:00:0{6 + index}+00:00",
+            phase_before="active",
+            phase_after="active",
+            payload={
+                "last_monitor_prob": 0.03,
+                "last_monitor_best_bid": 0.08,
+                "last_monitor_prob_is_fresh": True,
+                "q_version": "same-q",
+            },
+        )
     incident_id = loop.detect(cfg)[0]
 
     evidence = loop.build_evidence(cfg, incident_id)
@@ -4305,10 +4347,16 @@ def test_evidence_db_exposes_timeline_tables_without_copying_canonical_db(cfg: d
         assert conn.execute(
             "SELECT depth_json FROM price_ticks WHERE evidence_id='q-trajectory'"
         ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM price_ticks WHERE evidence_id='q-trajectory-repeat'"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM probability_ticks").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM monitor_events").fetchone()[0] == 2
     incident_dir = Path(cfg["paths"]["runtime"]) / "incidents" / incident_id
     manifest = json.loads((incident_dir / "generations" / (incident_dir / "CURRENT").read_text().strip() / "manifest.json").read_text())
     assert manifest["size_bytes"] == evidence.stat().st_size
     assert manifest["capacity"]["window_days"] <= 7
+    assert manifest["selection"]["quotes"]["trajectory_unchanged_top_rows_omitted"] >= 1
     assert evidence.stat().st_size < Path(cfg["paths"]["trades_db"]).stat().st_size * 20
 
 
@@ -4336,9 +4384,9 @@ def test_compact_monitor_event_keeps_causal_identity_without_vector_duplication(
         },
     )
     payload = json.loads(raw)
-    assert payload["event"]["event_id"] == "monitor-1"
-    assert "payload_json" not in payload["event"]
-    receipt = payload["payload"]["probability_receipt"]
+    assert payload["phase_before"] is None
+    assert "payload_json" not in payload
+    receipt = payload["probability_receipt"]
     assert receipt["probability_content_identity"] == "content-1"
     assert receipt["observation"]["observation_time"] == "2026-08-22T08:55:00+00:00"
     assert "day0_remaining_vector_witness" not in receipt["observation"]
