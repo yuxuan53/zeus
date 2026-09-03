@@ -283,6 +283,71 @@ def test_shared_remaining_carrier_uses_hko_oracle_truncation() -> None:
     assert hko["content_identity"] != wmo["content_identity"]
 
 
+def test_hko_monitor_remaining_operator_matches_materialized_carrier(
+    monkeypatch,
+) -> None:
+    """Held recompute and materialization must share HKO's settlement preimage."""
+    import src.engine.event_reactor_adapter as era
+    from src.types.temperature import TemperatureDelta
+
+    bins = [
+        Bin(None, 24, "C", "24C or below"),
+        Bin(25, 25, "C", "25C"),
+        Bin(26, None, "C", "26C or above"),
+    ]
+    payload = {
+        "metric": "low",
+        "rounded_value": 25,
+        "low_so_far": 25.9,
+        "settlement_source": "hko_hourly_accumulator",
+        "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
+        "_edli_day0_probability_boundary_native": 25.9,
+        "_edli_day0_provisional_boundary_survival_probability": 0.9,
+    }
+    monkeypatch.setattr(
+        "src.signal.ensemble_signal.sigma_instrument_for_city",
+        lambda _city: TemperatureDelta(0.0, "C"),
+    )
+
+    monitor_q = era._day0_remaining_p_raw_vector(
+        np.asarray([25.9], dtype=float),
+        city=_hong_kong(),
+        settlement_semantics=_settlement_semantics("Hong Kong"),
+        bins=bins,
+        payload=payload,
+        extra_member_sigma=0.0,
+    )
+    materialized = build_day0_remaining_probability_carrier(
+        future_extremes_c=[25.9],
+        boundary_scenarios=((25.9, 0.9), (None, 0.1)),
+        metric="low",
+        path_error_sigma_c=0.0,
+        instrument_sigma_c=0.0,
+        bin_bounds_c=[(None, 24), (25, 25), (26, None)],
+        n_point=10,
+        n_samples=5,
+        identity_inputs={"city": "Hong Kong", "unit": "C"},
+        settlement_semantics=_settlement_semantics("Hong Kong"),
+    )
+    legacy_half_up = build_day0_remaining_probability_carrier(
+        future_extremes_c=[25.9],
+        boundary_scenarios=((25.9, 0.9), (None, 0.1)),
+        metric="low",
+        path_error_sigma_c=0.0,
+        instrument_sigma_c=0.0,
+        bin_bounds_c=[(None, 24), (25, 25), (26, None)],
+        n_point=10,
+        n_samples=5,
+        identity_inputs={"city": "Hong Kong", "unit": "C"},
+        settlement_semantics=_settlement_semantics("Tel Aviv"),
+    )
+
+    assert monitor_q.tolist() == pytest.approx(materialized["q"])
+    assert materialized["q"] == pytest.approx([0.0, 1.0, 0.0])
+    assert legacy_half_up["q"] == pytest.approx([0.0, 0.0, 1.0])
+    assert materialized["content_identity"] != legacy_half_up["content_identity"]
+
+
 def test_noaa_adapter_replays_materialized_carrier_identity_and_samples():
     """The monitor-side replay must consume the materializer's exact carrier."""
     import src.engine.event_reactor_adapter as era
