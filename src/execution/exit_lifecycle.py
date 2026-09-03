@@ -2549,6 +2549,41 @@ def _protective_sell_authority_identity(**material: object) -> str:
     ).hexdigest()
 
 
+def _canonical_protective_sellable_shares(
+    conn: sqlite3.Connection | None,
+    *,
+    position_id: str,
+    requested_shares: object,
+) -> Decimal | None:
+    """Return the conservative 0.01-share quantity from canonical inventory."""
+
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            """SELECT shares, chain_shares
+                 FROM position_current WHERE position_id=? LIMIT 1""",
+            (position_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    requested = _positive_decimal(requested_shares)
+    canonical = _positive_decimal(
+        row["chain_shares"]
+        if row["chain_shares"] not in (None, "")
+        else row["shares"]
+    )
+    if requested is None or canonical is None:
+        return None
+    sellable = min(requested, canonical).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_FLOOR,
+    )
+    return sellable if sellable > 0 else None
+
+
 def _build_protective_sell_execution_authority(
     *,
     kind: str,
@@ -2700,6 +2735,14 @@ def _protective_sell_semantic_receipt(
     canonical_token = str(
         current["token_id"] if direction == "buy_yes" else current["no_token_id"]
     )
+    sellable_shares = (
+        min(requested, canonical_shares).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_FLOOR,
+        )
+        if requested is not None and canonical_shares is not None
+        else None
+    )
     if (
         not isinstance(payload, Mapping)
         or str(payload.get("exit_intent_token_id") or "") != token_id
@@ -2707,8 +2750,9 @@ def _protective_sell_semantic_receipt(
         or requested is None
         or requested_now is None
         or canonical_shares is None
-        or requested != requested_now
-        or requested_now > canonical_shares
+        or sellable_shares is None
+        or sellable_shares <= 0
+        or requested_now != sellable_shares
         or not str(row["decision_id"] or "")
         or str(payload.get("exit_intent_decision_id") or "")
         != str(row["decision_id"] or "")
@@ -7705,6 +7749,21 @@ def _execute_live_exit(
         and LIVE_ORDER_MIN_UNIT_PRICE <= protective_bid <= LIVE_ORDER_MAX_UNIT_PRICE
     ):
         try:
+            executable_shares = _canonical_protective_sellable_shares(
+                conn,
+                position_id=str(position.trade_id),
+                requested_shares=exit_intent.shares,
+            )
+            if executable_shares is None:
+                # INV-47 SCOPE: only this protective SELL attempt is blocked.
+                # DRAIN: chain reconciliation refreshes canonical inventory and
+                # the exit lifecycle retries. RESET: a positive 0.01-share
+                # conservative quantity rebuilds authority on the next attempt.
+                raise ValueError("protective sellable shares unavailable")
+            exit_intent = replace(
+                exit_intent,
+                shares=float(executable_shares),
+            )
             protective_sell_authority = _build_protective_sell_execution_authority(
                 kind=protective_kind,
                 position=position,

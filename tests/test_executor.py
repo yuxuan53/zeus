@@ -2674,8 +2674,8 @@ class TestExecutor:
             entry_price=0.50,
             p_posterior=0.55,
             edge=0.05,
-            shares=10.0,
-            chain_shares=10.0,
+            shares=31.512785,
+            chain_shares=31.5127,
             cost_basis_usd=5.0,
             state="holding",
             chain_state="synced",
@@ -2690,7 +2690,7 @@ class TestExecutor:
                    position_id, phase, direction, token_id, no_token_id,
                    shares, chain_shares, chain_state, updated_at,
                    temperature_metric, condition_id
-               ) VALUES (?, 'active', 'buy_yes', ?, ?, 10, 10,
+               ) VALUES (?, 'active', 'buy_yes', ?, ?, 31.512785, 31.5127,
                          'synced', ?, 'high', ?)""",
             (
                 position.trade_id,
@@ -2809,7 +2809,7 @@ class TestExecutor:
         )
 
         command = _TEST_CONN.execute(
-            """SELECT state, side, price, venue_order_id
+            """SELECT state, side, size, price, venue_order_id
                  FROM venue_commands
                 WHERE position_id = ? AND intent_kind = 'EXIT'
                 ORDER BY created_at DESC
@@ -2819,9 +2819,11 @@ class TestExecutor:
         assert outcome.startswith("sell_pending: order=flash-catastrophe-e2e-order")
         assert captured["order_type"] == "FAK"
         assert captured["price"] == pytest.approx(0.19)
+        assert captured["size"] == pytest.approx(31.51)
         assert command is not None
         assert command["side"] == "SELL"
         assert command["price"] == pytest.approx(0.19)
+        assert command["size"] == pytest.approx(31.51)
         assert _TEST_CONN.execute(
             """SELECT COUNT(*) FROM position_events
                 WHERE position_id = ? AND event_type = 'EXIT_INTENT'""",
