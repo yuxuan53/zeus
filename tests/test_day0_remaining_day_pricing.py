@@ -7820,6 +7820,30 @@ class TestRequestHashProvenance:
 
         assert [c.name for c in rotated] == ["Wellington", "Paris", "London"]
 
+    def test_scheduler_rotates_due_held_separately_from_valid_held(self):
+        from src.events import reactor
+
+        ordered = [
+            _paris(),
+            _wellington(),
+            SimpleNamespace(name="London"),
+            SimpleNamespace(name="Madrid"),
+        ]
+        rotated = reactor._edli_rotate_day0_hourly_refresh_order(
+            ordered,
+            priority_city_count=4,
+            held_city_count=3,
+            urgent_held_city_count=2,
+            cursor=1,
+        )
+
+        assert [c.name for c in rotated] == [
+            "Wellington",
+            "Paris",
+            "London",
+            "Madrid",
+        ]
+
     def test_scheduler_held_scope_does_not_disable_bounded_priority_recovery(
         self, monkeypatch
     ):
@@ -8084,6 +8108,24 @@ class TestRequestHashProvenance:
             ("paris", "2026-06-25", "low"),
             ("london", "2026-06-25", "high"),
             ("wellington", "2026-06-26", "high"),
+        ]
+
+    def test_day0_hourly_priority_source_puts_due_held_before_valid_held(self):
+        from src.events import reactor
+
+        assert reactor._edli_day0_hourly_priority_families(
+            held_families={
+                ("Paris", "2026-06-25", "low"),
+                ("Busan", "2026-06-25", "high"),
+            },
+            refresh_due_families={
+                ("Busan", "2026-06-25", "high"),
+                ("London", "2026-06-25", "high"),
+            },
+        ) == [
+            ("busan", "2026-06-25", "high"),
+            ("paris", "2026-06-25", "low"),
+            ("london", "2026-06-25", "high"),
         ]
 
 

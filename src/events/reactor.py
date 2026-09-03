@@ -6050,7 +6050,7 @@ def _edli_day0_hourly_priority_families(
     held_families: Iterable[tuple[str, str, str]] | None = None,
     refresh_due_families: Iterable[tuple[str, str, str]] = (),
 ) -> list[tuple[str, str, str]]:
-    """Held Day0 first, then current-day bundles due before authority expiry."""
+    """Due held Day0 first, then other held and current-day authority debt."""
 
     families: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -6063,13 +6063,29 @@ def _edli_day0_hourly_priority_families(
                 families.append(key)
 
     # Held money is the only consumer allowed to use the critical reserve.
-    held = (
+    held = list(
         _edli_current_held_position_family_keys()
         if held_families is None
         else held_families
     )
+    refresh_due = list(refresh_due_families)
+    held_keys = {
+        _substrate_refresh_family_key(city, target_date, metric)
+        for city, target_date, metric in held
+    }
+    # A held family whose strict bundle is already due is the only segment
+    # where data absence is currently preventing capital redecision.  Keep it
+    # ahead of held families that still have valid authority; otherwise the
+    # broad held set turns a known outage into a many-cycle round robin.
+    add(
+        sorted(
+            family
+            for family in refresh_due
+            if _substrate_refresh_family_key(*family) in held_keys
+        )
+    )
     add(sorted(held))
-    add(sorted(refresh_due_families))
+    add(sorted(refresh_due))
 
     return families
 
@@ -6127,15 +6143,19 @@ def _edli_rotate_day0_hourly_refresh_order(
     *,
     priority_city_count: int,
     held_city_count: int = 0,
+    urgent_held_city_count: int = 0,
     cursor: int,
 ) -> list[Any]:
     priority_end = max(0, min(len(ordered), int(priority_city_count)))
     held_end = max(0, min(priority_end, int(held_city_count)))
-    held = ordered[:held_end]
+    urgent_held_end = max(0, min(held_end, int(urgent_held_city_count)))
+    urgent_held = ordered[:urgent_held_end]
+    held = ordered[urgent_held_end:held_end]
     priority = ordered[held_end:priority_end]
     rest = ordered[priority_end:]
     return (
-        _rotate_day0_refresh_segment(held, cursor)
+        _rotate_day0_refresh_segment(urgent_held, cursor)
+        + _rotate_day0_refresh_segment(held, cursor)
         + _rotate_day0_refresh_segment(priority, cursor)
         + _rotate_day0_refresh_segment(rest, cursor)
     )
@@ -6290,6 +6310,15 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
                 "edli_day0_hourly_refresh: provider-run HWM probe failed: %s", exc
             )
         try:
+            refresh_due_keys = {
+                _substrate_refresh_family_key(*family)
+                for family in priority_probe.refresh_due_families
+            }
+            urgent_held_families = [
+                family
+                for family in held_families
+                if _substrate_refresh_family_key(*family) in refresh_due_keys
+            ]
             priority_families = _edli_day0_hourly_priority_families(
                 held_families=held_families,
                 refresh_due_families=priority_probe.refresh_due_families,
@@ -6299,6 +6328,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
                 "edli_day0_hourly_refresh: priority family probe failed: %s", exc
             )
             priority_probe = _Day0HourlyPriorityProbe()
+            urgent_held_families = []
             priority_families = list(held_families)
         ordered_cities, priority_city_count = _edli_order_day0_hourly_refresh_cities(
             cities,
@@ -6310,19 +6340,33 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
             decision_time=decision_time,
             priority_families=held_families,
         )
+        urgent_held_city_names = {
+            str(city_name or "").strip().casefold()
+            for city_name, _target_date, _metric in urgent_held_families
+        }
+        urgent_held_city_count = 0
+        for city in ordered_cities[:held_city_count]:
+            if (
+                str(getattr(city, "name", "") or "").strip().casefold()
+                not in urgent_held_city_names
+            ):
+                break
+            urgent_held_city_count += 1
         ordered_cities = _edli_rotate_day0_hourly_refresh_order(
             ordered_cities,
             priority_city_count=priority_city_count,
             held_city_count=held_city_count,
+            urgent_held_city_count=urgent_held_city_count,
             cursor=_DAY0_HOURLY_REFRESH_CURSOR,
         )
-        # One cursor rotates three independent segments. Bounding it by the
-        # held prefix meant a non-empty held set could expose only the first
-        # few members of a much larger discovery-priority segment, permanently
-        # starving every later city's Day0 q. Advance one page-start at a time
-        # over the longest segment so every city receives a bounded turn.
+        # One cursor rotates four independent segments.  Due held authority
+        # must remain ahead of still-valid held authority, while unit rotation
+        # inside each segment prevents a failed provider from monopolising it.
+        # Bound the cursor by the longest segment so every city receives a
+        # bounded turn without changing the economic precedence between them.
         cursor_span = max(
-            held_city_count,
+            urgent_held_city_count,
+            held_city_count - urgent_held_city_count,
             priority_city_count - held_city_count,
             len(ordered_cities) - priority_city_count,
             1,
@@ -6331,9 +6375,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         max_cities = _day0_hourly_refresh_max_cities(
             priority_city_count=priority_city_count,
         )
-        held_refresh_due = bool(
-            set(held_families).intersection(priority_probe.refresh_due_families)
-        )
+        held_refresh_due = bool(urgent_held_families)
         quota_critical_cities = 0
         quota_priority_cities = 0
         if trading_lane_active:
@@ -6439,7 +6481,8 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         if vectors_written or priority_city_count:
             _log.info(
                 "edli_day0_hourly_refresh: vectors_written=%d priority_cities=%d "
-                "held_cities=%d critical_cities=%d priority_lane_cities=%d "
+                "held_cities=%d urgent_held_cities=%d critical_cities=%d "
+                "priority_lane_cities=%d "
                 "trading_lane_active=%s "
                 "max_cities=%d cities_attempted=%d skipped_throttle=%d "
                 "skipped_quota=%d incomplete_expected_bundles=%d "
@@ -6448,6 +6491,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
                 vectors_written,
                 priority_city_count,
                 held_city_count,
+                urgent_held_city_count,
                 quota_critical_cities,
                 quota_priority_cities,
                 trading_lane_active,
