@@ -1251,7 +1251,6 @@ def _insert_incident(
         existing = conn.execute(
             "SELECT incident_id,t_floor,status FROM incidents "
             "WHERE position_id=? AND kind='hard' AND crossing_kind=? "
-            "AND status IN ('queued','running','retry_pending') "
             "ORDER BY t_floor LIMIT 1",
             (position_id, crossing_kind),
         ).fetchone()
@@ -2271,56 +2270,72 @@ def _detect_maintenance(cfg: Mapping[str, Any], deadline: float | None = None) -
         ):
             settlement_positions[str(position["position_id"])] = position
         for position in settlement_positions.values():
-            _maintenance_guard()
-            capability_failed = False
+            if time.monotonic() >= detector_deadline:
+                return _MaintenanceOutcome(created, postcommit_deferred=True)
+            incident_id: str | None = None
             try:
-                candidate = _settlement_full_loss_candidate(trades, position)
-            except ExecutionFactCapabilityError as exc:
-                capability_failed = True
-                mem.execute(
-                    "INSERT INTO controller_debt(debt_id,kind,status,reason,updated_at) "
-                    "VALUES ('execution_fact_schema','execution_fact','blocked',?,?) "
-                    "ON CONFLICT(debt_id) DO UPDATE SET status=excluded.status,"
-                    "reason=excluded.reason,updated_at=excluded.updated_at",
-                    (str(exc), iso()),
-                )
-                continue
-            except SettlementBasisPending as exc:
-                capability_failed = True
-                mem.execute(
-                    "INSERT INTO controller_debt(debt_id,kind,status,reason,updated_at) "
-                    "VALUES ('settlement_basis:' || ?, 'settlement_basis','retry_pending',?,?) "
-                    "ON CONFLICT(debt_id) DO UPDATE SET status=excluded.status,"
-                    "reason=excluded.reason,updated_at=excluded.updated_at",
-                    (str(position["position_id"]), str(exc), iso()),
-                )
-                continue
-            mem.execute(
-                "UPDATE controller_debt SET status='resolved',reason='execution_fact_schema_available',"
-                "updated_at=? WHERE debt_id='execution_fact_schema'",
-                (iso(),),
-            )
-            if candidate:
-                incident_id = _insert_settlement_full_loss_incident(
-                    mem, position, candidate, floor=floor
-                )
-                if incident_id:
-                    created.append(incident_id)
-            else:
-                _revise_settlement_non_loss_incidents(mem, trades, position)
-            mem.execute(
-                "UPDATE controller_debt SET status='resolved',reason='settlement_basis_complete',"
-                "updated_at=? WHERE debt_id=?",
-                (iso(), f"settlement_basis:{position['position_id']}"),
-            )
-            fingerprint = position.get("_settlement_backfill_fingerprint")
-            if fingerprint and not capability_failed:
-                mem.execute(
-                    "INSERT INTO settlement_backfill_state(position_id,fingerprint,completed,updated_at) "
-                    "VALUES (?,?,1,?) ON CONFLICT(position_id) DO UPDATE SET "
-                    "fingerprint=excluded.fingerprint,completed=1,updated_at=excluded.updated_at",
-                    (position["position_id"], fingerprint, iso()),
-                )
+                capability_failed = False
+                try:
+                    candidate = _settlement_full_loss_candidate(trades, position)
+                except ExecutionFactCapabilityError as exc:
+                    capability_failed = True
+                    mem.execute(
+                        "INSERT INTO controller_debt(debt_id,kind,status,reason,updated_at) "
+                        "VALUES ('execution_fact_schema','execution_fact','blocked',?,?) "
+                        "ON CONFLICT(debt_id) DO UPDATE SET status=excluded.status,"
+                        "reason=excluded.reason,updated_at=excluded.updated_at",
+                        (str(exc), iso()),
+                    )
+                except SettlementBasisPending as exc:
+                    capability_failed = True
+                    mem.execute(
+                        "INSERT INTO controller_debt(debt_id,kind,status,reason,updated_at) "
+                        "VALUES ('settlement_basis:' || ?, 'settlement_basis','retry_pending',?,?) "
+                        "ON CONFLICT(debt_id) DO UPDATE SET status=excluded.status,"
+                        "reason=excluded.reason,updated_at=excluded.updated_at",
+                        (str(position["position_id"]), str(exc), iso()),
+                    )
+                else:
+                    mem.execute(
+                        "UPDATE controller_debt SET status='resolved',"
+                        "reason='execution_fact_schema_available',updated_at=? "
+                        "WHERE debt_id='execution_fact_schema'",
+                        (iso(),),
+                    )
+                    if candidate:
+                        incident_id = _insert_settlement_full_loss_incident(
+                            mem, position, candidate, floor=floor
+                        )
+                    else:
+                        _revise_settlement_non_loss_incidents(mem, trades, position)
+                    mem.execute(
+                        "UPDATE controller_debt SET status='resolved',"
+                        "reason='settlement_basis_complete',updated_at=? WHERE debt_id=?",
+                        (iso(), f"settlement_basis:{position['position_id']}"),
+                    )
+                fingerprint = position.get("_settlement_backfill_fingerprint")
+                if fingerprint and not capability_failed:
+                    mem.execute(
+                        "INSERT INTO settlement_backfill_state"
+                        "(position_id,fingerprint,completed,updated_at) "
+                        "VALUES (?,?,1,?) ON CONFLICT(position_id) DO UPDATE SET "
+                        "fingerprint=excluded.fingerprint,completed=1,"
+                        "updated_at=excluded.updated_at",
+                        (position["position_id"], fingerprint, iso()),
+                    )
+                # Terminal truth is independent of quote/backfill maintenance.
+                # Commit it per position so a later bounded read cannot erase a
+                # confirmed settlement incident or its retry debt.
+                mem.commit()
+            except sqlite3.OperationalError as exc:
+                if "interrupted" not in str(exc).lower():
+                    raise
+                mem.rollback()
+                return _MaintenanceOutcome(created, postcommit_deferred=True)
+            if incident_id:
+                created.append(incident_id)
+        if time.monotonic() >= detector_deadline:
+            return _MaintenanceOutcome(created, postcommit_deferred=True)
         by_token: dict[str, list[dict[str, Any]]] = {}
         for position in positions.values():
             _maintenance_guard()

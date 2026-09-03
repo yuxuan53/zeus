@@ -140,7 +140,12 @@ def test_sqlite_factories_close_after_context_exception(cfg: dict) -> None:
 
 
 @pytest.fixture
-def cfg(tmp_path: Path) -> dict:
+def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    monkeypatch.setattr(
+        loop,
+        "now",
+        lambda: datetime(2026, 8, 22, 12, 0, tzinfo=UTC),
+    )
     trades = tmp_path / "trades.db"
     forecasts = tmp_path / "forecasts.db"
     settings = tmp_path / "settings.json"
@@ -5632,6 +5637,11 @@ def test_evidence_retry_identity_change_bypasses_backoff(cfg: dict, monkeypatch:
 
 
 def test_evidence_debt_fifo_keeps_new_hard_incident_first(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        loop,
+        "now",
+        lambda: datetime(2026, 8, 22, 12, 0, 3, tzinfo=UTC),
+    )
     cfg["loop"]["evidence_builds_per_cycle"] = 3
     for incident_id, position_id in (("debt-a", "debt-position-a"), ("debt-b", "debt-position-b"), ("new-hard", "new-position")):
         _queue_evidence_retry_incident(cfg, incident_id, position_id)
