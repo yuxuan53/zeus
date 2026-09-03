@@ -1829,6 +1829,45 @@ def test_detector_can_commit_crossing_without_waiting_for_evidence_worker(
     assert tuple(incident) == ("queued", "blind")
 
 
+def test_evidence_worker_yields_to_unhealthy_live_capital_lane(
+    cfg: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = Path(cfg["paths"]["trades_db"]).parent
+    stamp = loop.iso()
+    (state_dir / "daemon-heartbeat.json").write_text(
+        json.dumps({"alive": True, "timestamp": stamp})
+    )
+    (state_dir / "live_health_composite.json").write_text(
+        json.dumps(
+            {
+                "healthy": False,
+                "computed_at": stamp,
+                "failing_surfaces": ["held_position_monitor"],
+            }
+        )
+    )
+
+    ready, reason = loop._live_capital_lane_ready_for_evidence(cfg)
+
+    assert ready is False
+    assert reason == "live_health_composite_unhealthy"
+
+
+def test_evidence_worker_admits_only_fresh_healthy_live_capital_lane(
+    cfg: dict,
+) -> None:
+    state_dir = Path(cfg["paths"]["trades_db"]).parent
+    stamp = loop.iso()
+    (state_dir / "daemon-heartbeat.json").write_text(
+        json.dumps({"alive": True, "timestamp": stamp})
+    )
+    (state_dir / "live_health_composite.json").write_text(
+        json.dumps({"healthy": True, "computed_at": stamp})
+    )
+
+    assert loop._live_capital_lane_ready_for_evidence(cfg) == (True, None)
+
+
 def test_evidence_queue_cursor_bounds_provider_backoff_capture(
     cfg: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:

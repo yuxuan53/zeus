@@ -8543,6 +8543,45 @@ def _spawn_evidence_worker(cfg: Mapping[str, Any]) -> subprocess.Popen[Any]:
         handle.close()
 
 
+def _live_capital_lane_ready_for_evidence(
+    cfg: Mapping[str, Any],
+) -> tuple[bool, str | None]:
+    """Yield historical DB scans whenever the live money path is degraded."""
+
+    state_dir = Path(str(cfg["paths"]["trades_db"])).resolve().parent
+    max_age = float(
+        cfg.get("capital_lane", {}).get("max_main_heartbeat_age_seconds", 90)
+    )
+    heartbeat = read_json(state_dir / "daemon-heartbeat.json", {})
+    heartbeat_at = (
+        parse_time(str(heartbeat.get("timestamp") or ""))
+        if isinstance(heartbeat, Mapping)
+        else None
+    )
+    if (
+        not isinstance(heartbeat, Mapping)
+        or heartbeat.get("alive") is not True
+        or heartbeat_at is None
+        or (now() - heartbeat_at).total_seconds() > max_age
+    ):
+        return False, "main_heartbeat_unhealthy"
+
+    health = read_json(state_dir / "live_health_composite.json", {})
+    health_at = (
+        parse_time(str(health.get("computed_at") or ""))
+        if isinstance(health, Mapping)
+        else None
+    )
+    if (
+        not isinstance(health, Mapping)
+        or health.get("healthy") is not True
+        or health_at is None
+        or (now() - health_at).total_seconds() > max_age
+    ):
+        return False, "live_health_composite_unhealthy"
+    return True, None
+
+
 def evidence_once(cfg: Mapping[str, Any]) -> dict[str, Any]:
     """Drain one bounded evidence tranche outside the detector clock."""
 
@@ -8639,6 +8678,7 @@ def daemon(cfg: Mapping[str, Any]) -> int:
     capabilities_ready = False
     next_debt_check_at = 0.0
     next_evidence_check_at = 0.0
+    evidence_suppressed_reason: str | None = None
     while not stopping and not (run / "HALT").exists():
         cycle_started = time.monotonic()
         detector_elapsed = 0.0
@@ -8661,6 +8701,7 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                 "dispatch_worker_pid": None,
                 "error": None,
                 "dispatch_error": dispatch_error,
+                "evidence_suppressed_reason": evidence_suppressed_reason,
                 "provider_backoff": None,
             },
         )
@@ -8708,6 +8749,7 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                 "dispatch_worker_pid": None,
                 "error": None,
                 "dispatch_error": dispatch_error,
+                "evidence_suppressed_reason": evidence_suppressed_reason,
                 "provider_backoff": _provider_backoff(cfg),
             },
         )
@@ -8746,6 +8788,7 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                 ),
                 "error": error,
                 "dispatch_error": dispatch_error,
+                "evidence_suppressed_reason": evidence_suppressed_reason,
                 "provider_backoff": _provider_backoff(cfg),
             },
         )
@@ -8760,8 +8803,15 @@ def daemon(cfg: Mapping[str, Any]) -> int:
                     bool(created)
                     or time.monotonic() >= next_evidence_check_at
                 ):
-                    evidence_worker = _spawn_evidence_worker(cfg)
-                    next_evidence_check_at = time.monotonic() + 5.0
+                    evidence_ready, evidence_suppressed_reason = (
+                        _live_capital_lane_ready_for_evidence(cfg)
+                    )
+                    if evidence_ready:
+                        evidence_worker = _spawn_evidence_worker(cfg)
+                    next_evidence_check_at = time.monotonic() + max(
+                        5.0,
+                        float(cfg["loop"].get("evidence_scan_interval_seconds", 60)),
+                    )
                 running = _running(cfg)
                 completed = poll_runs(cfg, running)
                 if completed:
