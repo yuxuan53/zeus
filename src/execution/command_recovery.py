@@ -17663,6 +17663,7 @@ def _append_unrecorded_partial_exit_economics(
     from src.state.fill_dedup import (
         PartialExitEconomicDebtError,
         canonical_decimal_text,
+        economic_notional_storage_equal,
         economic_exit_fills_for_position,
         partial_exit_realized_pnl_fold,
         recorded_partial_exit_fill_cursors,
@@ -17701,12 +17702,26 @@ def _append_unrecorded_partial_exit_economics(
     baseline_cost: Decimal | None = None
     baseline_entry: Decimal | None = None
     if recovered_baseline is not None:
-        baseline_shares = _positive_decimal_or_none(recovered_baseline.get("baseline_shares"))
-        baseline_cost = _decimal_or_none(recovered_baseline.get("baseline_cost_basis_usd"))
-        baseline_entry = _positive_decimal_or_none(recovered_baseline.get("baseline_entry_price"))
+        baseline_shares = _positive_decimal_or_none(
+            recovered_baseline.get("baseline_shares")
+        )
+        baseline_cost = _decimal_or_none(
+            recovered_baseline.get("baseline_cost_basis_usd")
+        )
+        baseline_entry = _positive_decimal_or_none(
+            recovered_baseline.get("baseline_entry_price")
+        )
         proof = recovered_baseline.get("first_conservation_proof")
-        proof_exchange = _decimal_or_none(proof.get("exchange_residual_shares")) if isinstance(proof, Mapping) else None
-        proof_matched = _decimal_or_none(proof.get("matched_sell_shares")) if isinstance(proof, Mapping) else None
+        proof_exchange = (
+            _decimal_or_none(proof.get("exchange_residual_shares"))
+            if isinstance(proof, Mapping)
+            else None
+        )
+        proof_matched = (
+            _decimal_or_none(proof.get("matched_sell_shares"))
+            if isinstance(proof, Mapping)
+            else None
+        )
         if (
             baseline_shares is None
             or baseline_cost is None
@@ -17714,7 +17729,10 @@ def _append_unrecorded_partial_exit_economics(
             or baseline_entry is None
             or not isinstance(proof, Mapping)
             or not _decimal_matches(proof.get("baseline_shares"), baseline_shares)
-            or not _decimal_matches(proof.get("matched_sell_shares"), recovered_baseline.get("matched_sell_shares"))
+            or not _decimal_matches(
+                proof.get("matched_sell_shares"),
+                recovered_baseline.get("matched_sell_shares"),
+            )
             or proof_exchange is None
             or proof_matched is None
             or baseline_shares != proof_exchange + proof_matched
@@ -17751,8 +17769,14 @@ def _append_unrecorded_partial_exit_economics(
     canonical_notional = sum((fill.notional for fill in fills), Decimal("0"))
     if status_qty and (
         canonical_total < status_qty
-        or canonical_notional < status_notional
-        or (canonical_total == status_qty and canonical_notional != status_notional)
+        or (
+            canonical_notional < status_notional
+            and not economic_notional_storage_equal(canonical_notional, status_notional)
+        )
+        or (
+            canonical_total == status_qty
+            and not economic_notional_storage_equal(canonical_notional, status_notional)
+        )
     ):
         raise PartialExitEconomicDebtError(
             "partial EXIT canonical economics do not reconcile status receipt: "
@@ -17777,7 +17801,12 @@ def _append_unrecorded_partial_exit_economics(
             if covered_qty > 0
             else Decimal("0")
         )
-        if status_remaining_notional < covered_notional:
+        if (
+            status_remaining_notional < covered_notional
+            and not economic_notional_storage_equal(
+                status_remaining_notional, covered_notional
+            )
+        ):
             raise PartialExitEconomicDebtError(
                 "partial EXIT status receipt notional cannot cover canonical fill: "
                 f"position_id={position_id} identity={fill.identity}"
@@ -17807,7 +17836,9 @@ def _append_unrecorded_partial_exit_economics(
                 f"position_id={position_id} identity={fill.identity}"
             )
         slices.append((fill, delta_qty, delta_notional, False))
-    if status_remaining_qty != 0 or status_remaining_notional != 0:
+    if status_remaining_qty != 0 or not economic_notional_storage_equal(
+        status_remaining_notional, 0
+    ):
         raise PartialExitEconomicDebtError(
             "partial EXIT status receipt remains unmatched: "
             f"position_id={position_id} order_id={venue_order_id}"
@@ -17820,13 +17851,19 @@ def _append_unrecorded_partial_exit_economics(
         if baseline_shares is not None:
             cumulative_sold = canonical_total
             expected_residual = baseline_shares - cumulative_sold
-            if expected_residual < -basis_tolerance or abs(expected_residual - residual_shares) > basis_tolerance:
+            if (
+                expected_residual < -basis_tolerance
+                or abs(expected_residual - residual_shares) > basis_tolerance
+            ):
                 raise PartialExitEconomicDebtError(
                     "recovered partial EXIT residual does not match baseline cumulative fills: "
                     f"position_id={position_id} baseline={baseline_shares} sold={cumulative_sold} "
                     f"residual={residual_shares}"
                 )
-        if fresh_chain_seen_at and str(current.get("chain_seen_at") or "") != fresh_chain_seen_at:
+        if (
+            fresh_chain_seen_at
+            and str(current.get("chain_seen_at") or "") != fresh_chain_seen_at
+        ):
             sequence_no = _latest_position_sequence(conn, position_id) + 1
             built, projection = build_chain_economics_observed_canonical_write(
                 position,

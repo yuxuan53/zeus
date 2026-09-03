@@ -52,6 +52,7 @@ re-deriving the exclusion rule ad hoc.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
@@ -67,6 +68,22 @@ class PartialExitEconomicDebtError(RuntimeError):
     RESET: every exact canonical fill identity has one economics event, so the
     fold succeeds without retaining a latch.
     """
+
+
+ECONOMIC_NOTIONAL_STORAGE_TOLERANCE_USD = Decimal("0.000000001")
+
+
+def economic_notional_storage_equal(left: object, right: object) -> bool:
+    """Treat only sub-nanodollar decimal serialization drift as equal."""
+
+    left_decimal = _decimal(left)
+    right_decimal = _decimal(right)
+    return bool(
+        left_decimal is not None
+        and right_decimal is not None
+        and abs(left_decimal - right_decimal)
+        <= ECONOMIC_NOTIONAL_STORAGE_TOLERANCE_USD
+    )
 
 
 @dataclass(frozen=True)
@@ -109,13 +126,83 @@ def canonical_decimal_text(value: object) -> str:
     return format(result.normalize(), "f")
 
 
+def _taker_sell_maker_leg_unit_price(
+    raw_payload_json: object,
+    *,
+    venue_order_id: str,
+    selected_token_id: str,
+    quantity: Decimal,
+) -> Decimal | None:
+    """Derive exact taker-SELL VWAP when the top-level price is one leg.
+
+    Polymarket user-channel taker trades can report the lowest matched leg in
+    ``price`` while ``maker_orders`` carries every exact counterparty leg.  The
+    latter must reproduce the full selected-token quantity before it can
+    replace the top-level value.
+    """
+
+    try:
+        raw = json.loads(str(raw_payload_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or str(raw.get("trader_side") or "").upper() != "TAKER"
+        or str(raw.get("side") or "").upper() != "SELL"
+        or str(raw.get("taker_order_id") or "").lower()
+        != str(venue_order_id or "").lower()
+        or str(raw.get("asset_id") or "") != str(selected_token_id or "")
+    ):
+        return None
+    legs = raw.get("maker_orders")
+    if not isinstance(legs, list) or not legs:
+        return None
+    total_quantity = Decimal("0")
+    total_notional = Decimal("0")
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            return None
+        leg_quantity = _decimal(leg.get("matched_amount", leg.get("matchedAmount")))
+        leg_price = _decimal(leg.get("price"))
+        leg_token_id = str(leg.get("asset_id") or "")
+        leg_side = str(leg.get("side") or "").upper()
+        if (
+            leg_quantity is None
+            or leg_price is None
+            or leg_quantity <= 0
+            or leg_price <= 0
+            or leg_price >= 1
+            or not leg_token_id
+            or (leg_token_id == selected_token_id and leg_side != "BUY")
+            or (leg_token_id != selected_token_id and leg_side != "SELL")
+        ):
+            return None
+        selected_price = (
+            leg_price if leg_token_id == selected_token_id else Decimal("1") - leg_price
+        )
+        if selected_price <= 0 or selected_price >= 1:
+            return None
+        total_quantity += leg_quantity
+        total_notional += leg_quantity * selected_price
+    if (
+        total_quantity <= 0
+        or total_notional <= 0
+        or abs(total_quantity - quantity) > Decimal("0.000000001")
+    ):
+        return None
+    return total_notional / total_quantity
+
+
 def partial_exit_events_available(conn: sqlite3.Connection) -> bool:
     """Return whether this connection carries the canonical partial-exit journal."""
 
     try:
-        return conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'position_events'"
-        ).fetchone() is not None
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'position_events'"
+            ).fetchone()
+            is not None
+        )
     except sqlite3.Error:
         return False
 
@@ -371,7 +458,8 @@ def economic_exit_fills_for_position(
             WITH {canonical_trade_fact_cte()},
                  {economic_trade_fact_cte()}
             SELECT fact.command_id, fact.trade_id, fact.venue_order_id,
-                   fact.filled_size, fact.fill_price
+                   fact.filled_size, fact.fill_price, fact.raw_payload_json,
+                   cmd.token_id
               FROM economic_trade_fact fact
               JOIN venue_commands cmd ON cmd.command_id = fact.command_id
              WHERE cmd.position_id = ?
@@ -407,6 +495,14 @@ def economic_exit_fills_for_position(
             raise PartialExitEconomicDebtError(
                 f"partial EXIT canonical fill identity missing: position_id={position_id}"
             )
+        maker_leg_unit_price = _taker_sell_maker_leg_unit_price(
+            row["raw_payload_json"],
+            venue_order_id=canonical_order_id,
+            selected_token_id=str(row["token_id"] or ""),
+            quantity=quantity,
+        )
+        if maker_leg_unit_price is not None:
+            unit_price = maker_leg_unit_price
         fills.append(
             EconomicExitFill(
                 identity=(

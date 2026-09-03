@@ -34155,7 +34155,7 @@ class TestRecoveryResolutionTable:
             lambda *_args, **_kwargs: {
                 "status-fill:v1:pos-001:ord-exit": (
                     Decimal("100"),
-                    Decimal("11"),
+                    Decimal("10.9999999999999999"),
                 ),
                 canonical_identity: (Decimal("50"), Decimal("5.5")),
             },

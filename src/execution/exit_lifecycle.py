@@ -10302,6 +10302,7 @@ def _complete_intentional_position_reduction(
                 position_fill_to_apply = newly_filled
         from src.state.fill_dedup import (
             PartialExitEconomicDebtError,
+            economic_notional_storage_equal,
             partial_exit_realized_pnl_fold,
             recorded_partial_exit_fill_cursors,
         )
@@ -10322,19 +10323,32 @@ def _complete_intentional_position_reduction(
             status_remaining_qty = status_qty
             status_remaining_notional = status_notional
             canonical_total_qty = sum(
-                (Decimal(str(getattr(fact, "quantity", "0"))) for fact in canonical_fills),
+                (
+                    Decimal(str(getattr(fact, "quantity", "0")))
+                    for fact in canonical_fills
+                ),
                 Decimal("0"),
             )
             canonical_total_notional = sum(
-                (Decimal(str(getattr(fact, "notional", "0"))) for fact in canonical_fills),
+                (
+                    Decimal(str(getattr(fact, "notional", "0")))
+                    for fact in canonical_fills
+                ),
                 Decimal("0"),
             )
             if status_qty and (
                 canonical_total_qty < status_qty
-                or canonical_total_notional < status_notional
+                or (
+                    canonical_total_notional < status_notional
+                    and not economic_notional_storage_equal(
+                        canonical_total_notional, status_notional
+                    )
+                )
                 or (
                     canonical_total_qty == status_qty
-                    and canonical_total_notional != status_notional
+                    and not economic_notional_storage_equal(
+                        canonical_total_notional, status_notional
+                    )
                 )
             ):
                 raise PartialExitEconomicDebtError(
@@ -10357,7 +10371,12 @@ def _complete_intentional_position_reduction(
                     if covered_qty > 0
                     else Decimal("0")
                 )
-                if status_remaining_notional < covered_notional:
+                if (
+                    status_remaining_notional < covered_notional
+                    and not economic_notional_storage_equal(
+                        status_remaining_notional, covered_notional
+                    )
+                ):
                     raise PartialExitEconomicDebtError(
                         f"partial EXIT status receipt notional cannot cover canonical fill: position_id={trade_id} identity={identity}"
                     )
@@ -10395,7 +10414,9 @@ def _complete_intentional_position_reduction(
                         "cumulative_notional": cumulative_notional,
                     }
                 )
-            if status_remaining_qty != 0 or status_remaining_notional != 0:
+            if status_remaining_qty != 0 or not economic_notional_storage_equal(
+                status_remaining_notional, 0
+            ):
                 raise PartialExitEconomicDebtError(
                     f"partial EXIT status receipt remains unmatched: position_id={trade_id} order_id={order_id}"
                 )
@@ -10421,9 +10442,7 @@ def _complete_intentional_position_reduction(
                         "cumulative_notional": cumulative_notional,
                     }
                 )
-        slice_quantity = sum(
-            (item["quantity"] for item in slices), Decimal("0")
-        )
+        slice_quantity = sum((item["quantity"] for item in slices), Decimal("0"))
         if slice_quantity != newly_filled:
             raise PartialExitEconomicDebtError(
                 f"partial EXIT fill/economics mismatch: position_id={trade_id} fill={newly_filled} economics={slice_quantity}"

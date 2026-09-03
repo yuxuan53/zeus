@@ -511,6 +511,84 @@ def _seed_exit_intent_event(
     )
 
 
+def test_economic_exit_fill_uses_exact_taker_maker_leg_vwap(conn):
+    from src.state.fill_dedup import economic_exit_fills_for_position
+    from src.state.venue_command_repo import append_trade_fact
+
+    position_id = "pos-taker-sell-leg-vwap"
+    command_id = "cmd-taker-sell-leg-vwap"
+    order_id = "ord-taker-sell-leg-vwap"
+    tx_hash = "0xtaker-sell-leg-vwap"
+    _insert_exit_command(
+        conn,
+        command_id=command_id,
+        position_id=position_id,
+        token_id=YES_TOKEN,
+        size=21.25,
+        price=0.19,
+        venue_order_id=order_id,
+    )
+    append_trade_fact(
+        conn,
+        trade_id=tx_hash,
+        venue_order_id=order_id,
+        command_id=command_id,
+        state="MATCHED",
+        filled_size="21.25",
+        fill_price="0.1948235294117647058823529412",
+        source="REST",
+        observed_at=_NOW.isoformat(),
+        raw_payload_hash="a" * 64,
+        raw_payload_json={"source": "place_exit_order_matched_submit"},
+        tx_hash=tx_hash,
+    )
+    append_trade_fact(
+        conn,
+        trade_id="exact-child-trade",
+        venue_order_id=order_id,
+        command_id=command_id,
+        state="CONFIRMED",
+        filled_size="21.25",
+        fill_price="0.19",
+        source="WS_USER",
+        observed_at=(_NOW + timedelta(seconds=1)).isoformat(),
+        raw_payload_hash="b" * 64,
+        raw_payload_json={
+            "asset_id": YES_TOKEN,
+            "side": "SELL",
+            "trader_side": "TAKER",
+            "taker_order_id": order_id,
+            "maker_orders": [
+                {
+                    "asset_id": YES_TOKEN,
+                    "side": "BUY",
+                    "matched_amount": "10.25",
+                    "price": "0.20",
+                },
+                {
+                    "asset_id": YES_TOKEN,
+                    "side": "BUY",
+                    "matched_amount": "11",
+                    "price": "0.19",
+                },
+            ],
+        },
+        tx_hash=tx_hash,
+    )
+
+    fills = economic_exit_fills_for_position(
+        conn,
+        position_id,
+        venue_order_id=order_id,
+    )
+
+    assert len(fills) == 1
+    assert fills[0].trade_id == "exact-child-trade"
+    assert fills[0].quantity == Decimal("21.25")
+    assert fills[0].notional == Decimal("4.14")
+    assert fills[0].unit_price == Decimal("4.14") / Decimal("21.25")
+
+
 def _seed_canonical_position_identity(
     c,
     *,
@@ -2576,8 +2654,9 @@ def test_partial_exit_decimal_fill_events_are_exact_and_batch_projected(
     assert Decimal(str(current["realized_pnl_usd"])) == Decimal("0.72")
 
 
-def test_status_first_receipt_is_reconciled_against_canonical_fill(conn):
+def test_status_first_receipt_is_reconciled_against_canonical_fill(conn, monkeypatch):
     from src.execution import exit_lifecycle
+    from src.state import fill_dedup
     from src.state.fill_dedup import partial_exit_realized_pnl_fold
     from src.state.portfolio import PortfolioState, Position
     from src.state.venue_command_repo import append_trade_fact
@@ -2662,6 +2741,21 @@ def test_status_first_receipt_is_reconciled_against_canonical_fill(conn):
     )
     assert status_payload["filled_shares"] == "0.6"
     assert status_payload["filled_notional_usd"] == "0.36"
+    recorded_cursors = fill_dedup.recorded_partial_exit_fill_cursors
+
+    def cursors_with_storage_drift(*args, **kwargs):
+        cursors = recorded_cursors(*args, **kwargs)
+        cursors[f"status-fill:v1:{position_id}:{order_id}"] = (
+            Decimal("0.6"),
+            Decimal("0.3599999999999999"),
+        )
+        return cursors
+
+    monkeypatch.setattr(
+        fill_dedup,
+        "recorded_partial_exit_fill_cursors",
+        cursors_with_storage_drift,
+    )
     append_trade_fact(
         conn,
         trade_id="trade-status-first-canonical",
@@ -2682,11 +2776,14 @@ def test_status_first_receipt_is_reconciled_against_canonical_fill(conn):
     assert position.state == "holding"
     assert position.exit_state == ""
     assert position.shares == pytest.approx(9.4)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM position_events "
-        "WHERE position_id = ? AND caused_by = 'partial_exit_fill'",
-        (position_id,),
-    ).fetchone()[0] == before
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM position_events "
+            "WHERE position_id = ? AND caused_by = 'partial_exit_fill'",
+            (position_id,),
+        ).fetchone()[0]
+        == before
+    )
     assert partial_exit_realized_pnl_fold(conn, position_id) == Decimal("0.3")
     economics_count = conn.execute(
         "SELECT COUNT(*) FROM position_events WHERE position_id = ? "
