@@ -1143,9 +1143,19 @@ def _latest_authorized_day0_fact(
                     timezone.utc
                 )
                 agent_received_at = agent_received_at.astimezone(timezone.utc)
+                # Station valid time and feed publication time are independent
+                # source clocks.  METAR publishers can expose a HH:00 report a
+                # few seconds before that nominal minute, so requiring
+                # observation_time <= publication permanently discards a fact
+                # that was safely possessed after both clocks elapsed.  The
+                # causal availability boundary is their maximum; receipt and
+                # decision must still be on or after that boundary.
+                causal_available_at = max(
+                    observation_time,
+                    observation_available_at,
+                )
                 if not (
-                    observation_time
-                    <= observation_available_at
+                    causal_available_at
                     <= agent_received_at
                     <= decision_utc
                 ):

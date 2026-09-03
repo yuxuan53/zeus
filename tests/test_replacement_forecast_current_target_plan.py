@@ -1585,6 +1585,87 @@ def test_day0_event_fact_lookup_uses_family_index_when_available() -> None:
     conn.close()
 
 
+def test_day0_event_accepts_nominal_metar_clock_after_publication(monkeypatch) -> None:
+    """Possession after both source clocks is causal despite small clock skew."""
+
+    conn = _day0_source_switch_conn()
+    city = SimpleNamespace(
+        name="Sao Paulo",
+        timezone="America/Sao_Paulo",
+        settlement_unit="C",
+        settlement_source_type="noaa",
+        wu_station="SBGR",
+    )
+    monkeypatch.setattr(
+        "src.config.runtime_cities_by_name",
+        lambda: {"Sao Paulo": city},
+    )
+    payload = {
+        "city": "Sao Paulo",
+        "target_date": "2026-09-03",
+        "metric": "high",
+        "settlement_source": "aviationweather_metar",
+        "settlement_source_type": "noaa",
+        "station_id": "SBGR",
+        "observation_time": "2026-09-03T09:00:00+00:00",
+        "observation_available_at": "2026-09-03T08:59:49+00:00",
+        "raw_value": 13.0,
+        "rounded_value": 13,
+        "high_so_far": 13.0,
+        "source_match_status": "MATCH",
+        "local_date_status": "MATCH",
+        "station_match_status": "MATCH",
+        "dst_status": "UNAMBIGUOUS",
+        "metric_match_status": "MATCH",
+        "rounding_status": "MATCH",
+        "source_authorized_status": "AUTHORIZED",
+        "live_authority_status": "live",
+        "settlement_unit": "C",
+    }
+    conn.executemany(
+        "INSERT INTO opportunity_events VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            (
+                "sbgr-premature-0900",
+                "DAY0_EXTREME_UPDATED",
+                "2026-09-03T08:59:49+00:00",
+                "2026-09-03T08:59:50+00:00",
+                "2026-09-03T08:59:50+00:00",
+                json.dumps(payload),
+            ),
+            (
+                "sbgr-causal-0900",
+                "DAY0_EXTREME_UPDATED",
+                "2026-09-03T08:59:49+00:00",
+                "2026-09-03T09:00:05+00:00",
+                "2026-09-03T09:00:05+00:00",
+                json.dumps(payload),
+            ),
+        ),
+    )
+
+    assert _latest_authorized_day0_fact(
+        conn,
+        city="Sao Paulo",
+        target_date="2026-09-03",
+        temperature_metric="high",
+        decision_time=datetime(2026, 9, 3, 8, 59, 55, tzinfo=timezone.utc),
+    ) is None
+    fact = _latest_authorized_day0_fact(
+        conn,
+        city="Sao Paulo",
+        target_date="2026-09-03",
+        temperature_metric="high",
+        decision_time=datetime(2026, 9, 3, 9, 0, 6, tzinfo=timezone.utc),
+    )
+
+    assert fact is not None
+    assert fact["observed_extreme_native"] == 13.0
+    assert fact["observation_time"] == "2026-09-03T09:00:00+00:00"
+    assert fact["observation_available_at"] == "2026-09-03T08:59:49+00:00"
+    conn.close()
+
+
 def test_hko_day0_fact_uses_latest_official_snapshot_not_cross_time_max() -> None:
     """HKO cumulative snapshots may correct a provisional value; neither an
     older event nor an earlier row may keep the retracted value absorbing."""
