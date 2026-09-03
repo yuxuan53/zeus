@@ -5,7 +5,7 @@
 #   one-time replay is not enough). Packet I / wave-1.5 addition (2026-07-13,
 #   §KEEP-spine 完备性补遗 "归属图+歧义证据 — foreign/ambiguous 留 observation
 #   不丢"): durable wallet_fill_observations lane tests.
-# Lifecycle: created=2026-07-13; last_reviewed=2026-08-13; last_reused=2026-08-13
+# Lifecycle: created=2026-07-13; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Purpose: unit tests for src.ingest.fill_synchronizer.sync_fills — watermark
 #   resume, idempotent re-append rejection, foreign-fill handling, the
 #   advance-after-persist rollback contract, unified TRADE-writer admission
@@ -1174,6 +1174,69 @@ def test_live_sync_mixed_tranches_replay_and_empty_coverage(
         assert get_watermark(check)["watermark_ts"] == empty_at.isoformat()
     finally:
         check.close()
+
+
+def test_live_sync_replay_enters_only_watermark_writer_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    """A full-history replay with no new facts must not occupy tranche leases."""
+    import src.ingest.fill_synchronizer as fill_synchronizer_mod
+    import src.state.db as db_mod
+    import src.state.write_coordinator as coordinator_mod
+    from src.state.db import init_schema
+    from src.state.write_coordinator import DBIdentity, WriteCoordinator
+
+    db_path = tmp_path / "trades.db"
+    seed = sqlite3.connect(db_path)
+    seed.row_factory = sqlite3.Row
+    init_schema(seed)
+    fill_synchronizer_mod.ensure_watermark_table(seed)
+    fill_synchronizer_mod.ensure_wallet_fill_observations_table(seed)
+    _seed_command(seed, command_id="cmd-replay", venue_order_id="ord-replay")
+    seed.close()
+
+    real = WriteCoordinator({DBIdentity.TRADE: db_path})
+    owners: list[str] = []
+
+    class Coordinator:
+        @contextlib.contextmanager
+        def transaction(self, dbs, **kwargs):
+            owners.append(kwargs["owner"])
+            with real.transaction(dbs, **kwargs) as tx:
+                yield tx
+
+    def reader():
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
+    monkeypatch.setattr(
+        coordinator_mod,
+        "default_runtime_write_coordinator",
+        lambda: Coordinator(),
+    )
+    monkeypatch.setattr(db_mod, "get_trade_connection_read_only", reader)
+    trade = _trade(trade_id="trade-replay", order_id="ord-replay")
+    fill_synchronizer_mod._sync_fills_coordinated(
+        FakeSyncAdapter([trade]),
+        observed_at=NOW,
+        tranche_size=1,
+    )
+
+    owners.clear()
+    replay = fill_synchronizer_mod._sync_fills_coordinated(
+        FakeSyncAdapter([trade] * 64),
+        observed_at=NOW + timedelta(minutes=1),
+        tranche_size=1,
+    )
+
+    assert owners == ["fill_synchronizer_watermark"]
+    assert replay["appended"] == 0
+    assert replay["skipped_idempotent"] == 64
+    assert replay["observation_appended"] == 0
+    assert replay["observation_skipped_idempotent"] == 64
 
 
 def test_live_cycle_real_recovery_writer_times_out_behind_monitor_and_reports_retry(

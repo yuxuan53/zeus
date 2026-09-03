@@ -426,6 +426,91 @@ def _prepare_fill_sync(
     )
 
 
+def _pending_fill_sync_writes(
+    prepared: _PreparedFillSync,
+) -> tuple[_PreparedFillSync, dict[str, int]]:
+    """Remove fully durable venue rows before acquiring the TRADE writer.
+
+    ``get_trades`` currently replays the wallet's complete history.  Opening a
+    write transaction for every already-recorded tranche turns that read-side
+    replay into continuous writer pressure even though it changes no canonical
+    fact.  Append-only observation/fact identities make this read-side filter
+    safe: rows with either identity still missing remain in order for the
+    normal transactional idempotency checks; only rows whose complete durable
+    effect already exists are accounted here and omitted from writer tranches.
+    """
+
+    recorded_observations = set(prepared.recorded_observations)
+    recorded_facts = set(prepared.recorded_facts)
+    pending: list[tuple[Any, ...]] = []
+    skipped = {
+        "appended": 0,
+        "skipped_idempotent": 0,
+        "foreign_fill_count": 0,
+        "unattributable_count": 0,
+        "observation_appended": 0,
+        "observation_skipped_idempotent": 0,
+        "projected": 0,
+    }
+
+    for item in prepared.trades:
+        raw, raw_hash, trade_id, state, order_ids, order_id, command = item
+        observation_trade_id = trade_id or _stable_subject("wallet_fill", raw)
+        observation_key = (observation_trade_id, raw_hash)
+        observation_pending = observation_key not in recorded_observations
+        if observation_pending:
+            recorded_observations.add(observation_key)
+
+        classification = ""
+        fact_pending = False
+        if not trade_id or state is None:
+            classification = "unattributable_count"
+        elif command is None or not order_id:
+            classification = "foreign_fill_count"
+        else:
+            filled_size = _trade_filled_size(raw, order_id)
+            fill_price = _trade_fill_price(raw, order_id)
+            if _missing_trade_fill_economics(
+                state=state,
+                filled_size=filled_size,
+                fill_price=fill_price,
+            ):
+                classification = "unattributable_count"
+            else:
+                fact_key = (
+                    trade_id,
+                    str(command["command_id"]),
+                    state,
+                    str(filled_size),
+                    str(fill_price),
+                )
+                fact_pending = fact_key not in recorded_facts
+                if fact_pending:
+                    recorded_facts.add(fact_key)
+                else:
+                    classification = "skipped_idempotent"
+
+        if observation_pending or fact_pending:
+            pending.append(item)
+            continue
+
+        skipped["observation_skipped_idempotent"] += 1
+        if classification:
+            skipped[classification] += 1
+
+    return (
+        _PreparedFillSync(
+            source=prepared.source,
+            observed=prepared.observed,
+            raw_trade_count=prepared.raw_trade_count,
+            trades=tuple(pending),
+            recorded_observations=prepared.recorded_observations,
+            recorded_facts=prepared.recorded_facts,
+        ),
+        skipped,
+    )
+
+
 def _persist_prepared_fill_sync(
     conn: sqlite3.Connection,
     prepared: _PreparedFillSync,
@@ -700,19 +785,20 @@ def _sync_fills_coordinated(
             source=source,
             observed_at=observed_at,
         )
+        pending, skipped_summary = _pending_fill_sync_writes(prepared)
     finally:
         if reader is not None:
             reader.close()
 
-    summaries: list[dict[str, Any]] = []
-    for offset in range(0, len(prepared.trades), tranche_size):
+    summaries: list[dict[str, Any]] = [skipped_summary]
+    for offset in range(0, len(pending.trades), tranche_size):
         tranche = _PreparedFillSync(
-            source=prepared.source,
-            observed=prepared.observed,
-            raw_trade_count=prepared.raw_trade_count,
-            trades=prepared.trades[offset : offset + tranche_size],
-            recorded_observations=prepared.recorded_observations,
-            recorded_facts=prepared.recorded_facts,
+            source=pending.source,
+            observed=pending.observed,
+            raw_trade_count=pending.raw_trade_count,
+            trades=pending.trades[offset : offset + tranche_size],
+            recorded_observations=pending.recorded_observations,
+            recorded_facts=pending.recorded_facts,
         )
         with coordinator.transaction(
             (DBIdentity.TRADE,),

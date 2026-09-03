@@ -1449,6 +1449,13 @@ def _prepare_fill_bridge_write_connection(
             conn,
             deadline_monotonic=deadline_monotonic,
         )
+        autocheckpoint = conn.execute("PRAGMA wal_autocheckpoint=0").fetchone()
+        if autocheckpoint is None or int(autocheckpoint[0]) != 0:
+            raise RuntimeError("fill bridge WAL autocheckpoint disable failed")
+        _bound_fill_bridge_sqlite_wait_remaining(
+            conn,
+            deadline_monotonic=deadline_monotonic,
+        )
         set_progress_handler = getattr(conn, "set_progress_handler", None)
         if callable(set_progress_handler):
             set_progress_handler(

@@ -1,6 +1,6 @@
 # Created: 2026-06-20
 # Last audited: 2026-07-30
-# Last reused/audited: 2026-08-27
+# Last reused/audited: 2026-09-02
 # Authority basis: PR415 ChatGPT deep-review blocker B5 (INV-37). Quote projection
 #   writes TRADE only; derived redecision and NEW_MARKET_DISCOVERED facts write WORLD
 #   through independently coordinated lanes. TRADE quote refresh must never acquire
@@ -16,6 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from threading import Event
 
 import pytest
@@ -781,6 +782,25 @@ def test_background_quote_connection_disables_sqlite_autocheckpoint():
         conn.close()
 
 
+def test_fill_bridge_connection_disables_sqlite_autocheckpoint(tmp_path):
+    """A cross-DB bridge commit must not checkpoint while holding writer flocks."""
+    from src.ingest import price_channel_ingest as lane
+
+    db_path = tmp_path / "fill-bridge-autocheckpoint.db"
+
+    def opener(**_kwargs):
+        return sqlite3.connect(db_path)
+
+    conn = lane._prepare_fill_bridge_write_connection(
+        opener,
+        deadline_monotonic=time.monotonic() + 1.0,
+    )
+    try:
+        assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+    finally:
+        lane._close_fill_bridge_write_connection(conn)
+
+
 def test_foreground_price_channel_gate_preserves_explicit_lease_deadline_and_hold(monkeypatch):
     from src.ingest import price_channel_ingest as lane
     from src.state import write_coordinator
@@ -1108,6 +1128,9 @@ def test_fill_bridge_repair_releases_writer_between_exact_candidates(monkeypatch
 
     class _Conn:
         def execute(self, sql):
+            if sql == "PRAGMA wal_autocheckpoint=0":
+                lease_events.append("autocheckpoint")
+                return SimpleNamespace(fetchone=lambda: (0,))
             assert sql == "BEGIN"
             lease_events.append("begin")
 
@@ -1170,8 +1193,8 @@ def test_fill_bridge_repair_releases_writer_between_exact_candidates(monkeypatch
     assert result["edli_positions_bridged"] == 2
     assert scan_candidates == [("aggregate-a",), ("aggregate-b",)]
     assert lease_events == [
-        "bootstrap", "enter", "begin", "commit", "exit", "close",
-        "bootstrap", "enter", "begin", "commit", "exit", "close",
+        "bootstrap", "autocheckpoint", "enter", "begin", "commit", "exit", "close",
+        "bootstrap", "autocheckpoint", "enter", "begin", "commit", "exit", "close",
     ]
 
 
@@ -1185,6 +1208,9 @@ def test_trade_fact_bridge_bootstrap_happens_before_world_writer_lease(monkeypat
 
     class _Conn:
         def execute(self, sql):
+            if sql == "PRAGMA wal_autocheckpoint=0":
+                events.append("autocheckpoint")
+                return SimpleNamespace(fetchone=lambda: (0,))
             assert sql == "BEGIN"
             events.append("begin")
 
@@ -1239,6 +1265,7 @@ def test_trade_fact_bridge_bootstrap_happens_before_world_writer_lease(monkeypat
     assert result["scheduler_failed"] is False
     assert events == [
         "bootstrap",
+        "autocheckpoint",
         "enter:price_channel_fill_bridge_reconcile",
         "begin",
         "write",
@@ -1315,6 +1342,9 @@ def test_fill_bridge_commit_failure_releases_tranche_before_monitor(monkeypatch)
 
     class _Conn:
         def execute(self, sql):
+            if sql == "PRAGMA wal_autocheckpoint=0":
+                events.append("autocheckpoint")
+                return SimpleNamespace(fetchone=lambda: (0,))
             assert sql == "BEGIN"
             events.append("begin")
 
@@ -1363,7 +1393,12 @@ def test_fill_bridge_commit_failure_releases_tranche_before_monitor(monkeypatch)
 
     result = lane._edli_fill_bridge_repair_cycle()
     assert result["scheduler_failed"] is True
-    assert events[:3] == ["bootstrap", "enter:price_channel_fill_bridge", "begin"]
+    assert events[:4] == [
+        "bootstrap",
+        "autocheckpoint",
+        "enter:price_channel_fill_bridge",
+        "begin",
+    ]
     assert events.index("exit:price_channel_fill_bridge") < events.index("close")
 
     with lane._PriceChannelWriteGate(
