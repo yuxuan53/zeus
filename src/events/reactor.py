@@ -6030,10 +6030,27 @@ def _edli_day0_hourly_refresh_due_families(
     if read_error is not None or close_errors:
         logging.getLogger("zeus.events.reactor").warning(
             "edli_day0_hourly_refresh: strict readiness check failed: %s; "
-            "close_errors=%s",
+            "close_errors=%s partial_due_families=%d",
             read_error,
             close_errors,
+            len(missing),
         )
+        # A bounded scheduling scan may expire after proving some bundles due.
+        # Those positive findings remain safe fetch hints: they never become
+        # probability authority.  Discarding them made a large universe erase
+        # already-proved held debt on every cycle.  ``proved=False`` still
+        # prevents a partial scan from suppressing the maintenance sweep.
+        if read_error is not None and deadline_expired() and not close_errors:
+            return _Day0HourlyPriorityProbe(
+                refresh_due_families=frozenset(missing),
+                window_starts=tuple(
+                    (city_name, target_date, window_start)
+                    for (city_name, target_date), window_start in sorted(
+                        window_starts.items()
+                    )
+                ),
+                proved=False,
+            )
         return _Day0HourlyPriorityProbe()
     return _Day0HourlyPriorityProbe(
         refresh_due_families=frozenset(missing),
@@ -6265,8 +6282,23 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         )
         cities = _rc()
         held_families = sorted(_edli_current_held_position_family_keys())
+        held_city_names = {
+            str(family[0]).strip().casefold() for family in held_families
+        }
+        held_cities = [
+            city
+            for city in cities
+            if str(getattr(city, "name", "") or "").strip().casefold()
+            in held_city_names
+        ]
+        probe_cities = held_cities + [
+            city
+            for city in cities
+            if str(getattr(city, "name", "") or "").strip().casefold()
+            not in held_city_names
+        ]
         priority_probe = _edli_day0_hourly_refresh_due_families(
-            cities=cities,
+            cities=probe_cities,
             decision_time=decision_time,
             deadline_monotonic=preflight_deadline_monotonic,
         )
@@ -6278,12 +6310,6 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         provider_run_hwm = {}
         release_due_city_dates = frozenset()
         try:
-            held_city_names = {str(family[0]).strip() for family in held_families}
-            held_cities = [
-                city
-                for city in cities
-                if str(getattr(city, "name", "") or "").strip() in held_city_names
-            ]
             hwm_budget_seconds = min(
                 1.0,
                 max(0.0, preflight_deadline_monotonic - time.monotonic()),
@@ -6484,6 +6510,19 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         )
         vectors_written = int(getattr(stats, "vectors_written", stats))
         cities_attempted = int(getattr(stats, "cities_attempted", 0) or 0)
+        unavailable_bundles = tuple(
+            getattr(stats, "unavailable_bundles", ()) or ()
+        )
+        if unavailable_bundles:
+            _log.warning(
+                "edli_day0_hourly_refresh incomplete: %s",
+                " | ".join(
+                    f"city={item.city} dates={','.join(item.target_dates)} "
+                    f"reason={item.reason} "
+                    f"missing={','.join(item.missing_models) or '-'}"
+                    for item in unavailable_bundles
+                ),
+            )
         # Fairness is about which segment page was OFFERED a slot, not whether
         # its fetch escaped throttle/provider failure. A unit advance is
         # coprime to every segment length, so no city can be skipped forever.

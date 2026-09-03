@@ -7736,6 +7736,75 @@ class TestRequestHashProvenance:
         assert forecast_conn.progress is not None
         assert closed == ["world", "forecasts"]
 
+    def test_priority_probe_preserves_due_held_hints_before_deadline(self, monkeypatch):
+        import src.config as config_module
+        import src.data.day0_hourly_vectors as vectors_module
+        import src.data.replacement_forecast_current_target_plan as target_plan
+        import src.events.reactor as reactor
+        import src.state.db as db_module
+
+        paris = _paris()
+        wellington = _wellington()
+        now = datetime(2026, 6, 10, 9, 0, tzinfo=UTC)
+        clock = {"now": 0.0}
+        vector_reads = {"count": 0}
+
+        class Connection:
+            def set_progress_handler(self, _callback, _steps):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(reactor.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            config_module,
+            "runtime_cities_by_name",
+            lambda: {"Paris": paris, "Wellington": wellington},
+        )
+        monkeypatch.setattr(
+            db_module, "get_world_connection_read_only", Connection
+        )
+        monkeypatch.setattr(
+            db_module, "get_forecasts_connection_read_only", Connection
+        )
+        monkeypatch.setattr(
+            vectors_module,
+            "day0_hourly_models_for_city",
+            lambda _city: ["ecmwf_ifs"],
+        )
+        monkeypatch.setattr(
+            target_plan,
+            "_latest_authorized_day0_fact",
+            lambda *_args, **_kwargs: {
+                "observation_time": "2026-06-10T08:00:00+00:00"
+            },
+        )
+
+        def read_vectors(**_kwargs):
+            vector_reads["count"] += 1
+            if vector_reads["count"] == 2:
+                clock["now"] = 2.0
+            return []
+
+        monkeypatch.setattr(
+            vectors_module, "read_freshest_day0_hourly_vectors", read_vectors
+        )
+
+        probe = reactor._edli_day0_hourly_refresh_due_families(
+            cities=[paris, wellington],
+            decision_time=now,
+            deadline_monotonic=1.0,
+        )
+
+        assert probe.proved is False
+        assert probe.refresh_due_families == frozenset(
+            {
+                ("Paris", "2026-06-10", "high"),
+                ("Paris", "2026-06-10", "low"),
+            }
+        )
+
     def test_scheduler_rotates_priority_segment_without_demoting_priority(self):
         # R4-b2: moved to src.events.reactor with the day0-hourly-refresh cluster.
         from src.events import reactor
