@@ -4331,6 +4331,70 @@ def test_global_scope_queue_identity_enters_priority_below_held(monkeypatch, tmp
     assert background.name not in priority_names
 
 
+def test_own_clock_station_revision_enters_priority_without_becoming_held(
+    monkeypatch, tmp_path
+):
+    """Fresh station evidence must not wait behind historical background debt."""
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    station = tmp_path / "Hong_Kong.2026-09-04.low.station-input-revision.json"
+    gridded = tmp_path / "London.2026-09-04.high.gridded.json"
+    common = {
+        "source_cycle_time": "2026-09-03T00:00:00+00:00",
+        "computed_at": "2026-09-03T08:39:00+00:00",
+    }
+    payloads = {
+        station: {
+            **common,
+            "city": "Hong Kong",
+            "target_date": "2026-09-04",
+            "temperature_metric": "low",
+            "input_revision_sources": ["hko_fnd"],
+        },
+        gridded: {
+            **common,
+            "city": "London",
+            "target_date": "2026-09-04",
+            "temperature_metric": "high",
+            "input_revision_sources": ["ecmwf_ifs"],
+        },
+    }
+    for path, payload in payloads.items():
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        queue_mod,
+        "_current_probability_debt_families",
+        lambda **_kwargs: frozenset(),
+    )
+    priority_names: set[str] = set()
+
+    priority = queue_mod._cycle_advance_seed_priority_map(
+        None,
+        tuple(payloads),
+        payloads,
+        current_money_risk=frozenset(),
+        current_global_scope=frozenset(),
+        priority_names=priority_names,
+    )
+
+    assert priority_names == {station.name}
+    assert priority[station.name][0] == -0.75
+    assert gridded.name not in priority_names
+
+    backlog = tuple(tmp_path / f"ordinary-{index:03d}.json" for index in range(80))
+    ordered = queue_mod._prioritize_own_clock_station_revision_files(
+        (*backlog, gridded, station)
+    )
+    assert ordered[0] == station
+    window = queue_mod._bounded_seed_inspection_window(
+        ordered,
+        current_priority_scope=frozenset(),
+        inspection_cap=3,
+        lane=queue_mod.MATERIALIZATION_LANE_PRIORITY,
+    )
+    assert station in window
+
+
 @pytest.mark.parametrize("unheld_owner", ("global", "never_priced"))
 def test_priority_seed_tranche_preserves_held_and_unheld_truth(
     tmp_path, monkeypatch, unheld_owner

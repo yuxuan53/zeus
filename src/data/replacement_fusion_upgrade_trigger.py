@@ -1546,7 +1546,7 @@ def enqueue_fusion_upgrade_reseeds(
                         verdict["changed_input_revisions"],  # type: ignore[arg-type]
                     )
                 )
-            seed_file = seed_path / _seed_name(
+            seed_name = _seed_name(
                 {
                     "city": city,
                     "target_date": target_date,
@@ -1554,6 +1554,17 @@ def enqueue_fusion_upgrade_reseeds(
                 },
                 computed_at=now,
             )
+            station_input_revision = revision_update and any(
+                str(source).startswith(("hko_", "cwa_"))
+                for source in verdict["changed_input_sources"]
+            )
+            if station_input_revision:
+                seed_name_path = Path(seed_name)
+                seed_name = (
+                    f"{seed_name_path.stem}.station-input-revision"
+                    f"{seed_name_path.suffix}"
+                )
+            seed_file = seed_path / seed_name
             publication = _new_seed_publication(
                 seed_file,
                 transition_keys,
@@ -1608,6 +1619,10 @@ def enqueue_fusion_upgrade_reseeds(
                     manifest_base_dir=_manifest_base_dir,
                     resolve_path=_resolve_path,
                     expected_identity=expected_replacement_dependency_identity_by_role,
+                    input_revision_sources=tuple(
+                        str(source)
+                        for source in verdict["changed_input_sources"]
+                    ),
                     day0_payload=day0_payload,
                 )
             except Exception as exc:  # noqa: BLE001 — per-scope fail-soft
@@ -1790,6 +1805,7 @@ def _build_and_write_upgrade_seed(
     manifest_base_dir,
     resolve_path,
     expected_identity,
+    input_revision_sources: Sequence[str] = (),
     day0_payload: Mapping[str, object] | None = None,
 ) -> Path | None:
     """Build one re-materialization seed for a scope using the existing seed-builder pieces and
@@ -1862,5 +1878,12 @@ def _build_and_write_upgrade_seed(
     # posterior records WHY it was produced (instrument-set expansion, not a fresh cycle).
     seed_payload: dict[str, object] = dict(seed_result.seed)
     seed_payload["upgrade_trigger"] = "instrument_set_expansion"
+    if input_revision_sources:
+        # Keep the causal reason machine-readable through the queue.  Station
+        # forecasts publish on their own clock; a changed row must not lose its
+        # information lead behind historical background materialization debt.
+        seed_payload["input_revision_sources"] = list(
+            dict.fromkeys(str(source) for source in input_revision_sources)
+        )
     write_seed(seed_file, seed_payload)
     return seed_file

@@ -1900,6 +1900,20 @@ def _is_current_capital_protection_timeout_retry(
     )
 
 
+def _is_own_clock_station_input_revision(
+    payload: Mapping[str, object],
+) -> bool:
+    """Return whether fresh station evidence should use the one-second q lane."""
+
+    sources = payload.get("input_revision_sources")
+    if not isinstance(sources, (list, tuple)):
+        return False
+    return any(
+        str(source).strip().startswith(("hko_", "cwa_"))
+        for source in sources
+    )
+
+
 def _cycle_advance_seed_priority_map(
     forecast_db: Path | str | None,
     queue_files: Sequence[Path],
@@ -2144,11 +2158,15 @@ def _cycle_advance_seed_priority_map(
                 payload,
                 current_probability_debt=current_probability_debt,
             )
+            own_clock_station_revision = _is_own_clock_station_input_revision(
+                payload
+            )
             if priority_names is not None and (
                 fam_scope in current_money_risk
                 or fam_scope in current_global_scope
                 or fam_scope in never_priced_scopes
                 or current_day0_identity
+                or own_clock_station_revision
             ):
                 # The Day0 conditioning identity is part of the durable request
                 # semantic key. A held family without Day0 evidence is still
@@ -2201,6 +2219,10 @@ def _cycle_advance_seed_priority_map(
                 priority_tier = -11.0
             elif capital_protection_retry:
                 priority_tier = -10.0
+            elif own_clock_station_revision:
+                # Fresh own-clock evidence is ordinary alpha unless capital is
+                # already exposed; held/global tiers above remain stronger.
+                priority_tier = min(priority_tier, -0.75)
             priority[name] = (priority_tier, request_time)
     return priority
 
@@ -3865,6 +3887,23 @@ def _prioritize_seed_files_by_capital_tier(
     return ordered
 
 
+def _prioritize_own_clock_station_revision_files(
+    paths: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Keep named station evidence inside the bounded raw window without I/O."""
+
+    station: list[Path] = []
+    ordinary: list[Path] = []
+    for path in paths:
+        target = (
+            station
+            if ".station-input-revision." in path.name
+            else ordinary
+        )
+        target.append(path)
+    return (*station, *ordinary)
+
+
 def _interleave_current_priority_seed_files_by_name(
     paths: Sequence[Path],
     *,
@@ -4398,8 +4437,11 @@ def _prepare_seed_requests_with_connection(
             current_priority_scope,
         )
     elif lane == MATERIALIZATION_LANE_PRIORITY:
+        prioritized_raw_snapshot = _prioritize_own_clock_station_revision_files(
+            rotated_raw_snapshot
+        )
         prioritized_raw_snapshot = _prioritize_seed_files_by_capital_tier(
-            rotated_raw_snapshot,
+            prioritized_raw_snapshot,
             never_priced_scope=never_priced_scope,
             current_global_scope=current_global_scope,
             current_money_risk=current_money_risk,

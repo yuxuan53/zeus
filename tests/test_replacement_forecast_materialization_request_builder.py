@@ -111,6 +111,7 @@ def _write_inputs(tmp_path: Path) -> dict[str, object]:
 
 def test_request_builder_outputs_materializer_ready_json(tmp_path) -> None:
     seed = _write_inputs(tmp_path)
+    seed["input_revision_sources"] = ["hko_fnd"]
 
     result = build_replacement_forecast_materialization_request(seed, base_dir=tmp_path)
 
@@ -123,6 +124,7 @@ def test_request_builder_outputs_materializer_ready_json(tmp_path) -> None:
     assert request["precision_metadata_json"] == str(tmp_path / "precision_metadata.json")
     assert request["anchor_weight"] == 0.80
     assert request["anchor_sigma_c"] == 3.00
+    assert request["input_revision_sources"] == ["hko_fnd"]
 
 
 def test_shared_precision_metadata_rebinds_to_each_materialization_target(

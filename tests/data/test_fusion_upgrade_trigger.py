@@ -713,6 +713,12 @@ def test_upgrade_seed_baseline_lookup_obeys_manifest_and_decision_clocks(
         return manifest
 
     output = tmp_path / "staging" / "seed.json"
+
+    def _write_seed(path, payload):
+        observed["seed_payload"] = payload
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
     built = trigger._build_and_write_upgrade_seed(
         _conn(),
         city="Seoul",
@@ -727,10 +733,7 @@ def test_upgrade_seed_baseline_lookup_obeys_manifest_and_decision_clocks(
         build_seed=lambda **_kwargs: SimpleNamespace(ok=True, seed={}),
         latest_baseline_coverage=_coverage,
         market_bins=lambda *_args, **_kwargs: (object(),),
-        write_seed=lambda path, _payload: (
-            path.parent.mkdir(parents=True, exist_ok=True),
-            path.write_text("{}\n", encoding="utf-8"),
-        ),
+        write_seed=_write_seed,
         latest_manifest=_latest_manifest,
         manifest_path_value=lambda *_args, **_kwargs: tmp_path / "input.json",
         manifest_base_dir=lambda *_args, **_kwargs: tmp_path,
@@ -741,12 +744,14 @@ def test_upgrade_seed_baseline_lookup_obeys_manifest_and_decision_clocks(
                 data_version="v1",
             )
         },
+        input_revision_sources=("hko_fnd", "hko_fnd"),
     )
 
     assert built == output
     assert observed["not_after_source_cycle_time"] == cycle
     assert observed["as_of_time"] == computed_at
     assert observed["cycle_admissible"](manifest)
+    assert observed["seed_payload"]["input_revision_sources"] == ["hko_fnd"]
     assert not observed["cycle_admissible"](
         SimpleNamespace(source_cycle_time=cycle + timedelta(hours=6))
     )
@@ -1105,6 +1110,7 @@ def test_station_input_revision_enqueue_is_idempotent_until_raw_id_changes(
     assert duplicate["already_enqueued"] == 1
     assert revised["seeds_enqueued"] == 1
     assert len(built) == 2
+    assert all(".station-input-revision." in path for path in built)
     conn = sqlite3.connect(db)
     markers = conn.execute(
         """

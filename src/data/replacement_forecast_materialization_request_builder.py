@@ -261,6 +261,9 @@ def build_replacement_forecast_materialization_request(
         # fusion-upgrade trigger it carries upgrade_trigger="instrument_set_expansion"; thread it
         # through verbatim so the materializer can record it in the posterior provenance_json.
         "upgrade_trigger",
+        # Own-clock input revisions retain their causal class until the request
+        # reaches the single writer, so queue priority survives the seed bridge.
+        "input_revision_sources",
     ):
         if optional_key in payload:
             request[optional_key] = payload[optional_key]
