@@ -6049,6 +6049,7 @@ def _edli_day0_hourly_priority_families(
     *,
     held_families: Iterable[tuple[str, str, str]] | None = None,
     refresh_due_families: Iterable[tuple[str, str, str]] = (),
+    urgent_held_families: Iterable[tuple[str, str, str]] | None = None,
 ) -> list[tuple[str, str, str]]:
     """Due held Day0 first, then other held and current-day authority debt."""
 
@@ -6077,10 +6078,15 @@ def _edli_day0_hourly_priority_families(
     # where data absence is currently preventing capital redecision.  Keep it
     # ahead of held families that still have valid authority; otherwise the
     # broad held set turns a known outage into a many-cycle round robin.
+    urgent = (
+        refresh_due
+        if urgent_held_families is None
+        else list(urgent_held_families)
+    )
     add(
         sorted(
             family
-            for family in refresh_due
+            for family in urgent
             if _substrate_refresh_family_key(*family) in held_keys
         )
     )
@@ -6264,6 +6270,11 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
             decision_time=decision_time,
             deadline_monotonic=preflight_deadline_monotonic,
         )
+        # Strict due means the current consumer can no longer form probability
+        # authority.  Preserve that distinction before provider HWM release
+        # debt is unioned below: a newly available run should refresh promptly,
+        # but it must not displace a held position that is already blind.
+        strict_refresh_due_families = priority_probe.refresh_due_families
         provider_run_hwm = {}
         release_due_city_dates = frozenset()
         try:
@@ -6312,7 +6323,7 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
         try:
             refresh_due_keys = {
                 _substrate_refresh_family_key(*family)
-                for family in priority_probe.refresh_due_families
+                for family in strict_refresh_due_families
             }
             urgent_held_families = [
                 family
@@ -6322,12 +6333,14 @@ def run_edli_day0_hourly_refresh_cycle(*, trading_lane_active: bool) -> None:
             priority_families = _edli_day0_hourly_priority_families(
                 held_families=held_families,
                 refresh_due_families=priority_probe.refresh_due_families,
+                urgent_held_families=urgent_held_families,
             )
         except Exception as exc:  # noqa: BLE001 -- priority fails closed; held remains critical.
             _log.warning(
                 "edli_day0_hourly_refresh: priority family probe failed: %s", exc
             )
             priority_probe = _Day0HourlyPriorityProbe()
+            strict_refresh_due_families = frozenset()
             urgent_held_families = []
             priority_families = list(held_families)
         ordered_cities, priority_city_count = _edli_order_day0_hourly_refresh_cities(

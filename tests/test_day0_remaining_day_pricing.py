@@ -8128,6 +8128,30 @@ class TestRequestHashProvenance:
             ("london", "2026-06-25", "high"),
         ]
 
+    def test_provider_release_debt_does_not_displace_strictly_due_held(self):
+        from src.events import reactor
+
+        assert reactor._edli_day0_hourly_priority_families(
+            held_families={
+                ("Beijing", "2026-06-25", "high"),
+                ("Busan", "2026-06-25", "high"),
+                ("Lucknow", "2026-06-25", "high"),
+            },
+            refresh_due_families={
+                ("Beijing", "2026-06-25", "high"),
+                ("Busan", "2026-06-25", "high"),
+                ("Lucknow", "2026-06-25", "high"),
+            },
+            urgent_held_families={
+                ("Busan", "2026-06-25", "high"),
+                ("Lucknow", "2026-06-25", "high"),
+            },
+        ) == [
+            ("busan", "2026-06-25", "high"),
+            ("lucknow", "2026-06-25", "high"),
+            ("beijing", "2026-06-25", "high"),
+        ]
+
 
 @pytest.mark.parametrize(
     ("metric", "settlement_value", "physical_value", "future_unavailable_value", "extreme_key"),
