@@ -15279,6 +15279,41 @@ def test_current_actuation_probability_reuses_selected_book_token_bindings(
     )
 
 
+def test_current_sell_actuation_requires_only_held_token_binding(monkeypatch):
+    import src.engine.global_auction_universe as universe
+
+    current = SimpleNamespace(family_key="family", bindings=("current",))
+    selected_binding = SimpleNamespace(
+        condition_id="condition",
+        yes_token_id="held-token",
+        no_token_id=None,
+    )
+    selected = SimpleNamespace(
+        family_key="family",
+        bindings=(selected_binding,),
+    )
+    calls = []
+
+    def rebind(witness, *, token_map_by_condition, required_token_ids):
+        calls.append((witness, token_map_by_condition, required_token_ids))
+        return "sell-rebound"
+
+    monkeypatch.setattr(universe, "_rebind_probability_witness_tokens", rebind)
+
+    assert era._rebind_current_actuation_probability_tokens(
+        current,
+        selected,
+        required_token_id="held-token",
+    ) == "sell-rebound"
+    assert calls == [
+        (
+            current,
+            {"condition": ("held-token", "")},
+            frozenset({"held-token"}),
+        )
+    ]
+
+
 def test_global_book_token_reuse_for_batch_rejects_real_topology_change():
     def probability(family, *, bin_suffix):
         return SimpleNamespace(

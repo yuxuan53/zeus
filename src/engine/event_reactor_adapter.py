@@ -1488,6 +1488,8 @@ def _reuse_global_book_token_bindings(
 def _rebind_current_actuation_probability_tokens(
     current: object,
     selected: object,
+    *,
+    required_token_id: str | None = None,
 ) -> object:
     """Complete current q bindings from the selected book epoch, fail closed."""
 
@@ -1498,6 +1500,27 @@ def _rebind_current_actuation_probability_tokens(
     family_key = str(getattr(selected, "family_key", "") or "").strip()
     if not family_key or str(getattr(current, "family_key", "") or "") != family_key:
         raise ValueError("GLOBAL_ACTUATION_PROBABILITY_FAMILY_CHANGED")
+    if required_token_id is not None:
+        required = str(required_token_id or "").strip()
+        if not required:
+            raise ValueError("GLOBAL_ACTUATION_REQUIRED_TOKEN_INVALID")
+        from src.engine.global_auction_universe import (
+            _rebind_probability_witness_tokens,
+        )
+
+        token_map = {
+            str(getattr(binding, "condition_id", "") or "").strip(): (
+                str(getattr(binding, "yes_token_id", "") or "").strip(),
+                str(getattr(binding, "no_token_id", "") or "").strip(),
+            )
+            for binding in selected_bindings
+            if str(getattr(binding, "condition_id", "") or "").strip()
+        }
+        return _rebind_probability_witness_tokens(
+            current,
+            token_map_by_condition=token_map,
+            required_token_ids=frozenset({required}),
+        )
     return _reuse_global_book_token_bindings(
         {family_key: current},
         {family_key: selected},
@@ -17760,6 +17783,11 @@ def _current_global_actuation_prepared_family(
         ),
         allow_unobserved_day0_replacement=(
             probability_use is _CurrentProbabilityUse.REDUCE_ONLY_EXIT
+            and not _held_day0_has_canonical_observation(
+                observation_conn,
+                event=event,
+                decision_time=revalidation_time,
+            )
         ),
         allow_provisional_day0_replacement=(
             probability_use
@@ -17776,6 +17804,11 @@ def _current_global_actuation_prepared_family(
         current_witness = _rebind_current_actuation_probability_tokens(
             current_witness,
             selected,
+            required_token_id=(
+                str(getattr(candidate, "token_id", "") or "").strip()
+                if probability_use is _CurrentProbabilityUse.REDUCE_ONLY_EXIT
+                else None
+            ),
         )
     probability_mismatches = (
         ("probability_witness",)
@@ -37711,7 +37744,10 @@ def _held_day0_has_canonical_observation(
 
     if decision_time.tzinfo is None:
         raise ValueError("GLOBAL_HELD_DAY0_OBSERVATION_TIME_NAIVE")
-    payload = _payload(event)
+    try:
+        payload = _payload(event)
+    except (AttributeError, TypeError, ValueError):
+        return False
     city = str(payload.get("city") or "").strip()
     target_date = str(payload.get("target_date") or "").strip()
     metric = str(payload.get("metric") or "").strip().lower()
@@ -37721,8 +37757,8 @@ def _held_day0_has_canonical_observation(
         _latest_authorized_day0_fact,
     )
 
-    return bool(
-        _latest_authorized_day0_fact(
+    try:
+        fact = _latest_authorized_day0_fact(
             conn,
             city=city,
             target_date=target_date,
@@ -37730,8 +37766,9 @@ def _held_day0_has_canonical_observation(
             decision_time=decision_time.astimezone(UTC),
             require_settlement_channel=False,
         )
-        is not None
-    )
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+    return fact is not None
 
 
 def _day0_redecision_authority_scope(
