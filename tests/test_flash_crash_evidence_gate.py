@@ -2,9 +2,10 @@
 # Last reused/audited: 2026-09-03 (held executable-bid carrier restoration)
 # Authority basis: BUG#127 (守護 SEV1, GOAL#36 "a short price change is NOT edge reversal");
 #   src/state/portfolio.py flash_crash_should_fire + Position.evaluate_exit (single live site)
-# Purpose: Lock the evidence gate on FLASH_CRASH_PANIC so a bare single-cycle quote wiggle
-#   (adverse market_velocity_1h with UNCHANGED belief) can no longer force an exit, while a
-#   persistent deep catastrophe from causal quote history still exits. After unblock-W3
+# Purpose: Lock the evidence gate on FLASH_CRASH_PANIC so market-price motion cannot override
+#   a fresh probability-witness decision; a persistent deep catastrophe from causal quote
+#   history remains an emergency fallback only while probability authority is unavailable.
+#   After unblock-W3
 #   deleted the dead exit_triggers.py twin, the live gate lives solely in portfolio.py
 #   (flash_crash_should_fire, shared by Position.evaluate_exit).
 # Reuse: Run when FLASH_CRASH gating, exit_triggers ordering, or the flash_crash_* config changes.
@@ -105,6 +106,7 @@ def _exit_context(
         whale_toxicity=False,
         divergence_score=divergence_score,
         market_velocity_1h=market_velocity_1h,
+        current_ci=(max(0.0, fresh_prob - 0.10), min(1.0, fresh_prob + 0.10)),
     )
 
 
@@ -191,7 +193,7 @@ def test_portfolio_evaluate_exit_shallow_belief_divergence_does_not_exit():
     assert decision.trigger != "FLASH_CRASH_PANIC"
 
 
-def test_portfolio_evaluate_exit_persistent_deep_catastrophe_exits():
+def test_portfolio_evaluate_exit_fresh_probability_beats_deep_catastrophe():
     pos = _held_position()
     pos.flash_crash_count = flash_crash_confirmations()
     ctx = _exit_context(
@@ -201,9 +203,9 @@ def test_portfolio_evaluate_exit_persistent_deep_catastrophe_exits():
 
     decision = pos.evaluate_exit(ctx)
 
-    assert decision.should_exit is True
-    assert decision.trigger == "FLASH_CRASH_PANIC"
-    assert "flash_crash_persistent_market_evidence" in decision.applied_validations
+    assert decision.should_exit is False
+    assert decision.trigger == "HOLD"
+    assert "flash_crash_persistent_market_evidence" not in decision.applied_validations
 
 
 def test_portfolio_evaluate_exit_persistent_counter_resets_on_recovery():
@@ -214,7 +216,7 @@ def test_portfolio_evaluate_exit_persistent_counter_resets_on_recovery():
     )
     recovered = _exit_context(market_velocity_1h=0.0)
 
-    assert pos.evaluate_exit(deep).should_exit is True
+    assert pos.evaluate_exit(deep).should_exit is False
     assert pos.evaluate_exit(recovered).should_exit is False
     assert pos.flash_crash_count == 0
 
@@ -227,9 +229,29 @@ def test_portfolio_evaluate_exit_stale_market_resets_persistent_counter():
     )
     stale = replace(deep, current_market_price_is_fresh=False)
 
-    assert pos.evaluate_exit(deep).should_exit is True
+    assert pos.evaluate_exit(deep).should_exit is False
     assert pos.evaluate_exit(stale).should_exit is False
     assert pos.flash_crash_count == 0
+
+
+def test_paris_fresh_q_does_not_sell_at_six_cents_on_price_path_alone():
+    """Regression: q=36.69% must not liquidate at 6c solely on -40%/h quotes."""
+    pos = _held_position(direction="buy_yes")
+    pos.flash_crash_count = flash_crash_confirmations()
+    ctx = replace(
+        _exit_context(
+            market_velocity_1h=-0.40,
+            fresh_prob=0.3669,
+            current_market_price=0.06,
+        ),
+        best_bid=0.06,
+        best_ask=0.07,
+    )
+
+    decision = pos.evaluate_exit(ctx)
+
+    assert decision.should_exit is False
+    assert decision.trigger == "HOLD"
 
 
 def test_portfolio_evaluate_exit_guaranteed_settlement_lock_beats_catastrophe():

@@ -1033,11 +1033,12 @@ class Position:
         shallow divergence panic, vig trigger, or near-settlement price floor: a
         near-certain winner holds because its bid sits below q≈1, and a reversed
         bin sells because the bid beats q.  The sole market-path override is a
-        fresh, executable, persistent deep catastrophe: it protects capital when
-        the held-token book has collapsed by the configured amount across
-        multiple causal quote samples while the probability source has not
-        caught up.  The entry price / cost basis is sunk and never enters either
-        verdict.
+        fresh, executable, persistent deep catastrophe, and only while current
+        probability authority is unavailable: it protects capital when the
+        held-token book has collapsed across multiple causal quote samples while
+        the probability source has not caught up.  Fresh probability authority
+        remains governed by the expected-log-growth stopping law.  The entry
+        price / cost basis is sunk and never enters either verdict.
 
         Precedence is the law's: RiskGuard RED force-exits in every phase (the
         Day0 exemption is removed — DT#2 RED is orthogonal to observation phase);
@@ -1057,8 +1058,9 @@ class Position:
 
         # Market path is evidence, not a stop-loss.  A single adverse tick and
         # every shallow divergence remain governed by the posterior-mean stop
-        # below.  Only a fresh, executable, causally persistent deep collapse can
-        # override HOLD/EVIDENCE_UNAVAILABLE.  Deliberately pass
+        # below.  Only a fresh, executable, causally persistent deep collapse
+        # while probability authority is unavailable can override
+        # EVIDENCE_UNAVAILABLE.  Deliberately pass
         # has_probability_authority=False: the helper's shallow belief-confirmed
         # branch is not part of the live law, and the current divergence score is
         # not a causal probability witness.  A settlement-preimage GUARANTEED
@@ -1075,7 +1077,8 @@ class Position:
         ):
             self.flash_crash_count = 0
         persistent_market_catastrophe = (
-            lock is not LockState.GUARANTEED
+            not evidence_ok
+            and lock is not LockState.GUARANTEED
             and fresh_market_path_evidence
             and flash_crash_should_fire(
                 market_velocity_1h=float(velocity),
