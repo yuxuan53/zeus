@@ -20791,6 +20791,56 @@ def test_current_global_book_epoch_uses_normalized_negrisk_tradeability():
     assert {state[5] for state in epoch.asset_states} == {"EXECUTABLE"}
 
 
+def test_current_global_book_epoch_checks_metadata_at_capture_not_quote_time():
+    probability = _current_global_book_probability()
+    conn = _global_book_metadata_conn(
+        probability,
+        captured_at="2026-06-13T07:59:50+00:00",
+        freshness_deadline="2026-06-13T08:00:30+00:00",
+    )
+    prefetched_at = _dt.datetime(
+        2026, 6, 13, 7, 59, 45, tzinfo=_dt.timezone.utc
+    )
+    metadata_checked_at = _dt.datetime(
+        2026, 6, 13, 8, 0, 0, tzinfo=_dt.timezone.utc
+    )
+    finished_at = metadata_checked_at + _dt.timedelta(seconds=1)
+    times = iter((metadata_checked_at, finished_at))
+    books = {
+        token: {
+            "asset_id": token,
+            "hash": f"book-{token}",
+            "tick_size": "0.01",
+            "min_order_size": "5",
+            "bids": [{"price": "0.20", "size": "100"}],
+            "asks": [{"price": "0.30", "size": "100"}],
+        }
+        for binding in probability.bindings
+        for token in (binding.yes_token_id, binding.no_token_id)
+    }
+
+    epoch = capture_current_global_book_epoch(
+        conn,
+        probability_witnesses={probability.family_key: probability},
+        get_books=lambda _tokens: books,
+        clock=lambda: next(times),
+        max_age=_dt.timedelta(seconds=30),
+        prefetched_books=books,
+        prefetched_at_utc=prefetched_at,
+    )
+
+    assert epoch.captured_at_utc == prefetched_at
+    assert epoch.max_age == _dt.timedelta(seconds=30)
+    assert epoch.current_identity(
+        prefetched_at + _dt.timedelta(seconds=30)
+    ) is not None
+    assert epoch.current_identity(
+        prefetched_at + _dt.timedelta(seconds=31)
+    ) is None
+    assert len(epoch.assets) == 2 * len(probability.bindings)
+    assert {state[5] for state in epoch.asset_states} == {"EXECUTABLE"}
+
+
 def test_current_global_book_epoch_honors_normalized_non_executable_status():
     probability = _current_global_book_probability()
     conn = _global_book_metadata_conn(probability)

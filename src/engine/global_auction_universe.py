@@ -1250,11 +1250,21 @@ def capture_current_global_book_epoch(
     if started_at is None or started_at.tzinfo is None:
         raise ValueError("GLOBAL_BOOK_CLOCK_INVALID")
     started_at = started_at.astimezone(timezone.utc)
+    # A projected book can predate metadata that is already available at this
+    # capture.  The book clock still owns the epoch TTL; current tradeability is
+    # evaluated at the capture clock instead of being falsely rejected as
+    # future evidence relative to the older quote.
+    metadata_checked_at = clock() if prefetched_books is not None else started_at
+    if metadata_checked_at is None or metadata_checked_at.tzinfo is None:
+        raise ValueError("GLOBAL_BOOK_CLOCK_INVALID")
+    metadata_checked_at = metadata_checked_at.astimezone(timezone.utc)
+    if metadata_checked_at < started_at:
+        raise ValueError("GLOBAL_BOOK_CLOCK_REVERSED")
     if work_context is None:
         metadata_rows = _global_book_snapshot_rows(
             trade_conn,
             condition_ids=[row[2] for row in bindings],
-            checked_at_utc=started_at,
+            checked_at_utc=metadata_checked_at,
         )
     else:
         with bounded_work_sqlite(
@@ -1265,7 +1275,7 @@ def capture_current_global_book_epoch(
             metadata_rows = _global_book_snapshot_rows(
                 read_conn,
                 condition_ids=[row[2] for row in bindings],
-                checked_at_utc=started_at,
+                checked_at_utc=metadata_checked_at,
             )
     metadata_by_key: dict[tuple[str, str], dict[str, object]] = {}
     for row in metadata_rows:
@@ -1297,7 +1307,7 @@ def capture_current_global_book_epoch(
             )
         if _global_book_metadata_is_executable(
             metadata,
-            checked_at_utc=started_at,
+            checked_at_utc=metadata_checked_at,
         ):
             tokens.append(token_id)
     books = (
@@ -1340,7 +1350,7 @@ def capture_current_global_book_epoch(
             metadata=metadata,
             raw_book=books.get(token_id),
             captured_at_utc=started_at,
-            checked_at_utc=started_at,
+            checked_at_utc=metadata_checked_at,
             max_age=max_age,
         )
         states.append(state)
