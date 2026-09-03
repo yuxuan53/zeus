@@ -1008,26 +1008,30 @@ def _global_book_metadata_is_executable(
 def _global_book_metadata_tradeability(
     metadata: Mapping[str, object],
 ) -> bool | None:
-    """Return payload tradeability without asserting metadata freshness."""
+    """Return normalized tradeability, with legacy flags only as fallback."""
 
-    required = ("enable_orderbook", "active", "closed", "accepting_orders")
-    if any(key not in metadata for key in required):
-        return None
     try:
         tradeability = json.loads(
             str(metadata.get("tradeability_status_json") or "{}")
         )
     except json.JSONDecodeError:
         tradeability = {}
+    normalized = (
+        tradeability.get("executable_allowed")
+        if isinstance(tradeability, Mapping)
+        else None
+    )
+    if isinstance(normalized, bool):
+        return normalized
+
+    required = ("enable_orderbook", "active", "closed", "accepting_orders")
+    if any(key not in metadata for key in required):
+        return None
     return (
         bool(metadata.get("enable_orderbook"))
         and bool(metadata.get("active"))
         and not bool(metadata.get("closed"))
         and bool(metadata.get("accepting_orders"))
-        and not (
-            isinstance(tradeability, Mapping)
-            and tradeability.get("executable_allowed") is False
-        )
     )
 
 

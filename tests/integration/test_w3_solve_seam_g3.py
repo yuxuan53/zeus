@@ -20744,6 +20744,90 @@ def test_current_global_book_epoch_excludes_stale_tradeability_symmetrically():
     }
 
 
+def test_current_global_book_epoch_uses_normalized_negrisk_tradeability():
+    probability = _current_global_book_probability()
+    conn = _global_book_metadata_conn(probability)
+    conn.execute(
+        """
+        UPDATE executable_market_snapshots
+           SET active = 0,
+               tradeability_status_json = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "accepting_orders": True,
+                    "child_active": False,
+                    "clob_archived": False,
+                    "clob_enable_order_book": True,
+                    "executable_allowed": True,
+                    "reason": "clob_live_accepting_child",
+                }
+            ),
+        ),
+    )
+    at = _dt.datetime(2026, 6, 13, 8, 0, tzinfo=_dt.timezone.utc)
+    times = iter((at, at + _dt.timedelta(seconds=1)))
+
+    epoch = capture_current_global_book_epoch(
+        conn,
+        probability_witnesses={probability.family_key: probability},
+        get_books=lambda tokens: {
+            token: {
+                "asset_id": token,
+                "hash": f"book-{token}",
+                "tick_size": "0.01",
+                "min_order_size": "5",
+                "bids": [{"price": "0.20", "size": "100"}],
+                "asks": [{"price": "0.30", "size": "100"}],
+            }
+            for token in tokens
+        },
+        clock=lambda: next(times),
+        max_age=_dt.timedelta(seconds=30),
+    )
+
+    assert len(epoch.assets) == 2 * len(probability.bindings)
+    assert {state[5] for state in epoch.asset_states} == {"EXECUTABLE"}
+
+
+def test_current_global_book_epoch_honors_normalized_non_executable_status():
+    probability = _current_global_book_probability()
+    conn = _global_book_metadata_conn(probability)
+    conn.execute(
+        """
+        UPDATE executable_market_snapshots
+           SET tradeability_status_json = ?
+        """,
+        ('{"executable_allowed":false,"reason":"clob_archived"}',),
+    )
+    at = _dt.datetime(2026, 6, 13, 8, 0, tzinfo=_dt.timezone.utc)
+    times = iter((at, at + _dt.timedelta(seconds=1)))
+
+    epoch = capture_current_global_book_epoch(
+        conn,
+        probability_witnesses={probability.family_key: probability},
+        get_books=lambda tokens: {
+            token: {
+                "asset_id": token,
+                "hash": f"book-{token}",
+                "tick_size": "0.01",
+                "min_order_size": "5",
+                "bids": [{"price": "0.20", "size": "100"}],
+                "asks": [{"price": "0.30", "size": "100"}],
+            }
+            for token in tokens
+        },
+        clock=lambda: next(times),
+        max_age=_dt.timedelta(seconds=30),
+    )
+
+    assert epoch.assets == ()
+    assert {state[5] for state in epoch.asset_states} == {
+        "VENUE_NOT_EXECUTABLE"
+    }
+
+
 def _current_global_book_probability():
     family, proofs, payload = _corpus()[0]
     proofs = tuple(
