@@ -2715,7 +2715,6 @@ def _retry_committed_receipt(cfg: Mapping[str, Any], deadline: float) -> None:
 def detect(cfg: Mapping[str, Any]) -> list[str]:
     global _LAST_EVIDENCE_CYCLE
     _LAST_EVIDENCE_CYCLE = {"built": [], "deferred": [], "attempted": 0, "validated": 0, "bytes": 0}
-    budget = _new_evidence_budget(cfg)
     trigger_deadline = time.monotonic() + max(0.01, float(cfg["loop"].get("trigger_budget_ms", 100.0))) / 1000.0
     _phase_heartbeat(cfg, "trigger_start")
     floor = _bounded_floor_price(cfg, trigger_deadline)
@@ -2739,7 +2738,11 @@ def detect(cfg: Mapping[str, Any]) -> list[str]:
         # Both trigger connections are closed before this independent local
         # snapshot transaction begins.  Keep the cycle to one shared-budget
         # evidence capture, even when maintenance is interrupted.
-        _capture_hard_evidence(cfg, trigger_created, budget=budget)
+        _capture_hard_evidence(
+            cfg,
+            trigger_created,
+            budget=_new_evidence_budget(cfg),
+        )
         return list(dict.fromkeys(trigger_created))
     maintenance_ids = list(maintenance_result)
     created = list(dict.fromkeys([*maintenance_ids, *trigger_created]))
@@ -2759,7 +2762,15 @@ def detect(cfg: Mapping[str, Any]) -> list[str]:
     # Both trigger connections are closed before this independent local
     # snapshot transaction begins.  New maintenance incidents join this one
     # capture rather than triggering a second pass over the same budget.
-    _capture_hard_evidence(cfg, created, budget=budget)
+    # Evidence owns an independent wall-clock slice. Starting this deadline
+    # before trigger/maintenance made ordinary detector work consume the whole
+    # evidence budget, so hard incidents entered the expired recovery path
+    # without ever attempting a snapshot.
+    _capture_hard_evidence(
+        cfg,
+        created,
+        budget=_new_evidence_budget(cfg),
+    )
     return list(dict.fromkeys(created))
 
 

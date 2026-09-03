@@ -1760,6 +1760,47 @@ def test_committed_maintenance_ids_survive_postcommit_deadline(cfg: dict, monkey
     assert status["postcommit_deferred"] is True
 
 
+def test_detect_starts_evidence_budget_after_maintenance(
+    cfg: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 10.0}
+    budget_started_at: list[float] = []
+    captured_remaining: list[float] = []
+
+    monkeypatch.setattr(loop.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(loop, "_phase_heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(loop, "_bounded_floor_price", lambda *_args: 0.05)
+    monkeypatch.setattr(loop, "_detect_trigger", lambda *_args: [])
+    monkeypatch.setattr(loop, "_retry_committed_receipt", lambda *_args: None)
+
+    def maintenance(*_args):
+        clock["now"] = 12.0
+        return loop._MaintenanceOutcome([], postcommit_deferred=False)
+
+    def new_budget(_cfg):
+        budget_started_at.append(clock["now"])
+        return {
+            "remaining": 1,
+            "deadline": clock["now"] + 1.0,
+            "max_bytes": 1024,
+            "built": 0,
+            "bytes": 0,
+        }
+
+    def capture(_cfg, _ids, *, budget, **_kwargs):
+        captured_remaining.append(float(budget["deadline"]) - clock["now"])
+        return {"built": [], "deferred": []}
+
+    monkeypatch.setattr(loop, "_detect_maintenance", maintenance)
+    monkeypatch.setattr(loop, "_new_evidence_budget", new_budget)
+    monkeypatch.setattr(loop, "_capture_hard_evidence", capture)
+
+    assert loop.detect(cfg) == []
+    assert budget_started_at == [12.0]
+    assert captured_remaining == [1.0]
+
+
 def test_evidence_queue_cursor_bounds_provider_backoff_capture(
     cfg: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
