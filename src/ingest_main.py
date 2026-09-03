@@ -879,6 +879,24 @@ def _replacement_availability_poll_seconds() -> int:
         return 15
 
 
+def _station_forecast_source_clock_poll_seconds() -> int:
+    """Run the scheduler at the fastest enabled station source cadence."""
+
+    try:
+        from src.data.replacement_forecast_production import (
+            _station_forecast_poll_intervals,
+        )
+
+        intervals = _station_forecast_poll_intervals()
+        return max(15, int(min(intervals.values()))) if intervals else 15
+    except Exception as exc:  # noqa: BLE001 - boot keeps a bounded retry clock
+        logger.warning(
+            "station forecast cadence config unavailable (%s); using 15s scheduler tick",
+            exc,
+        )
+        return 15
+
+
 def _replacement_source_clock_download_budget_seconds(poll_seconds: int | None = None) -> float:
     """Wall-clock budget for the source-clock scoped download body.
 
@@ -2996,6 +3014,59 @@ def _replacement_maintenance_tick():
     return report
 
 
+@_scheduler_job("ingest_station_forecast_source_clock")
+def _station_forecast_source_clock_tick() -> dict[str, object]:
+    """Poll station forecasts without waiting behind gridded downloads."""
+
+    from src.data.replacement_forecast_production import (  # noqa: PLC0415
+        _enqueue_fusion_upgrade_reseeds_if_needed,
+        _ingest_station_forecasts_if_due,
+        _replacement_forecast_live_materialization_queue_config,
+    )
+
+    cfg = _replacement_forecast_live_materialization_queue_config()
+    try:
+        station_report = _ingest_station_forecasts_if_due(cfg)
+    except Exception as exc:  # noqa: BLE001 - the next source-local tick retries
+        logger.warning("station-forecast source-clock poll failed fail-soft: %s", exc)
+        return {
+            "status": "STATION_FORECAST_SOURCE_CLOCK_FAILSOFT",
+            "error": f"{type(exc).__name__}: {str(exc)[:220]}",
+        }
+    if station_report is None:
+        return {"status": "STATION_FORECAST_SOURCE_CURRENT"}
+
+    completed_sources = tuple(str(source) for source in station_report)
+    rows_written = sum(max(0, int(value)) for value in station_report.values())
+    report: dict[str, object] = {
+        "status": (
+            "STATION_FORECAST_ROWS_COMMITTED"
+            if rows_written > 0
+            else "STATION_FORECAST_BOOTSTRAP_RECONCILIATION"
+        ),
+        "sources": completed_sources,
+        "rows_written": rows_written,
+    }
+    try:
+        reseed = _enqueue_fusion_upgrade_reseeds_if_needed(
+            cfg,
+            changed_sources=completed_sources or None,
+        )
+        if reseed is not None:
+            report["fusion_upgrade_status"] = reseed.get("status")
+            report["fusion_upgrade_seeds_enqueued"] = reseed.get("seeds_enqueued")
+    except Exception as exc:  # noqa: BLE001 - fetch commit remains valid; next tick retries
+        report["fusion_upgrade_status"] = "STATION_FORECAST_RESEED_FAILED"
+        report["error"] = f"{type(exc).__name__}: {str(exc)[:220]}"
+        logger.warning(
+            "station-forecast fusion reseed failed fail-soft: %s",
+            exc,
+            exc_info=True,
+        )
+    logger.info("station-forecast source-clock report: %s", report)
+    return report
+
+
 @_scheduler_job("ingest_replacement_availability_poll")
 def _replacement_availability_poll_tick():
     """Fast source-clock poll for replacement raw-input fetches.
@@ -3013,7 +3084,6 @@ def _replacement_availability_poll_tick():
         _download_replacement_forecast_current_targets_if_needed,
         _enqueue_cycle_advance_reseeds_if_needed,
         _enqueue_fusion_upgrade_reseeds_if_needed,
-        _ingest_station_forecasts_if_due,
         _recover_held_common_cycle_anchors_if_needed,
         _replacement_forecast_live_materialization_queue_config,
     )
@@ -3161,52 +3231,6 @@ def _replacement_availability_poll_tick():
     except Exception as exc:  # noqa: BLE001 - next source-clock tick retries.
         logger.warning("held common-cycle anchor recovery failed: %s", exc)
 
-    # Station-calibrated official forecasts (CWA township / HKO fnd) ingest on THIS lane — re-homed
-    # 2026-07-20 after the 2026-06-11 download-lane migration orphaned the call (it lived only in the
-    # descheduled forecast-live _replacement_forecast_download_cycle, so cwa_township/hko_fnd went dark
-    # 2026-07-17). Due-gated (~3h) + fail-soft: a provider outage never touches the gridded capture.
-    _station_report = None
-    try:
-        _station_report = _ingest_station_forecasts_if_due(cfg)
-        if _station_report:
-            logger.info("station-forecast live ingest wrote rows: %s", _station_report)
-    except Exception as exc:  # noqa: BLE001 - station ingest must never break the poll
-        logger.warning("station-forecast live ingest skipped (fail-soft): %s", exc)
-
-    _station_reseed_report: dict[str, object] | None = None
-    _station_rows_written = sum(
-        max(0, int(value))
-        for value in (_station_report or {}).values()
-    )
-    if _station_report is not None:
-        _station_completed_sources = tuple(
-            str(source) for source in (_station_report or {})
-        )
-        _station_reseed_report = {
-            "status": (
-                "STATION_FORECAST_ROWS_COMMITTED"
-                if _station_rows_written > 0
-                else "STATION_FORECAST_RECONCILIATION"
-            ),
-            "rows_written": _station_rows_written,
-        }
-        try:
-            _attach_reseed_reports(
-                _station_reseed_report,
-                changed_sources=_station_completed_sources or None,
-                include_cycle_advance=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - source-clock poll must continue.
-            _station_reseed_report["fusion_upgrade_status"] = (
-                "STATION_FORECAST_RESEED_FAILED"
-            )
-            _station_reseed_report["error"] = f"{type(exc).__name__}: {str(exc)[:220]}"
-            logger.warning(
-                "station-forecast fusion reseed failed fail-soft: %s",
-                exc,
-                exc_info=True,
-            )
-
     def _download_current_targets(
         *,
         max_wall_clock_seconds: float | None = None,
@@ -3273,8 +3297,6 @@ def _replacement_availability_poll_tick():
             "source_clock_affected_cities": source_clock_payload.get("affected_cities", []),
             "source_clock_error": source_clock_payload.get("error"),
         }
-        if _station_reseed_report is not None:
-            report["station_forecast_reseed"] = _station_reseed_report
         # The source cursor can advance after a bounded first anchor wave, while
         # exact-cycle target manifests still have residual gaps. Global source
         # high-water is therefore never completion evidence. Keep the no-change
@@ -4176,6 +4198,7 @@ def _ingest_main_job_specs() -> list[tuple]:
 
     now = _dt_now.now()
     replacement_availability_poll_seconds = _replacement_availability_poll_seconds()
+    station_forecast_poll_seconds = _station_forecast_source_clock_poll_seconds()
     day0_metar_poll_seconds = _day0_metar_poll_seconds()
     day0_hko_poll_seconds = _day0_hko_poll_seconds()
     hko_daily_final_poll_seconds = _hko_daily_final_poll_seconds()
@@ -4228,6 +4251,12 @@ def _ingest_main_job_specs() -> list[tuple]:
             id="ingest_replacement_availability_poll", max_instances=1, coalesce=True,
             misfire_grace_time=max(120, replacement_availability_poll_seconds * 2),
             next_run_time=now)),
+        (_station_forecast_source_clock_tick, "interval", dict(
+            seconds=station_forecast_poll_seconds,
+            id="ingest_station_forecast_source_clock", max_instances=1, coalesce=True,
+            misfire_grace_time=max(30, station_forecast_poll_seconds * 2),
+            next_run_time=now + timedelta(seconds=1),
+        )),
         (_replacement_maintenance_tick, "interval", dict(seconds=60,
             id="ingest_replacement_maintenance", max_instances=1, coalesce=True,
             misfire_grace_time=120, next_run_time=now + timedelta(seconds=60))),
