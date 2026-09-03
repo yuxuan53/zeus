@@ -520,6 +520,9 @@ PreviousRunsFetchFn = Callable[..., float | None]
 
 _BATCH_TRANSPORT_ERROR_KEY = "__BAYES_PRECISION_FUSION_BATCH_TRANSPORT_ERROR__"
 _BATCH_TRANSPORT_PROVENANCE_KEY = "__BAYES_PRECISION_FUSION_BATCH_TRANSPORT_PROVENANCE__"
+_BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY = (
+    "__BAYES_PRECISION_FUSION_BATCH_EXACT_RUN_UNMATERIALIZABLE__"
+)
 _SOURCE_CLOCK_LOCATION_BATCH_SIZE = 25
 
 
@@ -1198,7 +1201,7 @@ def _parse_batched_single_runs_payload(
     timezone_name: str,
     *,
     decision_at: datetime | str | None = None,
-) -> dict[str, tuple[float | None, float | None]]:
+) -> dict[str, object]:
     """Parse a batched single-runs response into {model: (high_c, low_c)}.
 
     Open-Meteo returns temperature_2m_<om_id> for each requested model, or bare
@@ -1211,13 +1214,21 @@ def _parse_batched_single_runs_payload(
         extract_openmeteo_ecmwf_ifs9_localday_anchor,
     )
 
+    def _unmaterializable(reason: str) -> dict[str, object]:
+        return {
+            _BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY: {
+                model: reason for model in models
+            }
+        }
+
     if not isinstance(payload, dict):
-        return {}
+        return _unmaterializable("payload_not_mapping")
     hourly = payload.get("hourly")
     if not isinstance(hourly, dict):
-        return {}
+        return _unmaterializable("hourly_missing")
 
-    result: dict[str, tuple[float | None, float | None]] = {}
+    result: dict[str, object] = {}
+    unmaterializable: dict[str, str] = {}
     for model in models:
         om_id = OPENMETEO_MODEL_IDS.get(model, model)
         # Multi-model response keys: temperature_2m_<om_id>; single-model: temperature_2m.
@@ -1225,6 +1236,7 @@ def _parse_batched_single_runs_payload(
         bare_var = "temperature_2m"
         series = hourly.get(keyed_var) or (hourly.get(bare_var) if len(models) == 1 else None)
         if series is None:
+            unmaterializable[model] = "temperature_series_missing"
             continue
         # Build a sub-payload shaped like a single-model response for the extractor.
         sub_payload = dict(payload)
@@ -1273,9 +1285,13 @@ def _parse_batched_single_runs_payload(
                     )
             result[model] = (float(anchor.high_c), float(anchor.low_c))
         except Exception as exc:
+            reason = f"{type(exc).__name__}:{str(exc)[:180]}"
+            unmaterializable[model] = reason
             _LOG.warning(
                 "BAYES_PRECISION_FUSION parse batched single_runs model=%s (fail-soft): %s", model, exc
             )
+    if unmaterializable:
+        result[_BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY] = unmaterializable
     return result
 
 
@@ -1745,6 +1761,9 @@ def download_bayes_precision_fusion_extra_raw_inputs(
     domain_excluded: list[str] = []
     transport_errors: list[str] = []
     transport_outcomes: list[dict[str, object]] = []
+    exact_run_unmaterializable: list[dict[str, str]] = []
+    attempted_single_scopes: set[tuple[str, str, str, str]] = set()
+    exact_run_unmaterializable_scopes: set[tuple[str, str, str, str]] = set()
     abort_transport = False
     attempted_target_group_count = 0
     started_monotonic = time.monotonic()
@@ -2182,6 +2201,10 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                 if _timebox_expired():
                     timeboxed = True
                     break
+                for model in single_models:
+                    attempted_single_scopes.add(
+                        (model, city, target_date, single_run.isoformat())
+                    )
                 location_result = location_results.pop(
                     (city, target_date, single_run.isoformat()),
                     None,
@@ -2215,6 +2238,25 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                     _BATCH_TRANSPORT_PROVENANCE_KEY,
                     {},
                 )
+                exact_run_gaps = sv_map.pop(
+                    _BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY,
+                    {},
+                )
+                if isinstance(exact_run_gaps, Mapping):
+                    for model, raw_reason in exact_run_gaps.items():
+                        if model not in single_models:
+                            continue
+                        scope = (model, city, target_date, single_run.isoformat())
+                        exact_run_unmaterializable_scopes.add(scope)
+                        exact_run_unmaterializable.append(
+                            {
+                                "model": model,
+                                "city": city,
+                                "target_date": target_date,
+                                "source_cycle_time": single_run.isoformat(),
+                                "reason": str(raw_reason)[:220],
+                            }
+                        )
                 if single_transport_error is not None:
                     single_error_text = str(single_transport_error[0])
                     transport_errors.append(
@@ -2441,6 +2483,11 @@ def download_bayes_precision_fusion_extra_raw_inputs(
         if timeboxed
         else "BAYES_PRECISION_FUSION_EXTRA_TRANSPORT_RETRYABLE"
         if transport_errors and (abort_transport or not single_success_models)
+        else "BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE"
+        if (
+            attempted_single_scopes
+            and attempted_single_scopes <= exact_run_unmaterializable_scopes
+        )
         else "BAYES_PRECISION_FUSION_EXTRA_RAW_INPUTS_DOWNLOADED"
     )
     return {
@@ -2456,6 +2503,7 @@ def download_bayes_precision_fusion_extra_raw_inputs(
         "domain_excluded": tuple(sorted(set(domain_excluded))),
         "transport_errors": tuple(transport_errors),
         "transport_outcomes": tuple(transport_outcomes),
+        "exact_run_unmaterializable": tuple(exact_run_unmaterializable),
         "transport_aborted_remaining_targets": abort_transport,
         "attempted_target_group_count": attempted_target_group_count,
         "timeboxed_incomplete": timeboxed,

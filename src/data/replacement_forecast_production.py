@@ -2016,6 +2016,12 @@ def _download_bayes_precision_fusion_source_clock_raw_inputs_if_needed(
                 for outcome in source_transport_outcomes
                 if _source_transport_error_is_nonretryable(outcome)
             )
+            source_exact_run_unmaterializable = tuple(
+                value
+                for item in source_reports
+                for value in (item.get("exact_run_unmaterializable") or ())
+                if isinstance(value, Mapping)
+            )
             source_incomplete = any(
                 item.get("global_models_dropped_scoped")
                 or item.get("global_models_unavailable")
@@ -2056,8 +2062,15 @@ def _download_bayes_precision_fusion_source_clock_raw_inputs_if_needed(
             ):
                 status = "SOURCE_CLOCK_SOURCE_PERMANENT_FAILURE"
             elif (
+                statuses
+                == {"BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE"}
+                and source_exact_run_unmaterializable
+            ):
+                status = "SOURCE_CLOCK_SOURCE_PERMANENT_FAILURE"
+            elif (
                 "BAYES_PRECISION_FUSION_EXTRA_TRANSPORT_RETRYABLE" in statuses
                 or source_incomplete
+                or source_exact_run_unmaterializable
             ):
                 status = "SOURCE_CLOCK_SOURCE_TRANSPORT_RETRYABLE"
             elif statuses == {
@@ -2087,6 +2100,7 @@ def _download_bayes_precision_fusion_source_clock_raw_inputs_if_needed(
                 "transport_outcomes": source_transport_outcomes,
                 "permanent_errors": source_permanent_errors,
                 "permanent_outcomes": source_permanent_outcomes,
+                "exact_run_unmaterializable": source_exact_run_unmaterializable,
                 "fanout_errors": source_errors,
             }
 
@@ -2170,6 +2184,12 @@ def _download_bayes_precision_fusion_source_clock_raw_inputs_if_needed(
                 value
                 for item in reports
                 for value in (item.get("transport_errors") or ())
+            ),
+            "exact_run_unmaterializable": tuple(
+                value
+                for item in reports
+                for value in (item.get("exact_run_unmaterializable") or ())
+                if isinstance(value, Mapping)
             ),
             "transport_aborted_remaining_targets": any(
                 bool(item.get("transport_aborted_remaining_targets"))

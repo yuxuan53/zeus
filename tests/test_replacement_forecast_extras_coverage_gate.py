@@ -1,6 +1,6 @@
 # Created: 2026-06-16
-# Last reused or audited: 2026-08-19
-# Lifecycle: created=2026-06-16; last_reviewed=2026-08-19; last_reused=2026-08-19
+# Last reused or audited: 2026-09-03
+# Lifecycle: created=2026-06-16; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Authority basis: docs/evidence/timing_audit/capture_reactor_stall_rootcause_2026-06-16.md
 #   (PRIMARY/CODE fix) + docs/evidence/timing_audit/impl_flat_threshold_capture_fix_2026-06-16.md.
 #   BAYES_PRECISION_FUSION_SPEC §6 F1 (the q-path consumes the persisted single_runs capture).
@@ -2046,6 +2046,95 @@ def test_source_transport_error_terminalization_excludes_ambiguous_statuses() ->
     assert not prod._source_transport_error_is_nonretryable(
         "batched Client error '400 Bad Request'; fallback HTTP 429"
     )
+
+
+def test_source_exact_run_geometry_gap_terminalizes_only_that_source_cycle(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_model_updates as updates
+    import src.data.replacement_forecast_current_target_plan as target_plan
+    import src.data.replacement_forecast_seed_discovery as seed_discovery
+    import src.strategy.live_inference.source_clock_city_weights as city_weights
+
+    class _Report:
+        updated_sources = ("icon_eu",)
+        affected_cities = ("Moscow",)
+
+        def as_dict(self):
+            return {
+                "updated_sources": list(self.updated_sources),
+                "affected_cities": list(self.affected_cities),
+            }
+
+    monkeypatch.setitem(
+        prod.settings["edli"],
+        "replacement_0_1_bayes_precision_fusion_capture_enabled",
+        True,
+    )
+    monkeypatch.setattr(dl, "bayes_precision_fusion_quota_cooldown_seconds", lambda: 0)
+    monkeypatch.setattr(
+        updates,
+        "read_model_updates_jsonl",
+        lambda _path: (
+            updates.OpenMeteoModelUpdate(
+                model="icon_eu",
+                last_run_initialisation_time=_CYCLE,
+                last_run_availability_time=_CYCLE,
+                update_interval_seconds=3600,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        target_plan,
+        "replacement_forecast_current_target_keys",
+        lambda _path: (
+            target_plan.ReplacementForecastTargetKey(
+                "Moscow", "2026-07-17", "high"
+            ),
+        ),
+    )
+    monkeypatch.setattr(seed_discovery, "held_position_family_priorities", lambda: {})
+    monkeypatch.setattr(
+        city_weights,
+        "affected_cities_for_source_updates",
+        lambda _sources: ("Moscow",),
+    )
+    monkeypatch.setattr(
+        dl,
+        "download_bayes_precision_fusion_extra_raw_inputs",
+        lambda **_kwargs: {
+            "status": "BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE",
+            "target_count": 1,
+            "written_row_count": 0,
+            "exact_run_unmaterializable": (
+                {
+                    "model": "icon_eu",
+                    "city": "Moscow",
+                    "target_date": "2026-07-17",
+                    "source_cycle_time": _CYCLE.isoformat(),
+                    "reason": "ValueError:partial local-day coverage",
+                },
+            ),
+            "single_runs_request_cycles": {"icon_eu": _CYCLE.isoformat()},
+        },
+    )
+
+    report = prod._download_bayes_precision_fusion_source_clock_raw_inputs_if_needed(
+        {
+            "forecast_db": str(tmp_path / "zeus-forecasts.db"),
+            "source_clock_fanout_workers": 1,
+        },
+        source_clock_report=_Report(),
+        max_wall_clock_seconds=1.0,
+    )
+
+    assert report["status"] == (
+        "SOURCE_CLOCK_SCOPED_BAYES_PRECISION_FUSION_EXTRA_PERMANENT_FAILURE"
+    )
+    result = report["source_results"]["icon_eu"]
+    assert result["status"] == "SOURCE_CLOCK_SOURCE_PERMANENT_FAILURE"
+    assert result["exact_run_unmaterializable"][0]["city"] == "Moscow"
 
 
 def test_downloaded_extras_records_fixpoint_and_success_health(_cfg_with_db, _redirect_health):

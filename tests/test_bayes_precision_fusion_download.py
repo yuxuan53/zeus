@@ -1,5 +1,5 @@
 # Created: 2026-06-08
-# Lifecycle: created=2026-06-08; last_reviewed=2026-08-21; last_reused=2026-08-21
+# Lifecycle: created=2026-06-08; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Purpose: Regression tests for BPF raw forecast download and persistence semantics.
 # Reuse: Run when changing Bayes precision fusion raw-input capture or scheduler health.
 # Authority basis: BAYES_PRECISION_FUSION_SPEC.md §6 F1 (raw capture: previous_runs + single_runs ->
@@ -364,6 +364,33 @@ def test_single_runs_partial_day_requires_elapsed_prefix_and_remaining_coverage(
     assert ("ecmwf_ifs" in parsed) is expected
     if expected:
         assert parsed["ecmwf_ifs"] == (float(last_hour), float(first_hour))
+
+
+def test_single_runs_partial_future_day_receipts_exact_run_as_unmaterializable() -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    target_date = date(2026, 9, 4)
+    payload = {
+        "hourly": {
+            "time": [
+                f"{target_date.isoformat()}T{hour:02d}:00" for hour in range(6, 21)
+            ],
+            "temperature_2m": [float(hour) for hour in range(6, 21)],
+        },
+        "hourly_units": {"temperature_2m": "C"},
+    }
+
+    parsed = dl._parse_batched_single_runs_payload(
+        payload,
+        ["icon_eu"],
+        target_date,
+        "Europe/Moscow",
+        decision_at=datetime(2026, 9, 3, 15, tzinfo=UTC),
+    )
+
+    assert "icon_eu" not in parsed
+    gaps = parsed[dl._BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY]
+    assert gaps["icon_eu"].startswith("ValueError:partial local-day coverage")
 
 
 def test_source_clock_fetch_isolates_location_response_failure(monkeypatch) -> None:
@@ -1064,6 +1091,87 @@ def test_source_clock_multi_location_429_remains_retryable(tmp_path, monkeypatch
     assert report["transport_aborted_remaining_targets"] is True
     assert report["written_row_count"] == 0
     assert report["single_runs_location_batch_count"] == 1
+
+
+def test_source_clock_exact_run_geometry_gap_is_terminal_for_that_run(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    run = datetime(2026, 9, 3, 9, tzinfo=UTC)
+    gap = {
+        dl._BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY: {
+            "icon_eu": "ValueError:partial local-day coverage"
+        }
+    }
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_locations_batched",
+        lambda **kwargs: [
+            {target_date: dict(gap) for target_date in location[3]}
+            for location in kwargs["locations"]
+        ],
+    )
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=run,
+        targets=_two_city_targets(),
+        models=("icon_eu",),
+        include_previous_runs=False,
+        prune_after=False,
+        allow_single_runs_fallback=False,
+        frozen_source_runs={"icon_eu": (run, run)},
+    )
+
+    assert report["status"] == (
+        "BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE"
+    )
+    assert report["written_row_count"] == 0
+    assert len(report["exact_run_unmaterializable"]) == 2
+    assert {row["city"] for row in report["exact_run_unmaterializable"]} == {
+        "Paris",
+        "Berlin",
+    }
+
+
+def test_source_clock_exact_run_gap_does_not_discard_other_city_progress(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    gap = {
+        dl._BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY: {
+            "ecmwf_ifs": "ValueError:partial local-day coverage"
+        }
+    }
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_locations_batched",
+        lambda **_kwargs: [
+            {date(2026, 6, 9): dict(gap)},
+            {date(2026, 6, 9): {"ecmwf_ifs": (24.0, 12.0)}},
+        ],
+    )
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 6, 8, 0, tzinfo=UTC),
+        targets=_two_city_targets(),
+        models=("ecmwf_ifs",),
+        include_previous_runs=False,
+        prune_after=False,
+        allow_single_runs_fallback=False,
+    )
+
+    assert report["status"] == "BAYES_PRECISION_FUSION_EXTRA_RAW_INPUTS_DOWNLOADED"
+    assert report["written_row_count"] == 1
+    assert report["committed_families"] == (("Berlin", "2026-06-09", "high"),)
+    assert report["exact_run_unmaterializable"][0]["city"] == "Paris"
 
 
 def test_persist_lock_obeys_source_clock_deadline(tmp_path) -> None:
