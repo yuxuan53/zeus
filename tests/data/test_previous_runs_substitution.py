@@ -1,5 +1,5 @@
 # Created: 2026-06-11
-# Last reused or audited: 2026-09-02
+# Last reused or audited: 2026-09-03
 # Authority basis: Task #32 follow-up (operator 2026-06-11) — 没有新的就用老的 applied to fusion
 #   membership. The gem_global-only previous_runs exception (edc598b440) is generalized into the
 #   SINGLE serving authority (src/data/replacement_current_value_serving.py): a provider absent
@@ -2726,6 +2726,164 @@ def test_materialization_queue_bounds_missing_authority_receipts_per_family(tmp_
     assert "Q_MODE:BAYES_PRECISION_FUSION_CAPTURE_MISSING" in receipt["reason_codes"]
     assert not list(failed_dir.glob("*.json"))
     assert not list(processed_dir.glob("*.json"))
+
+
+def test_materialization_queue_preflights_missing_day0_carrier_without_subprocess(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    request_dir = tmp_path / "requests"
+    processed_dir = tmp_path / "processed"
+    failed_dir = tmp_path / "failed"
+    request_dir.mkdir()
+    request = {
+        "city": "Austin",
+        "target_date": "2099-09-03",
+        "temperature_metric": "low",
+        "source_cycle_time": "2099-09-03T06:00:00+00:00",
+        "computed_at": "2099-09-03T17:16:00+00:00",
+        "baseline_source_run_id": "baseline-run",
+        "openmeteo_source_run_id": "anchor-run",
+        "openmeteo_payload_json": "payload.json",
+        "precision_metadata_json": "precision.json",
+        "bins": [{"bin_id": "20C"}],
+        "day0_observed_extreme_source": "aviationweather_metar",
+        "day0_observed_extreme_observation_time": "2099-09-03T17:00:00+00:00",
+        "day0_observed_extreme_c": 21.0,
+        "day0_observed_extreme_unit": "C",
+    }
+    input_json = request_dir / "Austin.2099-09-03.low.json"
+    input_json.write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setattr(queue_mod, "_seed_source_cycle_boundary", lambda **_kwargs: None)
+    monkeypatch.setattr(queue_mod, "_seed_already_covered", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        queue_mod,
+        "_blocked_attempt_state",
+        lambda **_kwargs: (tmp_path / "blocked_attempt.json", "exact-input", False),
+    )
+    monkeypatch.setattr(
+        queue_mod,
+        "_day0_carrier_vector_preflight_reason",
+        lambda **_kwargs: queue_mod._DAY0_CARRIER_VECTOR_MISSING_REASON,
+    )
+
+    def _must_not_spawn(_argv):
+        raise AssertionError("known-missing Day0 vectors must not spawn materializer")
+
+    report = queue_mod.process_replacement_forecast_live_materialization_queue(
+        request_dir=request_dir,
+        processed_dir=processed_dir,
+        failed_dir=failed_dir,
+        forecast_db=tmp_path / "forecasts.db",
+        raw_manifest_dir=None,
+        limit=1,
+        runner=_must_not_spawn,
+    )
+
+    assert report.status == "PROCESSED"
+    assert report.processed_count == 1
+    assert report.failed_count == 0
+    assert queue_mod._DAY0_CARRIER_VECTOR_MISSING_REASON in report.reason_codes
+    receipt = next((tmp_path / "blocked_latest").glob("*.json"))
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["status"] == "BLOCKED_MISSING_PROBABILITY_AUTHORITY"
+    assert payload["reason_codes"] == [
+        queue_mod._BLOCKED_INPUT_RECEIPT_REASON,
+        queue_mod._DAY0_CARRIER_VECTOR_MISSING_REASON,
+    ]
+    assert payload["result_evidence"] == {
+        "request_validated": True,
+        "subprocess_spawned": False,
+        "attempt_fingerprint": "exact-input",
+    }
+    assert not input_json.exists()
+    assert not list(failed_dir.glob("*.json"))
+
+
+def test_day0_carrier_vector_preflight_uses_materializer_bundle_contract(
+    tmp_path, monkeypatch
+) -> None:
+    import src.config as config_mod
+    import src.data.day0_hourly_vectors as vectors_mod
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    calls: dict[str, object] = {}
+    future = {"values": []}
+
+    class _Connection:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    conn = _Connection()
+    sentinel_vector = object()
+    monkeypatch.setattr(
+        config_mod,
+        "runtime_cities_by_name",
+        lambda: {"Austin": types.SimpleNamespace(timezone="America/Chicago")},
+    )
+    monkeypatch.setattr(
+        vectors_mod, "day0_hourly_models_for_city", lambda _city: ["ecmwf_ifs"]
+    )
+
+    def _read_vectors(**kwargs):
+        calls.update(kwargs)
+        return [sentinel_vector]
+
+    monkeypatch.setattr(vectors_mod, "read_freshest_day0_hourly_vectors", _read_vectors)
+    monkeypatch.setattr(
+        vectors_mod,
+        "remaining_day_extremes_c",
+        lambda _vectors, **_kwargs: future["values"],
+    )
+    monkeypatch.setattr(queue_mod, "_queue_read_only_connection", lambda _path: conn)
+
+    reason = queue_mod._day0_carrier_vector_preflight_reason(
+        forecast_db=tmp_path / "forecasts.db",
+        payload={
+            "city": "Austin",
+            "target_date": "2099-09-03",
+            "temperature_metric": "low",
+            "computed_at": "2099-09-03T17:16:00+00:00",
+            "day0_observed_extreme_source": "aviationweather_metar",
+            "day0_observed_extreme_observation_time": "2099-09-03T17:00:00+00:00",
+            "day0_observed_extreme_c": 21.0,
+        },
+    )
+
+    assert reason == queue_mod._DAY0_CARRIER_VECTOR_MISSING_REASON
+    assert calls["city"] == "Austin"
+    assert calls["target_date"] == "2099-09-03"
+    assert calls["expected_models"] == ("ecmwf_ifs",)
+    assert calls["require_expected"] is True
+    assert calls["require_complete_remaining_window"] is True
+    assert calls["remaining_window_start"] == datetime(
+        2099, 9, 3, 17, 0, tzinfo=timezone.utc
+    )
+    assert calls["now"] == datetime(2099, 9, 3, 17, 16, tzinfo=timezone.utc)
+    assert calls["raise_on_db_error"] is True
+    assert conn.closed is True
+
+    future["values"] = [19.0]
+    assert (
+        queue_mod._day0_carrier_vector_preflight_reason(
+            forecast_db=tmp_path / "forecasts.db",
+            payload={
+                "city": "Austin",
+                "target_date": "2099-09-03",
+                "temperature_metric": "low",
+                "computed_at": "2099-09-03T17:16:00+00:00",
+                "day0_observed_extreme_source": "aviationweather_metar",
+                "day0_observed_extreme_observation_time": (
+                    "2099-09-03T17:00:00+00:00"
+                ),
+                "day0_observed_extreme_c": 21.0,
+            },
+        )
+        is None
+    )
 
 
 def test_materialization_queue_can_defer_seed_preparation_for_requests(

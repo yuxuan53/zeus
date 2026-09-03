@@ -2332,6 +2332,9 @@ _UNCHANGED_BLOCKED_SKIP_REASON = (
 _BLOCKED_INPUT_RECEIPT_REASON = (
     "REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_BLOCKED_INPUT"
 )
+_DAY0_CARRIER_VECTOR_MISSING_REASON = (
+    "DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_MISSING"
+)
 _UNCHANGED_BLOCKED_SEED_SKIP_REASON = (
     "REPLACEMENT_LIVE_MATERIALIZATION_SEED_UNCHANGED_BLOCKED_INPUT"
 )
@@ -2823,6 +2826,106 @@ def _blocked_attempt_state(
     if not isinstance(marker, Mapping):
         return marker_path, fingerprint, False
     return marker_path, fingerprint, marker.get("attempt_fingerprint") == fingerprint
+
+
+def _day0_carrier_vector_preflight_reason(
+    *,
+    forecast_db: Path | str | None,
+    payload: Mapping[str, object],
+) -> str | None:
+    """Prove an immutable Day0 request lacks its required future-path bundle.
+
+    This is the queue-side twin of
+    ``replacement_forecast_materializer._day0_noaa_future_vector_members``.
+    Unknown schema, identity, or DB state falls through to the authoritative
+    materializer; only the same strict complete-bundle predicate may suppress a
+    child process.
+    """
+
+    source = str(payload.get("day0_observed_extreme_source") or "").strip().lower()
+    from src.events.day0_authority import day0_is_noaa_preliminary_source  # noqa: PLC0415
+
+    if not (
+        day0_is_noaa_preliminary_source(source)
+        or source.startswith("hko_hourly_accumulator")
+    ):
+        return None
+    observation_time = _parse_utc_iso(
+        payload.get("day0_observed_extreme_observation_time")
+    )
+    computed_at = _parse_utc_iso(payload.get("computed_at"))
+    city_name = str(payload.get("city") or "").strip()
+    target_date = str(payload.get("target_date") or "").strip()
+    metric = str(payload.get("temperature_metric") or "").strip().lower()
+    if (
+        forecast_db is None
+        or observation_time is None
+        or computed_at is None
+        or observation_time > computed_at
+        or not city_name
+        or not target_date
+        or metric not in {"high", "low"}
+    ):
+        return None
+    from src.config import runtime_cities_by_name  # noqa: PLC0415
+    from src.data.day0_hourly_vectors import (  # noqa: PLC0415
+        DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
+        day0_hourly_models_for_city,
+        read_freshest_day0_hourly_vectors,
+        remaining_day_extremes_c,
+    )
+
+    city = runtime_cities_by_name().get(city_name)
+    if city is None or payload.get("day0_observed_extreme_c") is None:
+        return None
+    try:
+        from src.data.forecast_target_contract import (  # noqa: PLC0415
+            compute_target_local_day_window_utc,
+        )
+
+        target_window = compute_target_local_day_window_utc(
+            city_timezone=city.timezone,
+            target_local_date=date.fromisoformat(target_date[:10]),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if computed_at < target_window.start_utc:
+        return None
+    expected_models = tuple(day0_hourly_models_for_city(city))
+    if not expected_models:
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _queue_read_only_connection(Path(forecast_db))
+        vectors = read_freshest_day0_hourly_vectors(
+            city=city_name,
+            target_date=target_date,
+            now=computed_at,
+            expected_models=expected_models,
+            require_expected=True,
+            max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
+            remaining_window_start=observation_time,
+            require_complete_remaining_window=True,
+            conn=conn,
+            raise_on_db_error=True,
+        )
+        future = remaining_day_extremes_c(
+            vectors,
+            target_date=target_date,
+            now=computed_at,
+            metric=metric,
+            window_start=observation_time,
+        )
+    except _ClaimReadDeadlineExceeded:
+        raise
+    except Exception:  # noqa: BLE001 - unknown truth must reach the materializer
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    if future:
+        return None
+    return _DAY0_CARRIER_VECTOR_MISSING_REASON
 
 
 def _recent_success_coalesce_seconds() -> float:
@@ -5485,6 +5588,7 @@ def _process_claimed_materialization_batch(
     processed: list[str] = list(superseded)
     failed: list[str] = []
     unchanged_blocked: list[str] = []
+    preflight_blocked: list[str] = []
     unchanged_success: list[str] = []
     stale_day0_superseded: list[str] = []
     source_cycle_regressions: list[str] = []
@@ -5663,6 +5767,44 @@ def _process_claimed_materialization_batch(
             )
             processed.append(str(receipt))
             unchanged_blocked.append(str(receipt))
+            continue
+        preflight_reason = (
+            _day0_carrier_vector_preflight_reason(
+                forecast_db=forecast_db,
+                payload=request_payload,
+            )
+            if request_payload is not None
+            else None
+        )
+        if preflight_reason is not None:
+            # SCOPE: this exact immutable city/date/metric request only. DRAIN:
+            # terminal receipt replaces it immediately without a child process.
+            # RESET: a newly enqueued request whose observation/vector
+            # fingerprint advances is evaluated against its own later cutoff;
+            # unknown DB/schema state never enters this gate.
+            try:
+                _write_blocked_attempt_marker(
+                    marker_path=marker_path,
+                    payload=request_payload,
+                    fingerprint=attempt_fingerprint,
+                )
+            except OSError:
+                pass
+            receipt = _record_latest_terminal_request(
+                input_json,
+                processed_path=processed_path,
+                request_payload=request_payload,
+                receipt_dir_name="blocked_latest",
+                status="BLOCKED_MISSING_PROBABILITY_AUTHORITY",
+                reason_codes=(_BLOCKED_INPUT_RECEIPT_REASON, preflight_reason),
+                result_evidence={
+                    "request_validated": True,
+                    "subprocess_spawned": False,
+                    "attempt_fingerprint": attempt_fingerprint,
+                },
+            )
+            processed.append(str(receipt))
+            preflight_blocked.append(str(receipt))
             continue
         # SCOPE: one exact city/date/metric request whose successful posterior
         # commit and current input fingerprint are both proven. DRAIN: the fixed
@@ -5875,6 +6017,10 @@ def _process_claimed_materialization_batch(
         reasons.append("REPLACEMENT_LIVE_MATERIALIZATION_REQUEST_SUPERSEDED_BY_NEWER_DUPLICATE")
     if unchanged_blocked:
         reasons.append(_UNCHANGED_BLOCKED_SKIP_REASON)
+    if preflight_blocked:
+        reasons.extend(
+            (_BLOCKED_INPUT_RECEIPT_REASON, _DAY0_CARRIER_VECTOR_MISSING_REASON)
+        )
     if unchanged_success:
         reasons.append(_UNCHANGED_SUCCESS_SKIP_REASON)
     if stale_day0_superseded:
