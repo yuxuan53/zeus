@@ -4788,6 +4788,33 @@ def test_deploy_live_quote_only_repair_allows_only_stale_settlement_subset(
     assert ok is True
     assert "settlement_recoverable_positions=1" in detail
 
+    handoff["settlement_recoverable_position_count"] = 2
+    handoff["settlement_recoverable_position_ids"] = (
+        "pos-settlement",
+        "pos-fresh-settlement",
+    )
+    handoff["fresh_failed_monitor_no_action_position_count"] = 2
+    handoff["fresh_failed_monitor_no_action_position_ids"] = (
+        "pos-settlement",
+        "pos-fresh-settlement",
+    )
+    handoff["open_position_count"] = len(position_ids) + 1
+    handoff["monitored_position_ids"] = (*position_ids, "pos-fresh-settlement")
+    ok, detail = dl._quote_only_monitor_repair_handoff_admission(
+        trade_db=tmp_path / "zeus_trades.db",
+        obligations={
+            "open_position_count": len(position_ids) + 1,
+            "nonterminal_command_count": 0,
+            "all_open_position_ids": (*position_ids, "pos-fresh-settlement"),
+        },
+        pause_state={"entries_paused": True},
+        handoff=handoff,
+        repair_pending={"pending": True},
+    )
+
+    assert ok is True
+    assert "settlement_recoverable_positions=2" in detail
+
     handoff["fresh_failed_monitor_timestamp_stale_position_ids"] = (
         "pos-settlement",
         "pos-quote",
@@ -4795,9 +4822,9 @@ def test_deploy_live_quote_only_repair_allows_only_stale_settlement_subset(
     ok, detail = dl._quote_only_monitor_repair_handoff_admission(
         trade_db=tmp_path / "zeus_trades.db",
         obligations={
-            "open_position_count": len(position_ids),
+            "open_position_count": len(position_ids) + 1,
             "nonterminal_command_count": 0,
-            "all_open_position_ids": position_ids,
+            "all_open_position_ids": (*position_ids, "pos-fresh-settlement"),
         },
         pause_state={"entries_paused": True},
         handoff=handoff,

@@ -2030,8 +2030,8 @@ def _quote_only_monitor_repair_handoff_admission(
         != int(handoff.get("settlement_recoverable_position_count") or 0)
         or len(settlement_set) != len(settlement_ids)
         or not settlement_set.issubset(no_action_set)
-        or stale_timestamp_set != settlement_set
-        or stale_classified_set != settlement_set
+        or stale_timestamp_set != stale_classified_set
+        or not stale_timestamp_set.issubset(settlement_set)
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:stale_partition_invalid"
     restart_ids = {
