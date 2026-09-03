@@ -3117,6 +3117,18 @@ def _replacement_cycle_availability_poll_if_needed(
             report.setdefault("legs_failed", []).append(  # type: ignore[union-attr]
                 {"leg": leg, "cycle": cycle.isoformat(), "error": str(exc)[:200]}
             )
+    anchor_missing_after_fetch = (
+        _current_target_anchor_gap_count(
+            forecast_db_path,
+            newest_anchor_published,
+        )
+        if newest_anchor_published is not None
+        else 0
+    )
+    report["anchor_missing_scope_count_after_fetch"] = anchor_missing_after_fetch
+    anchor_gap_blocks_extras = newest_anchor_published is not None and (
+        anchor_missing_after_fetch is None or anchor_missing_after_fetch > 0
+    )
     # The bayes_precision_fusion extras ride the SAME probe-driven tick (run-selection
     # single authority): fusion needs same-cycle multimodel rows to produce q_lcb, and the
     # lag-modeled cron (next fire hours away) left q_lcb NULL long after the probe poll had
@@ -3139,8 +3151,20 @@ def _replacement_cycle_availability_poll_if_needed(
     # fan-out re-resolves internally for its OWN target build; momentary disagreement costs at
     # most one benign extra pass and self-corrects next tick.
     _extras_cycle = _probe_resolved_bayes_precision_fusion_extras_cycle()
-    _should_run_extras = _extras_cycle_incomplete(cfg, _extras_cycle)
-    if _should_run_extras:
+    _should_run_extras = (
+        not anchor_gap_blocks_extras
+        and _extras_cycle_incomplete(cfg, _extras_cycle)
+    )
+    if anchor_gap_blocks_extras:
+        # Provider-center artifacts are the indispensable first leg of q.
+        # Spending the finite metered budget on wider fusion before that leg
+        # covers the current target set can strand cities with same-cycle ENS
+        # and extras but no materializable anchor.  The bounded anchor rotation
+        # drains on the next poll; only then may extras consume quota.
+        report["bayes_precision_fusion_extras_status"] = (
+            "EXTRAS_DEFERRED_UNTIL_ANCHOR_MANIFESTS_COMPLETE"
+        )
+    elif _should_run_extras:
         bayes_precision_fusion_report = _download_bayes_precision_fusion_extra_raw_inputs_if_needed(cfg)
         if bayes_precision_fusion_report is not None:
             _bpf_status = bayes_precision_fusion_report.get("status")

@@ -440,6 +440,10 @@ class TestPollFetchDecision:
         assert fetched[0][1]["include_covered"] is False
         assert fetched[0][1]["missing_manifests_only"] is True
         assert fetched[0][1]["quota_priority"] is True
+        assert report["anchor_missing_scope_count_after_fetch"] == 205
+        assert report["bayes_precision_fusion_extras_status"] == (
+            "EXTRAS_DEFERRED_UNTIL_ANCHOR_MANIFESTS_COMPLETE"
+        )
 
     def test_held_scope_recovers_missing_newest_common_cycle(
         self, monkeypatch, tmp_path
