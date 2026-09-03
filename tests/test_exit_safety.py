@@ -9061,6 +9061,165 @@ def test_hard_fact_exit_uses_fresh_bid_protective_fak(
     assert authority.best_bid == "0.18"
 
 
+def test_protective_fak_terminal_no_fill_is_immediately_redecision_eligible(
+    conn, monkeypatch
+):
+    from src.execution import exit_lifecycle
+    from src.state.portfolio import (
+        ExitContext,
+        PortfolioState,
+        Position,
+        flash_crash_catastrophe_velocity,
+        flash_crash_confirmations,
+    )
+
+    now = datetime(2026, 9, 3, 10, 24, 45, tzinfo=timezone.utc)
+    position = Position(
+        trade_id="pos-protective-fak-no-fill",
+        market_id="condition-protective-fak-no-fill",
+        condition_id="condition-protective-fak-no-fill",
+        city="Tel Aviv",
+        cluster="asia",
+        target_date="2026-09-03",
+        bin_label="32C",
+        direction="buy_no",
+        token_id=YES_TOKEN,
+        no_token_id=NO_TOKEN,
+        entry_price=0.33,
+        size_usd=4.28,
+        shares=12.94,
+        chain_shares=12.94,
+        cost_basis_usd=4.28,
+        state="day0_window",
+        chain_state="synced",
+        strategy_key="forecast_qkernel_entry",
+        env="live",
+    )
+    conn.execute(
+        """INSERT INTO position_current(
+               position_id, phase, direction, token_id, no_token_id,
+               shares, chain_shares, chain_state, updated_at,
+               temperature_metric, condition_id
+           ) VALUES (?, 'day0_window', 'buy_no', ?, ?, 12.94, 12.94,
+                     'synced', ?, 'high', ?)""",
+        (
+            position.trade_id,
+            position.token_id,
+            position.no_token_id,
+            now.isoformat(),
+            position.condition_id,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO position_events(
+               event_id, position_id, event_version, sequence_no,
+               event_type, occurred_at, phase_before, phase_after,
+               source_module, env, payload_json
+           ) VALUES (?, ?, 1, 1, 'MONITOR_REFRESHED', ?, 'day0_window',
+                     'day0_window', 'src.engine.cycle_runtime', 'live', ?)""",
+        (
+            "event-protective-fak-no-fill-monitor",
+            position.trade_id,
+            (now - timedelta(seconds=7)).isoformat(),
+            json.dumps(
+                {
+                    "exit_decision_should_exit": True,
+                    "exit_decision_trigger": "FLASH_CRASH_PANIC",
+                    "held_sell_full_depth_action_authority": True,
+                    "last_monitor_market_price_is_fresh": True,
+                    "last_monitor_best_bid": 0.10,
+                    "market_velocity_1h": (
+                        flash_crash_catastrophe_velocity() - 0.01
+                    ),
+                    "flash_crash_count": flash_crash_confirmations(),
+                    "applied_validations": [
+                        "flash_crash_persistent_market_evidence",
+                        "flash_crash_trigger",
+                    ],
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(exit_lifecycle, "_utcnow", lambda: now)
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "_latest_or_capture_exit_snapshot_context",
+        lambda *_args, **_kwargs: {
+            "executable_snapshot_id": "snapshot-protective-fak-no-fill",
+            "executable_snapshot_hash": "hash-protective-fak-no-fill",
+            "executable_snapshot_orderbook_top_bid": 0.10,
+            "executable_snapshot_min_order_size": 0.01,
+        },
+    )
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "check_sell_collateral",
+        lambda *_args, **_kwargs: (True, ""),
+    )
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "place_sell_order",
+        lambda **_kwargs: exit_lifecycle.OrderResult(
+            trade_id=position.trade_id,
+            status="rejected",
+            reason="venue_fak_no_match_400",
+            command_id="cmd-protective-fak-no-fill",
+            command_state="REJECTED",
+        ),
+    )
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "_global_sell_fak_no_fill_reauction_error",
+        lambda *_args, **_kwargs: (
+            "global_sell_exit_fak_no_fill_reauction:venue_fak_no_match_400"
+        ),
+    )
+
+    outcome = exit_lifecycle.execute_exit(
+        PortfolioState(positions=[position]),
+        position,
+        ExitContext(
+            exit_reason=(
+                "FLASH_CRASH_PANIC "
+                f"(velocity={flash_crash_catastrophe_velocity() - 0.01:.3f}, "
+                f"causal_quotes={flash_crash_confirmations()})"
+            ),
+            fresh_prob=None,
+            fresh_prob_is_fresh=False,
+            current_market_price=0.10,
+            current_market_price_is_fresh=True,
+            best_bid=0.10,
+            best_ask=0.16,
+            hours_to_settlement=12.0,
+            day0_active=True,
+        ),
+        clob=object(),
+        conn=conn,
+    )
+
+    assert outcome == "sell_error: venue_fak_no_match_400"
+    assert position.state == "day0_window"
+    assert position.exit_state == ""
+    events = conn.execute(
+        """SELECT event_type, payload_json FROM position_events
+            WHERE position_id=? AND event_type IN (
+                'EXIT_ORDER_REJECTED', 'EXIT_RETRY_RELEASED'
+            ) ORDER BY sequence_no""",
+        (position.trade_id,),
+    ).fetchall()
+    assert [event["event_type"] for event in events] == [
+        "EXIT_ORDER_REJECTED",
+        "EXIT_RETRY_RELEASED",
+    ]
+    assert json.loads(events[0]["payload_json"])["next_retry_at"] == now.isoformat()
+    assert json.loads(events[1]["payload_json"])["release_reason"] == (
+        "EXIT_RETRY_COOLDOWN_EXPIRED"
+    )
+
+
 def test_protective_semantic_receipt_gap_records_retry_without_submit(
     conn, monkeypatch
 ):

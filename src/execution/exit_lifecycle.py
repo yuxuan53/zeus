@@ -8283,10 +8283,25 @@ def _execute_live_exit(
 
         if sell_result.status == "rejected":
             sell_error = sell_result.reason or "sell_rejected"
+            # A synchronous FAK no-match is an authenticated terminal no-fill:
+            # the venue created no exposure and no command remains in flight.
+            # It therefore cannot justify the ordinary multi-minute retry
+            # cooldown.  That cooldown suppresses a still-current protective
+            # decision while the held bid can disappear between monitor turns.
+            # Keep global statistical SELLs on their fresh-auction handoff;
+            # every other proven FAK no-fill is immediately eligible for a
+            # normal fresh-q/fresh-book redecision.
+            fak_no_fill_reauction = (
+                _global_sell_fak_no_fill_reauction_error(conn, sell_result)
+                if sell_result.reason == "venue_fak_no_match_400"
+                else ""
+            )
             if global_authorized:
                 sync_no_side_effect_reauction = (
-                    _global_sell_sync_no_side_effect_reauction_error(
-                        conn, sell_result
+                    fak_no_fill_reauction
+                    or _global_sell_sync_no_side_effect_reauction_error(
+                        conn,
+                        sell_result,
                     )
                 )
                 if sync_no_side_effect_reauction:
@@ -8330,6 +8345,9 @@ def _execute_live_exit(
                 position,
                 reason=retry_reason,
                 error=sell_error,
+                cooldown_seconds=(
+                    0 if fak_no_fill_reauction else DEFAULT_COOLDOWN_SECONDS
+                ),
                 post_only_cross_command_id=(
                     sell_result.command_id
                     if _is_post_only_cross_reauction_error(sell_error)
@@ -8353,6 +8371,12 @@ def _execute_live_exit(
                     error=sell_error,
                 )
                 log_exit_retry_event(conn, position, reason=retry_reason, error=sell_error)
+            if fak_no_fill_reauction and not global_authorized:
+                # No external publish follows this release, so the rejection
+                # and its immediate retry eligibility may share one atomic DB
+                # transaction.  This removes dependence on the auxiliary
+                # historical-debt scan before the next primary monitor turn.
+                check_pending_retries(position, conn=conn)
             return f"sell_error: {sell_error}"
 
         order_id = sell_result.external_order_id or sell_result.order_id or ""
