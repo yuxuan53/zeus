@@ -9016,10 +9016,16 @@ def event_bound_live_adapter_from_trade_conn(
                     ),
                     proof_accepted=False,
                 )
+            held_event = _latest_causal_day0_family_event(
+                calibration_conn,
+                event=event,
+                decision_time=at,
+            ) or event
+            held_is_day0 = held_event.event_type == "DAY0_EXTREME_UPDATED"
             family_key = ""
             cache_metadata: dict[str, str] = {}
-            if is_forecast_lane:
-                payload = _payload(event)
+            if is_forecast_lane or held_is_day0:
+                payload = _payload(held_event)
                 try:
                     family_key = weather_family_id(
                         city=str(payload.get("city") or ""),
@@ -9028,7 +9034,10 @@ def event_bound_live_adapter_from_trade_conn(
                     )
                 except (TypeError, ValueError):
                     pass
-                force_refresh = (
+                # Remaining-day q changes as the unobserved interval shrinks,
+                # even when the latest Day0 event_id has not advanced.  A
+                # receipt-time reissue of cached q would freeze held economics.
+                force_refresh = held_is_day0 or (
                     probability_refresh_family_keys is None
                     or family_key in probability_refresh_family_keys
                 )
@@ -9042,8 +9051,8 @@ def event_bound_live_adapter_from_trade_conn(
                     cached = _probe_global_probability_family_cache(
                         probability_cache_namespace,
                         family_key=family_key,
-                        event_id=event.event_id,
-                        causal_snapshot_id=event.causal_snapshot_id,
+                        event_id=held_event.event_id,
+                        causal_snapshot_id=held_event.causal_snapshot_id,
                         captured_at_utc=at,
                         probability_use=_CurrentProbabilityUse.HELD_MONITOR,
                     )
@@ -9053,7 +9062,7 @@ def event_bound_live_adapter_from_trade_conn(
                     probability_cache_stats["miss"] += 1
             try:
                 prepared = _prepare_current_global_probability_family(
-                    event,
+                    held_event,
                     forecast_conn=forecast_conn,
                     topology_conn=topology_conn,
                     observation_conn=calibration_conn,
@@ -9083,11 +9092,11 @@ def event_bound_live_adapter_from_trade_conn(
                     ),
                     proof_accepted=False,
                 )
-            if is_forecast_lane:
+            if is_forecast_lane or held_is_day0:
                 _store_global_probability_family_cache(
                     probability_cache_namespace,
                     family_key=family_key,
-                    event_id=event.event_id,
+                    event_id=held_event.event_id,
                     family_binding_hash=str(
                         cache_metadata.get("family_binding_hash") or ""
                     ),
@@ -37609,6 +37618,76 @@ class _CurrentProbabilityUse(StrEnum):
     ENTRY = "entry"
     HELD_MONITOR = "held_monitor"
     REDUCE_ONLY_EXIT = "reduce_only_exit"
+
+
+def _latest_causal_day0_family_event(
+    conn: sqlite3.Connection,
+    *,
+    event: OpportunityEvent,
+    decision_time: datetime,
+) -> OpportunityEvent | None:
+    """Select held-capital Day0 semantics independently of the queue owner."""
+
+    if decision_time.tzinfo is None:
+        raise ValueError("GLOBAL_HELD_DAY0_EVENT_DECISION_TIME_NAIVE")
+    payload = _payload(event)
+    city = str(payload.get("city") or "").strip()
+    target_date = str(payload.get("target_date") or "").strip()
+    metric = str(payload.get("metric") or "").strip().lower()
+    if not city or not target_date or metric not in {"high", "low"}:
+        return None
+    attached = {
+        str(row[1]) for row in conn.execute("PRAGMA database_list").fetchall()
+    }
+    schema = "world" if "world" in attached else "main"
+    if conn.execute(
+        f"SELECT 1 FROM {schema}.sqlite_master "
+        "WHERE type = 'table' AND name = 'opportunity_events'"
+    ).fetchone() is None:
+        return None
+    columns = (
+        "event_id",
+        "event_type",
+        "entity_key",
+        "source",
+        "observed_at",
+        "available_at",
+        "received_at",
+        "causal_snapshot_id",
+        "payload_hash",
+        "idempotency_key",
+        "priority",
+        "expires_at",
+        "payload_json",
+        "schema_version",
+        "created_at",
+    )
+    cut = decision_time.astimezone(UTC).isoformat()
+    row = conn.execute(
+        f"""
+        SELECT {', '.join(columns)}
+          FROM {schema}.opportunity_events
+               INDEXED BY idx_opportunity_events_day0_family_extreme
+         WHERE event_type = 'DAY0_EXTREME_UPDATED'
+           AND json_extract(payload_json, '$.city') = ?
+           AND json_extract(payload_json, '$.target_date') = ?
+           AND json_extract(payload_json, '$.metric') = ?
+           AND available_at <= ?
+           AND received_at <= ?
+           AND created_at <= ?
+         ORDER BY available_at DESC, received_at DESC, event_id DESC
+         LIMIT 1
+        """,
+        (city, target_date, metric, cut, cut, cut),
+    ).fetchone()
+    if row is None:
+        return None
+    values = (
+        {name: row[name] for name in columns}
+        if hasattr(row, "keys")
+        else dict(zip(columns, row, strict=True))
+    )
+    return OpportunityEvent(**values)
 
 
 def _day0_redecision_authority_scope(

@@ -11168,6 +11168,144 @@ def test_live_adapter_keeps_held_forecast_q_outside_entry_phase_gate(
     )
 
 
+def test_held_forecast_owner_rebinds_day0_and_never_reissues_remaining_q(
+    monkeypatch,
+):
+    trade = sqlite3.connect(":memory:")
+    forecast = sqlite3.connect(":memory:")
+    topology = sqlite3.connect(":memory:")
+    world = sqlite3.connect(":memory:")
+    callbacks = {}
+    forecast_event = _global_scope_event(city="Dallas", source_run_id="forecast")
+    day0_event = _global_day0_scope_event(city="Dallas", source_run_id="day0")
+    prepared = SimpleNamespace(
+        probability_witness=SimpleNamespace(family_key="held-day0-family")
+    )
+    prepare_calls = []
+
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "process_current_global_batch",
+        lambda events, **kwargs: callbacks.update(kwargs)
+        or SimpleNamespace(events=tuple(events)),
+    )
+    monkeypatch.setattr(
+        era,
+        "_latest_causal_day0_family_event",
+        lambda _conn, *, event, decision_time: (
+            day0_event
+            if event.event_id == forecast_event.event_id
+            and decision_time.tzinfo is not None
+            else None
+        ),
+    )
+
+    def prepare(event, *_args, **kwargs):
+        kwargs["cache_metadata_out"]["family_binding_hash"] = "day0-binding"
+        prepare_calls.append((event, kwargs["decision_time"]))
+        return prepared
+
+    monkeypatch.setattr(era, "_prepare_current_global_probability_family", prepare)
+    adapter = era.event_bound_live_adapter_from_trade_conn(
+        trade,
+        get_current_level=lambda: era.RiskLevel.GREEN,
+        forecast_conn=forecast,
+        topology_conn=topology,
+        calibration_conn=world,
+    )
+    first = _dt.datetime(2026, 7, 11, 8, 0, tzinfo=_dt.timezone.utc)
+    second = first + _dt.timedelta(seconds=30)
+
+    adapter.process_global_batch((forecast_event,), first)
+    callbacks["prepare_held_event"](forecast_event, first)
+    callbacks["prepare_held_event"](forecast_event, second)
+
+    assert [event.event_id for event, _at in prepare_calls] == [
+        day0_event.event_id,
+        day0_event.event_id,
+    ]
+    assert [at for _event, at in prepare_calls] == [first, second]
+
+
+def test_latest_causal_day0_family_event_respects_all_three_clocks():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE opportunity_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            available_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            causal_snapshot_id TEXT,
+            payload_hash TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            expires_at TEXT,
+            payload_json TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX idx_opportunity_events_day0_family_extreme
+            ON opportunity_events(
+                event_type,
+                json_extract(payload_json, '$.city'),
+                json_extract(payload_json, '$.target_date'),
+                json_extract(payload_json, '$.metric'),
+                available_at
+            )
+        """
+    )
+    owner = _global_scope_event(city="Dallas", source_run_id="forecast-owner")
+    visible = _global_day0_scope_event(city="Dallas", source_run_id="visible")
+    future = _global_day0_scope_event(city="Dallas", source_run_id="future")
+    columns = tuple(asdict(visible))
+
+    def insert(event, *, available_at, received_at, created_at):
+        values = asdict(event)
+        values.update(
+            available_at=available_at,
+            received_at=received_at,
+            created_at=created_at,
+        )
+        conn.execute(
+            f"INSERT INTO opportunity_events ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(values[column] for column in columns),
+        )
+
+    insert(
+        visible,
+        available_at="2026-07-11T07:59:50+00:00",
+        received_at="2026-07-11T07:59:51+00:00",
+        created_at="2026-07-11T07:59:52+00:00",
+    )
+    insert(
+        future,
+        available_at="2026-07-11T07:59:55+00:00",
+        received_at="2026-07-11T08:00:01+00:00",
+        created_at="2026-07-11T07:59:56+00:00",
+    )
+
+    selected = era._latest_causal_day0_family_event(
+        conn,
+        event=owner,
+        decision_time=_dt.datetime(
+            2026, 7, 11, 8, 0, tzinfo=_dt.timezone.utc
+        ),
+    )
+
+    assert selected is not None
+    assert selected.event_id == visible.event_id
+
+
 def test_probability_cache_never_promotes_held_authority_to_entry(monkeypatch):
     namespace = "probability-cache-purpose-test"
     family_key = "family-held-only"
