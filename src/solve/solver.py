@@ -379,14 +379,19 @@ def passive_buy_proposal_curve(
 def current_precliff_liquidation_capacity(
     native_bid_levels: Sequence[BidBookLevel | BookLevel],
 ) -> Decimal:
-    """Return shares executable through a legal live SELL floor."""
+    """Return shares executable before the live SELL floor is reached.
+
+    A bid exactly at the floor is legal execution authority for an already-held
+    SELL, but it is not pre-cliff capacity for admitting new risk: there is no
+    lower legal tick on which the next re-decision could preserve capital.
+    """
 
     return sum(
         (
             Decimal(level.size)
             for level in native_bid_levels
             if Decimal(level.price).is_finite()
-            and Decimal(level.price) >= LIVE_ORDER_MIN_UNIT_PRICE
+            and Decimal(level.price) > LIVE_ORDER_MIN_UNIT_PRICE
             and Decimal(level.price) <= LIVE_ORDER_MAX_UNIT_PRICE
             and Decimal(level.size).is_finite()
             and Decimal(level.size) > 0

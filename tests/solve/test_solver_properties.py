@@ -1,6 +1,6 @@
 # Created: 2026-07-03
-# Last reused/audited: 2026-08-17
-# Lifecycle: created=2026-07-03; last_reviewed=2026-08-17; last_reused=2026-08-17
+# Last reused/audited: 2026-09-02
+# Lifecycle: created=2026-07-03; last_reviewed=2026-09-02; last_reused=2026-09-02
 # Authority basis: current global auction, executable Kelly, and wealth contracts
 """Current global-auction solver properties over executable portfolio wealth."""
 
@@ -2490,8 +2490,8 @@ def test_global_buy_generation_omits_untyped_maker_sibling():
     assert proposals[0].eligibility_reason is None
 
 
-@pytest.mark.parametrize("bid_price", ("0.01", "0.04"))
-def test_statistical_taker_buy_requires_in_band_liquidation_capacity(bid_price):
+@pytest.mark.parametrize("bid_price", ("0.01", "0.04", "0.05"))
+def test_statistical_taker_buy_requires_precliff_liquidation_capacity(bid_price):
     candidate = _global_candidate(
         candidate_id="taker-born-unexitable",
         family="taker-born-unexitable-family",
@@ -2560,7 +2560,7 @@ def test_global_taker_buy_size_is_capped_by_current_liquidation_capacity():
     decision = _global_select((candidate,), cap="5")
 
     assert decision.candidate is candidate
-    assert decision.shares == Decimal("55")
+    assert decision.shares == Decimal("25")
 
 
 def test_statistical_taker_buy_retains_liquidation_capped_legal_size():
@@ -2695,7 +2695,7 @@ def test_exact_payoff_taker_can_lock_to_settlement_without_exit_depth(
     assert decision.expected_terminal_wealth.win_probability_mean == 1.0
 
 
-def test_current_precliff_capacity_counts_actionable_depth_from_inclusive_floor():
+def test_current_precliff_capacity_excludes_floor_without_down_tick_slack():
     levels = (
         BookLevel(price=Decimal("0.05"), size=Decimal("100")),
         BookLevel(price=Decimal("0.0501"), size=Decimal("2")),
@@ -2707,7 +2707,7 @@ def test_current_precliff_capacity_counts_actionable_depth_from_inclusive_floor(
         SimpleNamespace(price=Decimal("NaN"), size=Decimal("100")),
     )
 
-    assert S.current_precliff_liquidation_capacity(levels) == Decimal("105")
+    assert S.current_precliff_liquidation_capacity(levels) == Decimal("5")
 
 
 def test_current_maker_buy_witness_can_win_on_exact_partial_distribution():
