@@ -392,7 +392,7 @@ def test_historical_backfill_without_durable_state_discovers_and_advances_no_bid
             "SELECT evidence_id,quote_seen_at,best_bid FROM position_quote_state WHERE position_id='p1'"
         ).fetchone()
     assert incident_id
-    assert repeated_id == incident_id
+    assert repeated_id is None
     assert tuple(incident) == ("first-historical-no-bid", "no_bid")
     assert tuple(state) == (
         "first-historical-no-bid",
@@ -3528,7 +3528,8 @@ def test_corroborated_no_bid_stays_one_episode_behind_newer_incomplete_latest(
 
     hard = [row for row in _incidents(cfg) if row["crossing_kind"] == "no_bid"]
     assert len(hard) == 1
-    assert hard[0]["crossing_evidence_id"] == "buy-no-bid-2"
+    assert hard[0]["crossing_evidence_id"] == "buy-no-bid-1"
+    assert hard[0]["evidence_revision"] == 1
     with loop.memory(cfg) as conn:
         state = conn.execute(
             "SELECT quote_seen_at,quote_status,no_bid_episode_open "
@@ -3660,8 +3661,8 @@ def test_no_bid_episode_reuses_canonical_incident_until_floor_recovery(cfg: dict
     loop.detect(cfg)
     hard = [row for row in _incidents(cfg) if row["kind"] == "hard"]
     assert len(hard) == 1
-    assert hard[0]["crossing_evidence_id"] == "q-episode-2"
-    assert hard[0]["evidence_revision"] >= 2
+    assert hard[0]["crossing_evidence_id"] == "q-episode-1"
+    assert hard[0]["evidence_revision"] == 1
 
     _quote(cfg, "q-recovered", "2026-08-22T09:00:04+00:00", 0.20)
     loop.detect(cfg)
@@ -4276,6 +4277,7 @@ def test_evidence_db_exposes_timeline_tables_without_copying_canonical_db(cfg: d
     _quote(cfg, "q-before", "2026-08-22T09:00:01+00:00", 0.08, latest=False)
     _quote(cfg, "q-low", "2026-08-22T09:00:02+00:00", 0.01)
     _quote(cfg, "q-after", "2026-08-22T09:00:03+00:00", 0.02, latest=False)
+    _quote(cfg, "q-trajectory", "2026-08-22T09:00:04+00:00", 0.03, latest=False)
     incident_id = loop.detect(cfg)[0]
 
     evidence = loop.build_evidence(cfg, incident_id)
@@ -4289,11 +4291,53 @@ def test_evidence_db_exposes_timeline_tables_without_copying_canonical_db(cfg: d
             "daemon_health", "code_versions", "config_snapshot",
         } <= tables
         assert conn.execute("SELECT COUNT(*) FROM price_ticks").fetchone()[0] >= 1
+        raw_quote = json.loads(
+            conn.execute(
+                "SELECT raw_json FROM price_ticks WHERE evidence_id='q-low'"
+            ).fetchone()[0]
+        )
+        assert "depth_before_json" not in raw_quote
+        assert conn.execute(
+            "SELECT depth_json FROM price_ticks WHERE evidence_id='q-trajectory'"
+        ).fetchone()[0] is None
     incident_dir = Path(cfg["paths"]["runtime"]) / "incidents" / incident_id
     manifest = json.loads((incident_dir / "generations" / (incident_dir / "CURRENT").read_text().strip() / "manifest.json").read_text())
     assert manifest["size_bytes"] == evidence.stat().st_size
     assert manifest["capacity"]["window_days"] <= 7
     assert evidence.stat().st_size < Path(cfg["paths"]["trades_db"]).stat().st_size * 20
+
+
+def test_compact_monitor_event_keeps_causal_identity_without_vector_duplication() -> None:
+    raw = loop._compact_monitor_event(
+        {
+            "event_id": "monitor-1",
+            "occurred_at": "2026-08-22T09:00:01+00:00",
+            "payload_json": "not-copied",
+        },
+        {
+            "last_monitor_prob": 0.03,
+            "last_monitor_best_bid": 0.08,
+            "exit_decision_should_exit": True,
+            "day0_monitor_probability_receipt": {
+                "probability_content_identity": "content-1",
+                "probability_witness_identity": "witness-1",
+                "source_truth_identity": "source-1",
+                "observation": {
+                    "observation_time": "2026-08-22T08:55:00+00:00",
+                    "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
+                    "day0_remaining_vector_witness": {"blob": "x" * 10000},
+                },
+            },
+        },
+    )
+    payload = json.loads(raw)
+    assert payload["event"]["event_id"] == "monitor-1"
+    assert "payload_json" not in payload["event"]
+    receipt = payload["payload"]["probability_receipt"]
+    assert receipt["probability_content_identity"] == "content-1"
+    assert receipt["observation"]["observation_time"] == "2026-08-22T08:55:00+00:00"
+    assert "day0_remaining_vector_witness" not in receipt["observation"]
+    assert len(raw) < 2000
 
 
 def test_quote_evidence_metadata_stream_preserves_required_clocks_and_truthfully_truncates(

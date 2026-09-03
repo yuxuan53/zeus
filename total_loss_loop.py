@@ -1379,13 +1379,11 @@ def _observe_quote(
                 (evidence_id, seen_at, bid, int(reopen), int(reopen), iso(), earliest[0]),
             )
             created = str(earliest[0])
-    if created is None and no_bid and episode_open and no_bid_episode is not None and not out_of_order:
-        mem.execute(
-            "UPDATE incidents SET crossing_evidence_id=?,evidence_revision=evidence_revision+1,"
-            "updated_at=? WHERE incident_id=?",
-            (evidence_id, iso(), no_bid_episode[0]),
-        )
-        created = str(no_bid_episode[0])
+    # A continuing no-bid quote is state continuity, not a new crossing.  The
+    # position quote state below follows the newest carrier, while the incident
+    # remains anchored to the first no-bid fact in this episode.  Re-keying the
+    # incident on every market tick defeated evidence retry backoff and erased
+    # the earliest causal boundary the investigation is meant to reconstruct.
     if created is None and (
         (below and (previous is None or not bool(previous[0])))
         or (no_bid and (not episode_open or no_bid_episode is None))
@@ -2912,6 +2910,82 @@ def _monitor_anchor_signature(row: sqlite3.Row) -> tuple[Any, ...]:
     )
 
 
+def _compact_monitor_event(row: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
+    """Keep the continuous decision curve without duplicating large receipts.
+
+    Full probability receipts are retained at the critical monitor clocks chosen
+    for quote bracketing. Every other tick still carries the clocks, decision,
+    executable book, probability identity, and source finality needed to locate
+    a divergence on the continuous timeline.
+    """
+
+    receipt = payload.get("day0_monitor_probability_receipt")
+    if not isinstance(receipt, Mapping):
+        receipt = payload.get("monitor_probability_receipt")
+    receipt = receipt if isinstance(receipt, Mapping) else {}
+    observation = receipt.get("observation")
+    observation = observation if isinstance(observation, Mapping) else {}
+    event = {key: value for key, value in row.items() if key != "payload_json"}
+    compact_payload = {
+        key: payload.get(key)
+        for key in (
+            "applied_validations",
+            "exit_decision_available",
+            "exit_decision_reason",
+            "exit_decision_selected_method",
+            "exit_decision_should_exit",
+            "exit_decision_trigger",
+            "exit_decision_urgency",
+            "hold_reason",
+            "last_monitor_best_ask",
+            "last_monitor_best_bid",
+            "last_monitor_edge",
+            "last_monitor_market_price",
+            "last_monitor_market_price_is_fresh",
+            "last_monitor_prob",
+            "last_monitor_prob_is_fresh",
+            "phase_after",
+            "q_version",
+            "selected_method",
+        )
+        if key in payload
+    }
+    compact_payload["probability_receipt"] = {
+        key: receipt.get(key)
+        for key in (
+            "held_direction",
+            "held_pinned_recompute",
+            "held_side_probability",
+            "pinned_complete_posterior_id",
+            "pinned_complete_posterior_identity",
+            "probability_authority",
+            "probability_content_identity",
+            "probability_witness_identity",
+            "q_version",
+            "selected_method",
+            "source_truth_identity",
+        )
+        if key in receipt
+    }
+    compact_payload["probability_receipt"]["observation"] = {
+        key: observation.get(key)
+        for key in (
+            "current_observation_time",
+            "evidence_finality",
+            "observation_available_at",
+            "observation_time",
+            "observed_extreme_native",
+            "posterior_id",
+            "probability_base_identity",
+            "probability_conditioning_observation_time",
+            "settlement_source",
+            "station_id",
+        )
+        if key in observation
+    }
+    return json.dumps({"event": event, "payload": compact_payload}, default=str)
+
+
 def _monitor_is_red_or_exit(row: sqlite3.Row) -> bool:
     payload = read_json_text(str(row["payload_json"] or "{}"))
     if bool(payload.get("exit_decision_should_exit")):
@@ -3299,13 +3373,23 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
         out.execute("INSERT INTO position VALUES (?,?)", (incident["position_id"], json.dumps(position, default=str)))
         seen_quotes: set[str] = set()
         noncritical_quote_ids = set(quote_selection.pop("_noncritical_ids", []))
+        noncritical_depth_omitted = 0
         for raw in [*quote_rows, *latest]:
             row = dict(raw)
             key = str(row["evidence_id"])
             if key in seen_quotes:
                 continue
             seen_quotes.add(key)
-            raw_json = json.dumps(row, default=str)
+            # depth_json is already a first-class column. Do not duplicate a
+            # potentially large order book inside raw_json.
+            raw_json = json.dumps(
+                {
+                    name: value
+                    for name, value in row.items()
+                    if name != "depth_before_json"
+                },
+                default=str,
+            )
             try:
                 _budget_check(evidence, out)
                 _budget_check(evidence, out, extra_bytes=len(raw_json.encode()))
@@ -3320,15 +3404,32 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                 continue
             out.execute(
                 "INSERT INTO price_ticks VALUES (?,?,?,?,?,?,?,?)",
-                (key, row["quote_seen_at"], row.get("best_bid_before"), row.get("best_ask_before"), row.get("depth_before_json"), row.get("book_hash_before"), row.get("direction"), raw_json),
+                (
+                    key,
+                    row["quote_seen_at"],
+                    row.get("best_bid_before"),
+                    row.get("best_ask_before"),
+                    (
+                        None
+                        if key in noncritical_quote_ids
+                        else row.get("depth_before_json")
+                    ),
+                    row.get("book_hash_before"),
+                    row.get("direction"),
+                    raw_json,
+                ),
             )
+            if key in noncritical_quote_ids and row.get("depth_before_json") is not None:
+                noncritical_depth_omitted += 1
+        quote_selection["noncritical_depth_rows_omitted"] = noncritical_depth_omitted
+        critical_monitor_times = set(clock_times)
         for raw in events:
             _budget_check(evidence, out)
             row = dict(raw)
             payload = read_json_text(str(row.get("payload_json") or "{}"))
             packed = json.dumps(row, default=str)
-            _budget_check(evidence, out, extra_bytes=len(packed.encode()))
             if row["event_type"] == "SETTLED":
+                _budget_check(evidence, out, extra_bytes=len(packed.encode()))
                 fact_key = digest(
                     incident["position_id"], row.get("event_id"),
                     payload.get("payout_id") or payload.get("settlement_id") or "",
@@ -3338,7 +3439,17 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                     (fact_key, row.get("occurred_at") or "", json.dumps({"event": row, "payload": payload}, default=str)),
                 )
             if row["event_type"] == "MONITOR_REFRESHED":
-                out.execute("INSERT INTO monitor_events VALUES (?,?,?)", (row["event_id"], row["occurred_at"], packed))
+                occurred_at = parse_time(str(row["occurred_at"] or ""))
+                monitor_json = (
+                    packed
+                    if occurred_at in critical_monitor_times
+                    else _compact_monitor_event(row, payload)
+                )
+                _budget_check(evidence, out, extra_bytes=len(monitor_json.encode()))
+                out.execute(
+                    "INSERT INTO monitor_events VALUES (?,?,?)",
+                    (row["event_id"], row["occurred_at"], monitor_json),
+                )
                 probability = _json_number(payload, ("last_monitor_prob", "p_posterior", "held_probability", "probability", "q"))
                 edge = _json_number(payload, ("last_monitor_edge", "edge", "held_edge"))
                 market_price = _json_number(payload, ("last_monitor_market_price", "market_price", "best_bid", "held_bid"))
@@ -3360,6 +3471,7 @@ def _build_evidence_snapshot(cfg: Mapping[str, Any], incident_id: str) -> Path:
                         },
                         default=str,
                     )
+                _budget_check(evidence, out, extra_bytes=len(decision_json.encode()))
                 out.execute("INSERT INTO exit_decisions VALUES (?,?,?,?,?)", (row["event_id"], row["occurred_at"], row["event_type"], row.get("command_id"), decision_json))
         for raw in commands:
             _budget_check(evidence, out)
