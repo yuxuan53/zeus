@@ -34940,6 +34940,27 @@ def _day0_replacement_conditioning(
                 # RESET: the next global cut and submit rebind reproduce an active
                 # conditioning age inside the existing 15-minute entry contract.
                 raise ValueError("GLOBAL_DAY0_FAST_OBSERVATION_ENTRY_STALE")
+    causal_bundle = provenance.get("day0_causal_evidence_bundle")
+    causal_bundle_validation = None
+    if causal_bundle is not None:
+        if not isinstance(causal_bundle, Mapping):
+            raise ValueError("GLOBAL_DAY0_REPLACEMENT_CAUSAL_BUNDLE_INVALID")
+        from src.data.day0_hourly_vectors import (
+            validate_day0_causal_evidence_bundle,
+        )
+
+        try:
+            causal_bundle_validation = validate_day0_causal_evidence_bundle(
+                expected=causal_bundle,
+                actual=causal_bundle,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "GLOBAL_DAY0_REPLACEMENT_CAUSAL_BUNDLE_INVALID"
+            ) from exc
+        if not causal_bundle_validation.ok:
+            raise ValueError("GLOBAL_DAY0_REPLACEMENT_CAUSAL_BUNDLE_INVALID")
+
     return {
         **conditioning,
         **{
@@ -34960,6 +34981,11 @@ def _day0_replacement_conditioning(
         },
         "day0_remaining_carrier_likelihood": provenance.get(
             "day0_preliminary_report_survival_likelihood"
+        ),
+        "day0_causal_evidence_bundle_validation": (
+            causal_bundle_validation.receipt()
+            if causal_bundle_validation is not None
+            else None
         ),
         "metric": conditioned_metric,
         "unit": conditioned_unit,
@@ -36191,6 +36217,15 @@ def _global_day0_execution_payload(
         )
     if isinstance(causal_bundle, Mapping):
         payload["_edli_day0_causal_evidence_bundle"] = dict(causal_bundle)
+    causal_bundle_validation = (
+        conditioning.get("day0_causal_evidence_bundle_validation")
+        if isinstance(conditioning, Mapping)
+        else None
+    )
+    if isinstance(causal_bundle_validation, Mapping):
+        payload["_edli_day0_causal_evidence_bundle_validation"] = dict(
+            causal_bundle_validation
+        )
     if isinstance(conditioning, Mapping):
         carrier_fields = {
             "day0_remaining_carrier_content_identity": "_edli_day0_remaining_content_identity",

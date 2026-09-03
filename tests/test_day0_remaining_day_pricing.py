@@ -1591,8 +1591,38 @@ def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units(
 
 def test_day0_redecision_conditioning_copies_shared_carrier_fields():
     import src.engine.event_reactor_adapter as era
+    from src.data.day0_hourly_vectors import build_day0_causal_evidence_bundle
 
     samples = [[1.0, 0.0], [0.0, 1.0]]
+    vector_witness = {
+        "vector_ids_by_model": {"ecmwf_ifs": "vector-1"},
+        "capture_times_by_model_utc": {
+            "ecmwf_ifs": "2026-08-24T09:00:00+00:00"
+        },
+        "request_hash_by_model": {"ecmwf_ifs": "request-1"},
+        "source_run_id_by_model": {"ecmwf_ifs": "source-1"},
+        "provider_run_id_by_model": {"ecmwf_ifs": "provider-1"},
+        "provider_source_cycle_time_by_model_utc": {
+            "ecmwf_ifs": "2026-08-24T00:00:00+00:00"
+        },
+        "provider_source_available_at_by_model_utc": {
+            "ecmwf_ifs": "2026-08-24T08:00:00+00:00"
+        },
+        "provider_source_modified_at_by_model_utc": {
+            "ecmwf_ifs": "2026-08-24T07:55:00+00:00"
+        },
+    }
+    causal_bundle = build_day0_causal_evidence_bundle(
+        city="Hong Kong",
+        target_date="2026-08-24",
+        metric="high",
+        observation_context={
+            "source": "hko_hourly_accumulator",
+            "observed_extreme_native": 31.0,
+        },
+        cutoff_utc="2026-08-24T09:30:00+00:00",
+        vector_witness=vector_witness,
+    )
     bundle = SimpleNamespace(
         provenance_json={
             "day0_provisional_observation": {
@@ -1607,6 +1637,8 @@ def test_day0_redecision_conditioning_copies_shared_carrier_fields():
             "day0_remaining_carrier_future_extremes_c": [31.0, 32.0],
             "day0_remaining_carrier_path_error_sigma_c": 0.25,
             "day0_remaining_carrier_probability_cutoff_utc": "2026-08-24T09:30:00+00:00",
+            "day0_remaining_vector_witness": vector_witness,
+            "day0_causal_evidence_bundle": causal_bundle,
         }
     )
     conditioning = era._day0_replacement_conditioning(
@@ -1620,6 +1652,41 @@ def test_day0_redecision_conditioning_copies_shared_carrier_fields():
     assert conditioning["day0_remaining_carrier_content_identity"] == "identity"
     assert conditioning["day0_remaining_carrier_probability_samples"] == samples
     assert conditioning["day0_remaining_carrier_future_extremes_c"] == [31.0, 32.0]
+    assert conditioning["day0_causal_evidence_bundle"] == causal_bundle
+    assert conditioning["day0_causal_evidence_bundle_validation"] == {
+        "reason": None,
+        "expected_bundle_identity": causal_bundle["bundle_identity"],
+        "actual_bundle_identity": causal_bundle["bundle_identity"],
+        "expected_carrier_vector_identity": causal_bundle[
+            "carrier_vector_identity"
+        ],
+        "actual_carrier_vector_identity": causal_bundle[
+            "carrier_vector_identity"
+        ],
+        "expected_carrier_vector_hash": causal_bundle["carrier_vector_hash"],
+        "actual_carrier_vector_hash": causal_bundle["carrier_vector_hash"],
+    }
+    tampered_bundle = SimpleNamespace(
+        provenance_json={
+            **bundle.provenance_json,
+            "day0_causal_evidence_bundle": {
+                **causal_bundle,
+                "carrier_vector_hash": "tampered",
+            },
+        }
+    )
+    with pytest.raises(
+        ValueError,
+        match="GLOBAL_DAY0_REPLACEMENT_CAUSAL_BUNDLE_INVALID",
+    ):
+        era._day0_replacement_conditioning(
+            tampered_bundle,
+            provisional=True,
+            metric="high",
+            unit="C",
+            decision_time=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+            entry_authority=False,
+        )
 
 
 def test_live_hourly_fetch_persists_real_possession_clock_and_identity(
