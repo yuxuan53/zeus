@@ -1937,10 +1937,11 @@ def _coordinator_for_trade_connection(conn: sqlite3.Connection):
 def _chain_mirror_trade_transaction(*, owner: str):
     """Yield one 250ms TRADE apply quantum after bounded connection bootstrap.
 
-    SCOPE: one token-registry row or one exact position id.  DRAIN: the next
-    scheduled/operator pass retries only the failed unit.  RESET: successful
-    commit reclassifies the position as consistent.  Bootstrap deliberately
-    precedes the coordinator lease: journal/cutover work must never consume a
+    SCOPE: one current positions-discovery batch or one exact position id.
+    DRAIN: the next scheduled/operator pass retries the failed batch/position.
+    RESET: successful commit records the complete discovery batch or
+    reclassifies the position as consistent.  Bootstrap deliberately precedes
+    the coordinator lease: journal/cutover work must never consume a
     MONITOR-visible writer quantum.
     """
     from src.state.db import get_trade_connection
@@ -2065,24 +2066,33 @@ def run_cycle() -> None:
         # redemption, illiquidity) can never be read as the token having
         # vanished -- registry rows are never deleted on absence. Best-effort:
         # a registry write failure must never abort the reconcile pass that
-        # already has fresh chain facts in hand.
-        for asset, chain_fact in chain_by_asset.items():
-            if not chain_fact.condition_id:
-                continue
+        # already has fresh chain facts in hand.  One positions response is one
+        # atomic discovery fact set: persist it through one bounded transaction.
+        # Opening a canonical connection/lease per token turned a 2k-token
+        # response into a write-acquisition storm that starved held-position
+        # monitoring and the global auction while adding no isolation value.
+        registry_items = tuple(
+            (asset, chain_fact)
+            for asset, chain_fact in chain_by_asset.items()
+            if chain_fact.condition_id
+        )
+        if registry_items:
             try:
                 with _chain_mirror_trade_transaction(
                     owner="chain_mirror_token_registry"
                 ) as write_conn:
-                    record_token_seen(
-                        write_conn,
-                        token_id=asset,
-                        condition_id=chain_fact.condition_id,
-                        source="positions_api_discovery",
-                    )
+                    for asset, chain_fact in registry_items:
+                        record_token_seen(
+                            write_conn,
+                            token_id=asset,
+                            condition_id=chain_fact.condition_id,
+                            source="positions_api_discovery",
+                        )
             except Exception as exc:
                 logger.warning(
-                    "chain_mirror_reconcile: ctf_token_registry record failed for token %s: %s",
-                    asset,
+                    "chain_mirror_reconcile: ctf_token_registry batch record failed "
+                    "for %d tokens: %s",
+                    len(registry_items),
                     exc,
                 )
         try:

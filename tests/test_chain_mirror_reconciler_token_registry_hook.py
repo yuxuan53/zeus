@@ -129,14 +129,47 @@ def test_run_cycle_registers_every_positions_token(monkeypatch, trades_db_path):
     assert tok_z.first_source == "positions_api_discovery"
     assert [entry[1]["owner"] for entry in transactions] == [
         "chain_mirror_token_registry",
-        "chain_mirror_token_registry",
     ]
     assert all(entry[1]["priority"].value == "background_recovery" for entry in transactions)
     assert all(entry[1]["deadline_ms"] == 250 for entry in transactions)
     assert all(entry[1]["max_hold_ms"] == 250 for entry in transactions)
-    assert [kind for kind, _kwargs in events] == [
-        "bootstrap", "lease", "bootstrap", "lease"
+    assert [kind for kind, _kwargs in events] == ["bootstrap", "lease"]
+
+
+def test_large_positions_discovery_uses_one_registry_write_quantum(
+    monkeypatch, trades_db_path
+):
+    """Token cardinality must not multiply canonical connection/lease acquisition."""
+    from src.state.chain_mirror_reconciler import run_cycle
+
+    transactions, events = _patch_common(monkeypatch, trades_db_path)
+    token_count = 2_500
+    monkeypatch.setattr(
+        "src.data.polymarket_client.PolymarketClient",
+        lambda: SimpleNamespace(
+            get_positions_from_api=lambda: [
+                {
+                    "token_id": f"token-{index}",
+                    "condition_id": f"condition-{index}",
+                    "size": 1.0,
+                    "redeemable": False,
+                    "current_value": 0.5,
+                    "side": "BUY",
+                }
+                for index in range(token_count)
+            ]
+        ),
+    )
+
+    run_cycle()
+
+    with sqlite3.connect(str(trades_db_path)) as conn:
+        recorded = conn.execute("SELECT COUNT(*) FROM ctf_token_registry").fetchone()[0]
+    assert recorded == token_count
+    assert [entry[1]["owner"] for entry in transactions] == [
+        "chain_mirror_token_registry"
     ]
+    assert [kind for kind, _kwargs in events] == ["bootstrap", "lease"]
 
 
 def test_run_cycle_survives_registry_write_failure(monkeypatch, trades_db_path):
