@@ -9060,6 +9060,93 @@ def test_live_exit_with_fresh_snapshot_but_no_bid_records_liquidity_block(
     ]
 
 
+def test_hard_fact_exit_with_zero_snapshot_bid_falls_to_liquidity_wait_not_authority_error(
+    conn,
+    monkeypatch,
+):
+    """A DAY0_HARD_FACT_BIN_DEAD exit whose freshly captured snapshot bid is
+    exactly 0.0 must be classified as a liquidity wait (self-resolving,
+    budget-exempt cooldown), never as ``hard_fact_sell_authority_invalid``
+    (which requires a global-auction reauction this direct trigger never
+    requests, per FIX 2 of the DAY0_HARD_FACT_BIN_DEAD retry-starvation bug).
+    """
+    from src.execution import exit_lifecycle
+    from src.state.portfolio import ExitContext, PortfolioState, Position
+
+    fresh_now = datetime.now(timezone.utc)
+    _ensure_snapshot(
+        conn,
+        token_id=YES_TOKEN,
+        no_token_id=NO_TOKEN,
+        selected_outcome_token_id=YES_TOKEN,
+        outcome_label="YES",
+        snapshot_id="snap-exit-zero-bid",
+        captured_at=fresh_now,
+        freshness_deadline=fresh_now + timedelta(minutes=5),
+        # A raw orderbook can never publish a non-positive top bid (the
+        # snapshot contract rejects it); "0.000" is how a stale/estimated
+        # exit_context.best_bid presents when the live book has gone one-sided.
+        orderbook_top_bid=None,
+        orderbook_top_ask=Decimal("0.02"),
+    )
+    position = Position(
+        trade_id="pos-exit-zero-bid",
+        market_id="condition-test",
+        condition_id="condition-test",
+        city="Manila",
+        cluster="asia",
+        target_date="2026-07-02",
+        bin_label="32C",
+        direction="buy_yes",
+        token_id=YES_TOKEN,
+        no_token_id=NO_TOKEN,
+        entry_price=0.71,
+        size_usd=10.0,
+        shares=10.0,
+        cost_basis_usd=7.10,
+        state="day0_window",
+        strategy_key="forecast_qkernel_entry",
+    )
+    portfolio = PortfolioState(positions=[position])
+    exit_context = ExitContext(
+        exit_reason="DAY0_HARD_FACT_BIN_DEAD",
+        current_market_price=0.02,
+        current_market_price_is_fresh=True,
+        best_bid=0.0,
+        day0_active=True,
+    )
+
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "execute_exit_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("zero-bid liquidity block must preempt executor")
+        ),
+    )
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "_hard_fact_sell_authority_valid",
+        lambda *args, **kwargs: True,
+    )
+
+    outcome = exit_lifecycle.execute_exit(
+        portfolio,
+        position,
+        exit_context,
+        clob=None,
+        conn=conn,
+        hard_fact_authority=object(),
+    )
+
+    assert outcome == "exit_blocked: no_executable_bid"
+    assert position.exit_state == "retry_pending"
+    assert position.exit_retry_count == 0
+    assert position.last_exit_error == "exit_no_executable_bid"
+    assert not str(position.last_exit_error or "").startswith(
+        "global_sell_exit_capital_authority_reauction"
+    )
+
+
 @pytest.mark.parametrize(
     ("direction", "expected_token"),
     (("buy_yes", YES_TOKEN), ("buy_no", NO_TOKEN)),

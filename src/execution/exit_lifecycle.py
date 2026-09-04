@@ -7879,6 +7879,15 @@ def _execute_live_exit(
     protective_bid = _positive_decimal(
         snapshot_context.get("executable_snapshot_orderbook_top_bid")
     )
+    # A recognized protective trigger with no executable bid right now is not
+    # an authority failure -- it is a liquidity fact. Let it fall through to
+    # the ordinary no-bid/dust classification below (self-resolving, budget-
+    # exempt cooldown) instead of the capital-authority-reauction branch,
+    # which requires a fresh global auction this direct SELL never requests.
+    protective_bid_unavailable = bool(protective_kind) and not (
+        protective_bid is not None
+        and LIVE_ORDER_MIN_UNIT_PRICE <= protective_bid <= LIVE_ORDER_MAX_UNIT_PRICE
+    )
     if (
         protective_kind
         and protective_bid is not None
@@ -7963,7 +7972,11 @@ def _execute_live_exit(
                 branchwise_sell_authority,
                 snapshot_context=snapshot_context,
             )
-        elif protective_sell_authority is not None or continuing_existing_exit:
+        elif (
+            protective_sell_authority is not None
+            or continuing_existing_exit
+            or protective_bid_unavailable
+        ):
             authority_error = None
         else:
             authority_error = "hard_fact_sell_authority_invalid"
