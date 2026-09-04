@@ -15947,6 +15947,47 @@ def test_exit_dual_write_backfills_missing_entry_history_after_day0_only_canonic
     assert events[4]["source_module"] == "src.execution.exit_lifecycle"
 
 
+def test_exit_dual_write_reuses_existing_command_bound_economic_close(tmp_path):
+    """A second close writer must not duplicate one command's canonical fill."""
+    conn = get_connection(tmp_path / "zeus.db")
+    init_schema(conn)
+    init_schema_trade_only(conn)
+
+    from src.engine.lifecycle_events import build_economic_close_canonical_write
+    from src.state.db import append_many_and_project
+
+    position_id = "command-bound-close-dedup"
+    command_id = "exit-command-1"
+    closed = _position(
+        trade_id=position_id,
+        state="economically_closed",
+        exit_state="sell_filled",
+        pre_exit_state="pending_exit",
+        last_exit_order_id="sell-order-1",
+        last_exit_at="2026-04-01T01:00:00Z",
+        exit_price=0.58,
+        exit_reason="global capital optimal sell",
+    )
+    events, projection = build_economic_close_canonical_write(
+        closed,
+        sequence_no=1,
+        phase_before="pending_exit",
+        source_module="src.execution.exchange_reconcile",
+    )
+    events[0]["command_id"] = command_id
+    append_many_and_project(conn, events, projection)
+    before = _raw_position_event_rows(conn, position_id)
+
+    assert exit_lifecycle_module._dual_write_canonical_economic_close_if_available(
+        conn,
+        closed,
+        phase_before="pending_exit",
+        command_id=command_id,
+    ) is True
+
+    assert _raw_position_event_rows(conn, position_id) == before
+
+
 def test_day0_existing_canonical_event_repairs_position_current_projection(tmp_path):
     """Existing Day0 event is enough canonical truth to repair stale projection."""
     conn = get_connection(tmp_path / "zeus.db")

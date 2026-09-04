@@ -4884,6 +4884,25 @@ def _dual_write_canonical_economic_close_if_available(
     from src.state.db import append_many_and_project
 
     trade_id = getattr(position, "trade_id", "")
+    exit_order_id = str(getattr(position, "last_exit_order_id", "") or "").strip()
+    identity_clauses: list[str] = []
+    identity_params: list[str] = [str(trade_id)]
+    if command_id:
+        identity_clauses.append("command_id = ?")
+        identity_params.append(str(command_id))
+    if exit_order_id:
+        identity_clauses.append("lower(COALESCE(order_id, '')) = lower(?)")
+        identity_params.append(exit_order_id)
+    if identity_clauses:
+        existing_close = conn.execute(
+            "SELECT 1 FROM position_events "
+            "WHERE position_id = ? AND event_type = 'EXIT_ORDER_FILLED' AND ("
+            + " OR ".join(identity_clauses)
+            + ") LIMIT 1",
+            tuple(identity_params),
+        ).fetchone()
+        if existing_close is not None:
+            return True
     existing_entry_types = _existing_canonical_entry_event_types(conn, trade_id)
     missing_entry_types = [
         event_type
