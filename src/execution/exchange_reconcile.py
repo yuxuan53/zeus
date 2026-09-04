@@ -129,7 +129,7 @@ _ENTRY_FILL_PROJECTION_PHASES = frozenset(
 _TERMINAL_ENTRY_COMMAND_STATES = frozenset(
     {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "SUBMIT_REJECTED", "FILLED"}
 )
-_CHAIN_CONFIRMED_HELD_PHASES = frozenset({"active", "day0_window"})
+_CHAIN_CONFIRMED_HELD_PHASES = frozenset({"active", "day0_window", "pending_exit"})
 _TEMPERATURE_BIN_LABEL_RE = re.compile(
     r"-?\d+(?:\.\d+)?\s*(?:[-–]\s*-?\d+(?:\.\d+)?\s*)?°[FfCc]"
     r"(?:\s+or\s+(?:below|lower|higher|above|more)|\s+on\b|$)"
@@ -8237,6 +8237,18 @@ def _chain_confirmed_active_holdings_by_token(conn: sqlite3.Connection) -> dict[
 
     Observed 2026-06-16: Seoul buy_no 10.86 (finding 3c7427cf), ``chain_state=synced`` /
     ``chain_shares=10.86`` vs ``confirmed_journal=0`` — froze ALL new submits for hours.
+
+    Observed 2026-09-04: Chengdu HIGH 32C YES token 8510...5436 (finding 530deb22) — a
+    same-token re-entry after a prior position was fully exited (economically_closed).
+    ``_journal_positions_by_token`` excludes an inactive-phase position's BUY fills but
+    STILL includes its EXIT SELL fills (so live positions can net a real wallet reduction
+    against a closed position's exit), so the new position's journal balance nets the new
+    BUY against the old position's SELLs instead of isolating it: BUY 10.92 (new, CONFIRMED)
+    minus SELL 21.25 minus SELL 5.0 (old, economically_closed) = -15.33 vs exchange 10.92.
+    The new position was ``pending_exit`` (a hard-fact dead bin, bid 0, held until
+    settlement) — included here so its on-chain-confirmed size clears the drift the same
+    way ``active``/``day0_window`` do. A real reduction still breaks the equality below
+    (fresh exchange read < chain_shares) and keeps the finding open (fail-closed).
 
     The persisted ``chain_shares`` (the chain reconciler's data-api /positions read,
     ``chain_state='synced'``) is matched against the FRESH exchange /positions read at sweep

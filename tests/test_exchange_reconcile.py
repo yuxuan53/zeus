@@ -782,6 +782,172 @@ def test_day0_chain_confirmed_holding_clears_position_drift_without_journal(conn
     assert findings(conn) == []
 
 
+def _seed_reentry_pending_exit_scenario(conn, token: str) -> None:
+    """Fully exited (economically_closed) prior position plus a re-entered,
+    chain-confirmed pending_exit position on the SAME token — the 2026-09-04
+    Chengdu shape (finding 530deb22).
+
+    All fills are backdated well past the 300s ``_has_recent_filled_suppression``
+    grace window (mirrors the live finding, open for hours before the sweep) so
+    the assertions below exercise the chain-confirmed absorber itself, not the
+    unrelated just-filled suppression."""
+
+    filled_at = NOW - timedelta(hours=1)
+    seed_command(
+        conn,
+        command_id="cmd-reentry-old-entry",
+        venue_order_id="ord-reentry-old-entry",
+        position_id="pos-reentry-old",
+        token_id=token,
+        side="BUY",
+        size=26.25,
+        price=0.40,
+        state="FILLED",
+        created_at=filled_at,
+    )
+    append_trade_fact(
+        conn,
+        command_id="cmd-reentry-old-entry",
+        venue_order_id="ord-reentry-old-entry",
+        token_id=token,
+        trade_id="trade-reentry-old-entry",
+        size="26.25",
+        fill_price="0.40",
+        state="CONFIRMED",
+    )
+    seed_position_baseline(conn, position_id="pos-reentry-old", order_id="ord-reentry-old-entry")
+    conn.execute(
+        """
+        UPDATE position_current
+           SET phase = 'economically_closed',
+               token_id = ?,
+               order_id = 'ord-reentry-old-entry',
+               order_status = 'sell_filled',
+               shares = 0,
+               updated_at = ?
+         WHERE position_id = 'pos-reentry-old'
+        """,
+        (token, NOW.isoformat()),
+    )
+    seed_command(
+        conn,
+        command_id="cmd-reentry-old-exit-1",
+        venue_order_id="ord-reentry-old-exit-1",
+        position_id="pos-reentry-old",
+        token_id=token,
+        side="SELL",
+        size=21.25,
+        price=0.45,
+        state="FILLED",
+        created_at=filled_at,
+    )
+    append_trade_fact(
+        conn,
+        command_id="cmd-reentry-old-exit-1",
+        venue_order_id="ord-reentry-old-exit-1",
+        token_id=token,
+        trade_id="trade-reentry-old-exit-1",
+        size="21.25",
+        fill_price="0.45",
+        state="CONFIRMED",
+    )
+    seed_command(
+        conn,
+        command_id="cmd-reentry-old-exit-2",
+        venue_order_id="ord-reentry-old-exit-2",
+        position_id="pos-reentry-old",
+        token_id=token,
+        side="SELL",
+        size=5.0,
+        price=0.10,
+        state="FILLED",
+        created_at=filled_at,
+    )
+    append_trade_fact(
+        conn,
+        command_id="cmd-reentry-old-exit-2",
+        venue_order_id="ord-reentry-old-exit-2",
+        token_id=token,
+        trade_id="trade-reentry-old-exit-2",
+        size="5.0",
+        fill_price="0.10",
+        state="CONFIRMED",
+    )
+
+    seed_command(
+        conn,
+        command_id="cmd-reentry-new-entry",
+        venue_order_id="ord-reentry-new-entry",
+        position_id="pos-reentry-new",
+        token_id=token,
+        side="BUY",
+        size=10.92,
+        price=0.55,
+        state="FILLED",
+        created_at=filled_at,
+    )
+    append_trade_fact(
+        conn,
+        command_id="cmd-reentry-new-entry",
+        venue_order_id="ord-reentry-new-entry",
+        token_id=token,
+        trade_id="trade-reentry-new-entry",
+        size="10.92",
+        fill_price="0.55",
+        state="CONFIRMED",
+    )
+    seed_position_baseline(conn, position_id="pos-reentry-new", order_id="ord-reentry-new-entry")
+    conn.execute(
+        """
+        UPDATE position_current
+           SET phase = 'pending_exit',
+               chain_state = 'synced',
+               chain_shares = 10.92,
+               shares = 10.92,
+               token_id = ?,
+               order_id = 'ord-reentry-new-entry',
+               updated_at = ?
+         WHERE position_id = 'pos-reentry-new'
+        """,
+        (token, NOW.isoformat()),
+    )
+
+
+def test_pending_exit_chain_confirmed_holding_clears_reentry_position_drift(conn):
+    from src.execution.exchange_reconcile import run_reconcile_sweep
+
+    token = "reentry-pending-exit-token"
+    _seed_reentry_pending_exit_scenario(conn, token)
+
+    result = run_reconcile_sweep(
+        FakeM5Adapter(positions=[position(token_id=token, size="10.92")]),
+        conn,
+        context="ws_gap",
+        observed_at=NOW,
+    )
+
+    assert result == []
+    assert findings(conn) == []
+
+
+def test_pending_exit_chain_confirmed_holding_keeps_finding_on_real_reduction(conn):
+    from src.execution.exchange_reconcile import run_reconcile_sweep
+
+    token = "reentry-pending-exit-reduced-token"
+    _seed_reentry_pending_exit_scenario(conn, token)
+
+    result = run_reconcile_sweep(
+        FakeM5Adapter(positions=[position(token_id=token, size="5.00")]),
+        conn,
+        context="ws_gap",
+        observed_at=NOW,
+    )
+
+    assert [finding.kind for finding in result] == ["position_drift"]
+    open_findings = [row for row in findings(conn) if row["resolved_at"] is None]
+    assert len(open_findings) == 1
+
+
 def test_exact_trade_split_replaces_point_order_aggregate_without_drift(conn):
     from src.execution.exchange_reconcile import run_reconcile_sweep
     from src.state.venue_command_repo import append_trade_fact as append_venue_trade_fact
