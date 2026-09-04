@@ -41,6 +41,14 @@ class Day0AdmissionContext:
     # one-bin-edge fragility
     selected_bin_edge_distance_quanta: float
     edge_survives_one_bin_stress: bool
+    # diurnal-residual nowcast veto (gate 9). ``nowcast_q_held`` is the station
+    # residual nowcast's probability that the HELD token pays; ``decision_price_held``
+    # is the same decision-time all-in price p0 the market-anchored correction anchors
+    # on. Both None on every candidate the artifact cannot serve — the gate is then
+    # inert, which is its dormant default.
+    nowcast_q_held: float | None = None
+    nowcast_basis: str | None = None
+    decision_price_held: float | None = None
     # stage policy (the caller supplies the current stage's admissible metric/health set;
     # M-13 2026-07-19: city_allowlist REMOVED here — see the deleted gate 1 comment below)
     metric_allowlist: frozenset[str] = field(default_factory=lambda: frozenset({"high", "low"}))
@@ -133,5 +141,31 @@ def day0_live_admission_rejection_reason(ctx: Day0AdmissionContext) -> str | Non
     # 8) maker-only entry until the lane is calibrated (taker/auto-cross entry forbidden).
     if ctx.maker_only_required and ctx.execution_mode not in _MAKER_MODES:
         return "DAY0_TAKER_ENTRY_FORBIDDEN"
+
+    # 9) the station diurnal-residual nowcast prices the held token at or below what we
+    # are about to pay for it.
+    #
+    # On day0 our posterior conditions on the running observed extreme but treats the
+    # remaining NWP path as near-certain, so it is overconfident on the running-extreme
+    # bin before the diurnal peak: at local 08-11 with the peak 0-1h away a stated
+    # q_floor of 0.90-0.95 realises 0.31, and the market prices that correctly. The
+    # residual nowcast (src/calibration/day0_diurnal_residual.py) beats OUR posterior on
+    # executable edge but never beats the market's Brier, so it is wired HERE as a veto
+    # and never as a q source: the set "our model would trade, the nowcast vetoes" is
+    # -0.020/unit HIGH [-0.040, -0.001] and -0.043/unit LOW, negative in 6/6 walk-forward
+    # windows, and the live day0_nowcast_entry positions in that set lost $292 on $962
+    # over 30 days.
+    #
+    # The comparison is against p0, the decision-time all-in price of the token we would
+    # HOLD — the same anchor the market-anchored correction uses — so the rule reads
+    # exactly as "the nowcast says this token is worth no more than its price". Both
+    # inputs absent (artifact dormant, unparseable bin, no running extreme) leaves the
+    # gate inert by construction.
+    if (
+        ctx.nowcast_q_held is not None
+        and ctx.decision_price_held is not None
+        and ctx.decision_price_held >= ctx.nowcast_q_held
+    ):
+        return "DAY0_DIURNAL_NOWCAST_VETO"
 
     return None

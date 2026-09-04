@@ -22205,6 +22205,224 @@ def _day0_in_final_localday_noentry_window(
     return remaining <= timedelta(minutes=_DAY0_FINAL_LOCALDAY_NOENTRY_MINUTES)
 
 
+def _day0_held_token_decision_price(
+    actionable_payload: Mapping[str, object],
+) -> float | None:
+    """p0 — the decision-time all-in unit cost of the token this candidate would HOLD.
+
+    Same anchor the market-anchored correction shrinks toward, read from the sealed
+    per-candidate record when one exists and from the global solve's expected fill price
+    otherwise. Both live in the qkernel economics cert, so this never re-prices anything.
+    """
+
+    economics = actionable_payload.get("qkernel_execution_economics")
+    if not isinstance(economics, Mapping):
+        return None
+    correction = economics.get("market_anchored_correction")
+    if isinstance(correction, Mapping) and correction.get("applied") is True:
+        p0 = _optional_float(correction.get("p0"))
+        if p0 is not None:
+            return p0
+    return _optional_float(economics.get("global_expected_fill_price_before_fee"))
+
+
+def _day0_nowcast_gap_native(
+    *,
+    actionable_payload: Mapping[str, object],
+    event_payload: Mapping[str, object],
+    metric: str,
+    running_extreme: float,
+    unit: str,
+) -> float | None:
+    """NWP gap = model center minus the running extreme (reversed for LOW), in the
+    city's settlement unit.
+
+    The centers come from the remaining-vector witness's carrier members already on the
+    payload — the same day-of model trajectories the posterior itself consumed — so the
+    hot path reads no database. Absent on most candidates, and absent means the pooled
+    cell, not a veto.
+    """
+
+    for source in (actionable_payload, event_payload):
+        if not isinstance(source, Mapping):
+            continue
+        authority = source.get("day0_probability_authority")
+        blocks: tuple[object, ...] = (source,)
+        if isinstance(authority, Mapping):
+            blocks = (
+                authority,
+                authority.get("global_current_observation_payload"),
+                source,
+            )
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            members = block.get(
+                "remaining_carrier_future_extremes_c"
+            ) or block.get("_edli_day0_remaining_carrier_future_extremes_c")
+            if not isinstance(members, (list, tuple)) or not members:
+                continue
+            values = [
+                value
+                for value in (_optional_float(member) for member in members)
+                if value is not None and math.isfinite(value)
+            ]
+            if not values:
+                continue
+            center_c = float(np.median(np.asarray(values, dtype=float)))
+            center = center_c * 9.0 / 5.0 + 32.0 if unit == "F" else center_c
+            return (
+                center - running_extreme
+                if metric == "high"
+                else running_extreme - center
+            )
+    return None
+
+
+DAY0_NOWCAST_Q_HELD_KEY = "_edli_day0_nowcast_q_held"
+DAY0_NOWCAST_BASIS_KEY = "_edli_day0_nowcast_basis"
+DAY0_NOWCAST_FIT_DATE_KEY = "_edli_day0_nowcast_fit_date"
+
+
+def stamp_day0_diurnal_nowcast(
+    actionable_payload: dict[str, object],
+    *,
+    event_payload: Mapping[str, object],
+    decision_time: datetime,
+) -> None:
+    """Stamp the residual nowcast's verdict onto the actionable payload IN PLACE.
+
+    Called once, on the payload dict BEFORE ``build_actionable_trade_certificate``
+    seals it, so the certificate hash covers the stamp and the admission gate below can
+    be a pure predicate over already-computed facts. A candidate the nowcast cannot
+    serve leaves the keys absent, which is what makes the gate inert.
+    """
+
+    if str(actionable_payload.get("event_type") or "").strip() != "DAY0_EXTREME_UPDATED":
+        return
+    city = runtime_cities_by_name().get(
+        str(actionable_payload.get("city") or event_payload.get("city") or "")
+    )
+    metric = str(
+        actionable_payload.get("metric")
+        or actionable_payload.get("temperature_metric")
+        or event_payload.get("metric")
+        or ""
+    ).strip().lower()
+    verdict = _day0_diurnal_nowcast_verdict(
+        actionable_payload=actionable_payload,
+        event_payload=event_payload,
+        city=city,
+        metric=metric,
+        decision_time=decision_time,
+    )
+    if verdict is None:
+        return
+    actionable_payload[DAY0_NOWCAST_Q_HELD_KEY] = float(verdict.q_held)
+    actionable_payload[DAY0_NOWCAST_BASIS_KEY] = str(verdict.basis)
+    actionable_payload[DAY0_NOWCAST_FIT_DATE_KEY] = str(verdict.fit_date)
+
+
+def _day0_diurnal_nowcast_verdict(
+    *,
+    actionable_payload: Mapping[str, object],
+    event_payload: Mapping[str, object],
+    city: object,
+    metric: str,
+    decision_time: datetime,
+) -> Any | None:
+    """The residual nowcast's held-token probability for this candidate, or None.
+
+    Fail-open on EVERY fault: no artifact, no city timezone, no running extreme,
+    unparseable bin label, unexpected exception. The caller then leaves the veto gate
+    inert. Reads no database — the running extreme, the bin label and the model centers
+    are all already in the payload the reactor assembled.
+    """
+
+    try:
+        from src.calibration.day0_diurnal_residual import (
+            load_day0_diurnal_residual_nowcast,
+        )
+
+        nowcast = load_day0_diurnal_residual_nowcast(now=decision_time)
+        if nowcast is None:
+            return None
+        city_name = str(getattr(city, "name", "") or "").strip()
+        timezone_name = str(getattr(city, "timezone", "") or "").strip()
+        if not city_name or not timezone_name or metric not in {"high", "low"}:
+            return None
+        direction = str(actionable_payload.get("direction") or "").strip().lower()
+        if direction not in {"buy_yes", "buy_no"}:
+            return None
+        bin_label = str(actionable_payload.get("bin_label") or "").strip()
+        if not bin_label:
+            return None
+        from src.data.market_scanner import _parse_temp_range
+
+        bin_low, bin_high = _parse_temp_range(bin_label)
+        if bin_low is None and bin_high is None:
+            return None
+        # The running extreme the reactor already holds for this candidate — the same
+        # observed value day0_probability_authority priced against. Never re-queried.
+        running_extreme = _optional_float(
+            actionable_payload.get("high_so_far" if metric == "high" else "low_so_far")
+        )
+        if running_extreme is None:
+            running_extreme = _observed_day0_extreme_native(event_payload, metric)
+        if running_extreme is None:
+            return None
+        unit = str(getattr(city, "settlement_unit", "") or "").strip().upper()
+        if nowcast.fitted_unit(city_name) not in (None, unit):
+            # The artifact was fitted in a different unit for this city; its integer
+            # residual grid does not transfer.
+            return None
+        local_hour = (
+            decision_time.astimezone(ZoneInfo(timezone_name)).hour
+            + decision_time.astimezone(ZoneInfo(timezone_name)).minute / 60.0
+        )
+        gap = _day0_nowcast_gap_native(
+            actionable_payload=actionable_payload,
+            event_payload=event_payload,
+            metric=metric,
+            running_extreme=running_extreme,
+            unit=unit,
+        )
+        return nowcast.held_probability(
+            city=city_name,
+            metric=metric,
+            direction=direction,
+            local_hour=local_hour,
+            running_extreme=running_extreme,
+            bin_low=bin_low,
+            bin_high=bin_high,
+            gap=gap,
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory gate; never blocks on its own fault
+        _log_day0_nowcast_fault(exc)
+        return None
+
+
+_DAY0_NOWCAST_FAULT_LOG_INTERVAL_SECONDS = 3600.0
+_day0_nowcast_fault_logged_at: dict[str, float] = {}
+_day0_nowcast_fault_lock = threading.Lock()
+
+
+def _log_day0_nowcast_fault(exc: BaseException) -> None:
+    """WARN once per exception family per hour — a recurring fault must be visible
+    without the decision cadence turning it into a log flood."""
+
+    family = type(exc).__name__
+    now = _time.monotonic()
+    with _day0_nowcast_fault_lock:
+        last = _day0_nowcast_fault_logged_at.get(family)
+        if last is not None and now - last < _DAY0_NOWCAST_FAULT_LOG_INTERVAL_SECONDS:
+            return
+        _day0_nowcast_fault_logged_at[family] = now
+    logging.getLogger(__name__).warning(
+        "day0 diurnal nowcast unavailable (%s): %s", family, exc
+    )
+
+
 def _day0_live_submit_admission_rejection_reason(
     *,
     event: OpportunityEvent,
@@ -22330,6 +22548,15 @@ def _day0_live_submit_admission_rejection_reason(
         ),
         selected_bin_edge_distance_quanta=distance_quanta,
         edge_survives_one_bin_stress=stress_survives,
+        nowcast_q_held=_optional_float(
+            actionable_payload.get(DAY0_NOWCAST_Q_HELD_KEY)
+        ),
+        nowcast_basis=(
+            str(actionable_payload.get(DAY0_NOWCAST_BASIS_KEY))
+            if actionable_payload.get(DAY0_NOWCAST_BASIS_KEY)
+            else None
+        ),
+        decision_price_held=_day0_held_token_decision_price(actionable_payload),
         maker_only_required=not global_current_solve,
     )
     return day0_live_admission_rejection_reason(ctx)
@@ -22425,6 +22652,14 @@ def _build_live_execution_command_certificates(
             event=event,
         )
         _assert_live_entry_submit_authority(actionable_payload)
+        # Stamp the Day0 residual-nowcast verdict BEFORE the certificate seals the
+        # payload hash, so the veto the admission gate applies below is auditable on the
+        # certificate and on the no-submit receipt that carries it.
+        stamp_day0_diurnal_nowcast(
+            actionable_payload,
+            event_payload=_payload(event),
+            decision_time=decision_time,
+        )
         actionable = build_actionable_trade_certificate(
             payload=actionable_payload,
             parent_certificates=base_certs + day0_source_certs + (live_cap,),
