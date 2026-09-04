@@ -219,10 +219,16 @@ class FitRow:
     q_raw: float | None
     lead_bucket: str | None
     y: int | None
+    # Training weight. The live table certifies a claim (city, target_date,
+    # temperature_metric, traded_bin_label, direction) at ~6.5x the row rate of
+    # the underlying claim surface (re-certification duplicates), so an
+    # unweighted fit over-counts re-certified claims. w defaults to 1.0 so
+    # every unweighted caller (walk_forward, existing tests) is unaffected.
+    w: float = 1.0
 
 
-def _design_row(row: FitRow) -> tuple[np.ndarray, float, float] | None:
-    """Build (feature_vector, offset, y) for one row, or None if invalid.
+def _design_row(row: FitRow) -> tuple[np.ndarray, float, float, float] | None:
+    """Build (feature_vector, offset, y, w) for one row, or None if invalid.
 
     feature_vector = [1{day0}, 1{day1}, 1{day2}, clipped_logit_residual].
     Invalid: unmodeled lead_bucket, non-finite p0/q_raw, or y not in {0,1}.
@@ -239,18 +245,19 @@ def _design_row(row: FitRow) -> tuple[np.ndarray, float, float] | None:
     onehot = [1.0 if row.lead_bucket == bucket else 0.0 for bucket in LEAD_BUCKETS]
     features = np.array([*onehot, x], dtype=np.float64)
     offset = logit(p0_c)
-    return features, offset, float(row.y)
+    return features, offset, float(row.y), float(row.w)
 
 
 def _fit_irls(
-    X: np.ndarray, y: np.ndarray, offset: np.ndarray, lambda_: float
+    X: np.ndarray, y: np.ndarray, offset: np.ndarray, lambda_: float, w: np.ndarray
 ) -> np.ndarray:
-    """Ridge-penalized Newton-Raphson logistic regression with a fixed offset.
+    """Ridge-penalized Newton-Raphson weighted logistic regression with a fixed offset.
 
-    Minimizes -loglik(beta) + (lambda_/2)*||beta||^2 where
+    Minimizes -sum(w * loglik(beta)) + (lambda_/2)*||beta||^2 where
     mu = sigmoid(offset + X @ beta). Zero-initialized (deterministic start);
     the L2 term keeps the Hessian positive-definite even under separable
-    data, so this converges without a rank-deficiency special case.
+    data, so this converges without a rank-deficiency special case. w == 1
+    for every row reproduces the unweighted fit exactly.
     """
     n_params = X.shape[1]
     beta = np.zeros(n_params, dtype=np.float64)
@@ -258,9 +265,9 @@ def _fit_irls(
     for _ in range(_IRLS_MAX_ITER):
         eta = offset + X @ beta
         mu = 1.0 / (1.0 + np.exp(-eta))
-        grad = X.T @ (mu - y) + lambda_ * beta
-        w = mu * (1.0 - mu)
-        hessian = (X * w[:, None]).T @ X + lambda_ * identity
+        grad = X.T @ (w * (mu - y)) + lambda_ * beta
+        wm = w * mu * (1.0 - mu)
+        hessian = (X * wm[:, None]).T @ X + lambda_ * identity
         delta = np.linalg.solve(hessian, grad)
         beta = beta - delta
         if np.max(np.abs(delta)) < _IRLS_TOL:
@@ -309,7 +316,8 @@ def fit(
         X = np.stack([r[0] for r in design_rows])
         offset = np.array([r[1] for r in design_rows], dtype=np.float64)
         y = np.array([r[2] for r in design_rows], dtype=np.float64)
-        coef = _fit_irls(X, y, offset, lambda_)
+        w = np.array([r[3] for r in design_rows], dtype=np.float64)
+        coef = _fit_irls(X, y, offset, lambda_, w)
         alpha = {bucket: float(coef[i]) for i, bucket in enumerate(lead_buckets)}
         raw_beta = float(coef[-1])
         beta = min(max(raw_beta, BETA_MIN), BETA_MAX)

@@ -88,12 +88,22 @@ def load_fit_rows(
     the settled_at-before-cutoff filter is what makes the live fit
     walk-forward-safe, and is applied in SQL so an unsettled row is never
     materialized.
+
+    A claim is (city, target_date, temperature_metric, traded_bin_label,
+    direction). The live table carries roughly one row per claim, but the
+    certificate surface underneath it is re-certified many times over (a
+    claim re-certifying does not produce a new independent outcome), so an
+    unweighted fit over-counts whichever claims happen to re-certify most.
+    Each returned row is weighted 1/(claim count within this same
+    cutoff-filtered set) so a claim contributes exactly one row's worth of
+    evidence to the fit regardless of how many certified rows it produced.
     """
 
     rows = conn.execute(
         """
         SELECT q_in_bin, market_in_bin_prob, settled_in_bin,
-               decision_posterior_computed_at, target_date, settled_at, graded_at
+               decision_posterior_computed_at, target_date, settled_at, graded_at,
+               city, temperature_metric, traded_bin_label, direction
         FROM settlement_attribution
         WHERE q_in_bin IS NOT NULL
           AND market_in_bin_prob IS NOT NULL
@@ -102,7 +112,7 @@ def load_fit_rows(
         """
     ).fetchall()
 
-    fit_rows: list[FitRow] = []
+    valid: list[tuple[dict, str, tuple, int]] = []
     for row in rows:
         record = dict(row) if not isinstance(row, dict) else row
         settled_at = _parse_ts(record.get("settled_at")) or _parse_ts(
@@ -121,12 +131,28 @@ def load_fit_rows(
             outcome = int(record["settled_in_bin"])
         except (KeyError, TypeError, ValueError):
             continue
+        claim_key = (
+            record.get("city"),
+            target_date.isoformat(),
+            record.get("temperature_metric"),
+            record.get("traded_bin_label"),
+            record.get("direction"),
+        )
+        valid.append((record, lead_bucket, claim_key, outcome))
+
+    claim_counts: dict[tuple, int] = {}
+    for _record, _lead_bucket, claim_key, _outcome in valid:
+        claim_counts[claim_key] = claim_counts.get(claim_key, 0) + 1
+
+    fit_rows: list[FitRow] = []
+    for record, lead_bucket, claim_key, outcome in valid:
         fit_rows.append(
             FitRow(
                 p0=record.get("market_in_bin_prob"),
                 q_raw=record.get("q_in_bin"),
                 lead_bucket=lead_bucket,
                 y=outcome,
+                w=1.0 / claim_counts[claim_key],
             )
         )
     return fit_rows
@@ -181,7 +207,10 @@ class MarketAnchoredFitProvider:
             rows = load_fit_rows(conn, training_cutoff=training_cutoff)
         except Exception:  # noqa: BLE001 - an unavailable fit must never block serving
             return None
-        if len(rows) < self._min_train_rows:
+        # Each row is weighted 1/(claim count), so the training-row floor is
+        # measured in claim-equivalent weight (sum(w)), not raw row count —
+        # a claim re-certified many times must not look like many claims.
+        if sum(row.w for row in rows) < self._min_train_rows:
             return None
         cutoff_iso = training_cutoff.isoformat().replace("+00:00", "Z")
         try:

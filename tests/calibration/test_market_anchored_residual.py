@@ -406,3 +406,52 @@ class TestRecovery:
         assert artifact.alpha["day0"] == pytest.approx(true_alpha["day0"], abs=0.15)
         assert artifact.alpha["day1"] == pytest.approx(true_alpha["day1"], abs=0.15)
         assert artifact.alpha["day2"] == pytest.approx(true_alpha["day2"], abs=0.15)
+
+
+# ---------------------------------------------------------------------------
+# claim-count weighting (Tier-0 fix: a re-certified claim must not double
+# count). FitRow.w defaults to 1.0 so every unweighted caller above this
+# section is unaffected by these additions.
+# ---------------------------------------------------------------------------
+
+
+class TestClaimWeighting:
+    def test_duplicated_row_with_reciprocal_weight_reproduces_single_row_fit(self):
+        """Duplicating one row k times with w=1/k must reproduce the unweighted
+        single-row fit to 1e-9 — the IRLS weighting must be exact, not
+        approximate, since a claim's k-fold re-certification carries zero new
+        information."""
+        rng = random.Random(41)
+        base_rows = []
+        for _ in range(200):
+            lead = rng.choice(list(LEAD_BUCKETS))
+            p0 = rng.uniform(0.05, 0.6)
+            q = rng.uniform(0.05, 0.6)
+            y = rng.randint(0, 1)
+            base_rows.append(FitRow(p0=p0, q_raw=q, lead_bucket=lead, y=y))
+
+        unweighted = fit(base_rows, lambda_=0.1, training_cutoff="2026-01-01T00:00:00Z")
+
+        k = 7
+        one_row = base_rows[0]
+        duplicated = base_rows[1:] + [
+            FitRow(
+                p0=one_row.p0,
+                q_raw=one_row.q_raw,
+                lead_bucket=one_row.lead_bucket,
+                y=one_row.y,
+                w=1.0 / k,
+            )
+            for _ in range(k)
+        ]
+        weighted = fit(duplicated, lambda_=0.1, training_cutoff="2026-01-01T00:00:00Z")
+
+        assert weighted.beta == pytest.approx(unweighted.beta, abs=1e-9)
+        for bucket in LEAD_BUCKETS:
+            assert weighted.alpha[bucket] == pytest.approx(
+                unweighted.alpha[bucket], abs=1e-9
+            )
+
+    def test_w_defaults_to_one_and_matches_unweighted_call(self):
+        rows = [FitRow(p0=0.3, q_raw=0.4, lead_bucket="day0", y=1)]
+        assert rows[0].w == 1.0

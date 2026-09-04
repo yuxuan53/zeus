@@ -47,7 +47,10 @@ def _memory_db(rows: list[dict]) -> sqlite3.Connection:
             decision_posterior_computed_at TEXT,
             target_date TEXT,
             settled_at TEXT,
-            graded_at TEXT
+            graded_at TEXT,
+            city TEXT,
+            temperature_metric TEXT,
+            traded_bin_label TEXT
         )
         """
     )
@@ -56,11 +59,11 @@ def _memory_db(rows: list[dict]) -> sqlite3.Connection:
         INSERT INTO settlement_attribution (
             attribution_id, q_in_bin, market_in_bin_prob, settled_in_bin,
             direction, decision_posterior_computed_at, target_date,
-            settled_at, graded_at
+            settled_at, graded_at, city, temperature_metric, traded_bin_label
         ) VALUES (
             :attribution_id, :q_in_bin, :market_in_bin_prob, :settled_in_bin,
             :direction, :decision_posterior_computed_at, :target_date,
-            :settled_at, :graded_at
+            :settled_at, :graded_at, :city, :temperature_metric, :traded_bin_label
         )
         """,
         rows,
@@ -69,8 +72,26 @@ def _memory_db(rows: list[dict]) -> sqlite3.Connection:
     return conn
 
 
-def _row(index: int, *, settled_at: datetime, lead_days: int = 1) -> dict:
-    decision_day = date(2026, 8, 1) + timedelta(days=index % 5)
+def _row(
+    index: int,
+    *,
+    settled_at: datetime,
+    lead_days: int = 1,
+    city: str | None = None,
+    claim_suffix: object = None,
+    claim_index: int | None = None,
+) -> dict:
+    """One settlement_attribution row. Each row is its own distinct claim by
+    default (``city`` keyed on ``index``), matching every pre-existing test's
+    assumption that N rows here means N independently-weighted claims. Tests
+    of claim-count weighting pass an explicit ``city``/``claim_suffix`` (so
+    rows collide on the claim key) AND ``claim_index`` (so re-certifications
+    of the same claim also share target_date, since a claim is fixed to one
+    (city, target_date, temperature_metric, traded_bin_label, direction) —
+    ``index`` alone still varies to keep attribution_id/outcome distinct.
+    """
+    decision_basis = index if claim_index is None else claim_index
+    decision_day = date(2026, 8, 1) + timedelta(days=decision_basis % 5)
     return {
         "attribution_id": f"row-{index}",
         "q_in_bin": 0.9,
@@ -83,6 +104,9 @@ def _row(index: int, *, settled_at: datetime, lead_days: int = 1) -> dict:
         "target_date": (decision_day + timedelta(days=lead_days)).isoformat(),
         "settled_at": settled_at.isoformat(),
         "graded_at": None,
+        "city": city if city is not None else f"city-{index}",
+        "temperature_metric": "high",
+        "traded_bin_label": f"bin-{claim_suffix if claim_suffix is not None else index}",
     }
 
 
@@ -383,3 +407,61 @@ def test_corrected_probability_rejects_an_unrecognized_side():
             target_date=date(2026, 8, 27),
             side="sell_no",
         )
+
+
+# ---------------------------------------------------------------------------
+# claim-count weighting: a claim (city, target_date, temperature_metric,
+# traded_bin_label, direction) that re-certifies many rows must not
+# contribute more than one row's worth of evidence to the fit.
+# ---------------------------------------------------------------------------
+
+
+def test_load_fit_rows_weights_by_reciprocal_claim_count():
+    when = NOW - timedelta(days=3)
+    # Claim A re-certified 4x (same city/target_date/temp/bin/direction);
+    # claim B is a singleton.
+    claim_a = [
+        _row(i, settled_at=when, city="Warsaw", claim_suffix="A", claim_index=0)
+        for i in range(4)
+    ]
+    claim_b = [
+        _row(4, settled_at=when, city="Austin", claim_suffix="B", claim_index=1)
+    ]
+    conn = _memory_db(claim_a + claim_b)
+
+    rows = load_fit_rows(conn, training_cutoff=NOW)
+
+    assert len(rows) == 5
+    a_weights = [r.w for r in rows[:4]]
+    b_weight = rows[4].w
+    assert all(w == pytest.approx(0.25) for w in a_weights)
+    assert b_weight == pytest.approx(1.0)
+    assert sum(r.w for r in rows) == pytest.approx(2.0)
+
+
+def test_duplicated_claim_window_refused_though_row_count_meets_floor():
+    """20 rows that are really 5 distinct claims re-certified 4x each must be
+    refused at min_train_rows=20 (sum(w) == 5), even though len(rows) == 20
+    would have passed under the old unweighted floor."""
+    when = NOW - timedelta(days=3)
+    rows_in = []
+    for claim_idx in range(5):
+        for cert in range(4):
+            rows_in.append(
+                _row(
+                    claim_idx * 4 + cert,
+                    settled_at=when,
+                    city=f"city-{claim_idx}",
+                    claim_suffix=claim_idx,
+                    claim_index=claim_idx,
+                )
+            )
+    conn = _memory_db(rows_in)
+
+    # Sanity: the row-count floor alone would have accepted this sample.
+    raw_rows = load_fit_rows(conn, training_cutoff=NOW)
+    assert len(raw_rows) == 20
+    assert sum(r.w for r in raw_rows) == pytest.approx(5.0)
+
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    assert provider.artifact(now=NOW) is None
