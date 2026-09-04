@@ -1466,28 +1466,18 @@ def test_production_actionable_payload_none_receipt_resolves_as_ordinary_entry(
     world.close()
 
 
-@pytest.mark.parametrize(
-    "missing_fields",
-    (
-        ("top", "nested"),
-        ("marker", "nested"),
-        ("marker", "top"),
-        ("marker",),
-        ("top",),
-        ("nested",),
-    ),
-)
-def test_partial_global_declaration_never_downgrades_to_ordinary(
-    tmp_path, missing_fields: tuple[str, ...],
-) -> None:
-    """Any global marker/reference presence requires all three exact fields."""
+def _resolve_partial_global_fixture(
+    tmp_path, missing_fields: tuple[str, ...], *, suffix: str,
+):
+    """Shared fixture builder for the marker/partial-declaration family below.
+    ``missing_fields`` may contain "marker", "top", "nested"."""
     from src.analysis.settlement_skill_attribution import (
         _resolve_decision_q_from_certificate,
     )
 
-    world = sqlite3.connect(tmp_path / "world.db")
+    world = sqlite3.connect(tmp_path / f"world-{suffix}.db")
     init_schema(world)
-    receipt_db = sqlite3.connect(tmp_path / "receipt.db")
+    receipt_db = sqlite3.connect(tmp_path / f"receipt-{suffix}.db")
     init_schema(receipt_db)
     receipt_ref = _seed_global_auction_receipt(receipt_db)
     payload_extra = _global_receipt_certificate_payload(receipt_ref)
@@ -1501,12 +1491,14 @@ def test_partial_global_declaration_never_downgrades_to_ordinary(
         payload_extra["qkernel_execution_economics"].pop(
             "global_auction_receipt", None
         )
-    certificate_hash = "p" * 64
+    certificate_hash = (suffix * 2)[:64].ljust(64, "0")
+    condition_id = f"condition-{suffix}"
+    token_id = f"token-{suffix}"
     _seed_belief_certificate(
         world,
         certificate_hash=certificate_hash,
-        condition_id="condition-partial-global",
-        token_id="token-partial-global",
+        condition_id=condition_id,
+        token_id=token_id,
         q_live=0.80,
         q_lcb_5pct=0.70,
         payload_extra=payload_extra,
@@ -1514,20 +1506,153 @@ def test_partial_global_declaration_never_downgrades_to_ordinary(
     world.commit()
     receipt_db.commit()
     resolved = _resolve_decision_q_from_certificate(
-        world,
-        certificate_hash,
-        condition_id="condition-partial-global",
-        direction="buy_no",
-        held_token_id="token-partial-global",
+        world, certificate_hash, condition_id=condition_id,
+        direction="buy_no", held_token_id=token_id,
     )
-    # 2026-09-03 fix: a partial global declaration is a receipt-closure AUDIT
-    # defect, never a reason to discard an identity/hash-verified certificate's
-    # q_live — the certificate still resolves, flagged for audit.
+    world.close()
+    receipt_db.close()
+    return resolved
+
+
+def test_marker_alone_is_not_a_global_declaration(tmp_path) -> None:
+    """2026-09-03 forensic pass: global_actuation_identity is an EXECUTION
+    identity stamped on every LIVE fill (non-empty on 100% of live VERIFIED
+    certificates) — it is NOT a "went through the global auction" signal. A
+    certificate with the marker but NEITHER receipt reference is an ordinary
+    entry (receipt_closure="not_global"), never "partial_declaration"."""
+    resolved = _resolve_partial_global_fixture(
+        tmp_path, ("top", "nested"), suffix="markeronly",
+    )
+    assert resolved is not None
+    assert resolved["q_live"] == pytest.approx(0.80)
+    assert resolved["receipt_closure"] == "not_global"
+
+
+@pytest.mark.parametrize(
+    "missing_fields",
+    (
+        ("marker", "nested"),
+        ("marker", "top"),
+        ("top",),
+        ("nested",),
+    ),
+)
+def test_partial_global_declaration_never_downgrades_to_ordinary(
+    tmp_path, missing_fields: tuple[str, ...],
+) -> None:
+    """A genuinely asymmetric declaration — one of the top-level/nested
+    global_auction_receipt references present without the other — is a
+    receipt-closure AUDIT defect (2026-09-03 fix), never a reason to discard
+    an identity/hash-verified certificate's q_live: the certificate still
+    resolves, flagged "partial_declaration" for audit."""
+    resolved = _resolve_partial_global_fixture(
+        tmp_path, missing_fields, suffix="".join(missing_fields) or "none",
+    )
     assert resolved is not None
     assert resolved["q_live"] == pytest.approx(0.80)
     assert resolved["receipt_closure"] == "partial_declaration"
+
+
+def test_missing_marker_on_declared_receipt_is_artifact_mismatch(tmp_path) -> None:
+    """Both receipt references present (a genuine global declaration) but the
+    marker is absent: the actuation-identity match against the receipt fails
+    — a REAL red flag, distinct from a routine decision_log retention prune.
+    q_live still resolves; the defect is recorded as "artifact_mismatch"."""
+    resolved = _resolve_partial_global_fixture(
+        tmp_path, ("marker",), suffix="nomarker",
+    )
+    assert resolved is not None
+    assert resolved["q_live"] == pytest.approx(0.80)
+    assert resolved["receipt_closure"] == "artifact_mismatch"
+
+
+def _resolve_fully_declared_receipt_fixture(tmp_path, *, suffix: str, mutate):
+    """Seed a certificate with a COMPLETE, symmetric global declaration
+    resolvable against a real trades.decision_log row, apply ``mutate`` to
+    the trades connection before commit, then resolve directly. Shared by the
+    decision_log_row_missing / artifact_mismatch distinct-state tests below."""
+    from src.analysis.settlement_skill_attribution import (
+        _resolve_decision_q_from_certificate,
+    )
+
+    world = sqlite3.connect(tmp_path / f"world-{suffix}.db")
+    init_schema(world)
+    trades_path = tmp_path / f"trades-{suffix}.db"
+    trades = sqlite3.connect(trades_path)
+    init_schema(trades)
+    receipt_ref = _seed_global_auction_receipt(trades)
+    certificate_hash = (suffix * 3)[:64].ljust(64, "1")
+    condition_id = f"condition-{suffix}"
+    token_id = f"token-{suffix}"
+    _seed_belief_certificate(
+        world,
+        certificate_hash=certificate_hash,
+        condition_id=condition_id,
+        token_id=token_id,
+        q_live=0.80,
+        q_lcb_5pct=0.70,
+        payload_extra=_global_receipt_certificate_payload(receipt_ref),
+    )
+    mutate(trades, receipt_ref)
+    world.commit()
+    trades.commit()
+    trades.close()
+    world.execute("ATTACH DATABASE ? AS trades", (str(trades_path),))
+    resolved = _resolve_decision_q_from_certificate(
+        world, certificate_hash, condition_id=condition_id,
+        direction="buy_no", held_token_id=token_id,
+    )
     world.close()
-    receipt_db.close()
+    return resolved
+
+
+def test_decision_log_row_missing_is_a_distinct_closure_state(tmp_path) -> None:
+    """A fully-declared, otherwise-valid receipt whose trades.decision_log row
+    was pruned (30-day retention migration) is "decision_log_row_missing" —
+    ROUTINE and expected, distinct from a genuine content mismatch. q_live
+    still resolves."""
+
+    def _delete_row(trades, receipt_ref):
+        trades.execute(
+            "DELETE FROM decision_log WHERE id = ?",
+            (receipt_ref.decision_log_id,),
+        )
+
+    resolved = _resolve_fully_declared_receipt_fixture(
+        tmp_path, suffix="rowmissing", mutate=_delete_row,
+    )
+    assert resolved is not None
+    assert resolved["q_live"] == pytest.approx(0.80)
+    assert resolved["receipt_closure"] == "decision_log_row_missing"
+
+
+def test_artifact_mismatch_is_a_distinct_closure_state_from_missing_row(
+    tmp_path,
+) -> None:
+    """A fully-declared receipt whose trades.decision_log row EXISTS but whose
+    artifact content disagrees with the receipt reference is
+    "artifact_mismatch" — a REAL red flag, never conflated with the routine
+    "decision_log_row_missing" prune above. q_live still resolves."""
+
+    def _mutate_artifact(trades, receipt_ref):
+        row = trades.execute(
+            "SELECT artifact_json FROM decision_log WHERE id = ?",
+            (receipt_ref.decision_log_id,),
+        ).fetchone()
+        artifact = json.loads(row[0])
+        artifact["summary"]["winner_candidate_id"] = "mutated-candidate"
+        trades.execute(
+            "UPDATE decision_log SET artifact_json = ? WHERE id = ?",
+            (json.dumps(artifact), receipt_ref.decision_log_id),
+        )
+
+    resolved = _resolve_fully_declared_receipt_fixture(
+        tmp_path, suffix="artifactmismatch", mutate=_mutate_artifact,
+    )
+    assert resolved is not None
+    assert resolved["q_live"] == pytest.approx(0.80)
+    assert resolved["receipt_closure"] == "artifact_mismatch"
+    assert resolved["receipt_closure"] != "decision_log_row_missing"
 
 
 @pytest.mark.parametrize("wrong_field", ("condition_id", "direction", "token_id"))
@@ -2796,11 +2921,12 @@ def test_bugA_one_unattributable_tranche_makes_whole_position_unattributable(
 def test_bugA_one_tranche_cert_with_partial_declaration_still_aggregates(
     tmp_path,
 ) -> None:
-    """(e) One tranche's certificate carries a partial global declaration
-    (untouched by the Bug B identity/hash checks, which still pass) -> that
-    tranche's q still resolves (2026-09-03 fix: receipt closure is an audit
-    signal, not a q gate) -> the position aggregates successfully across both
-    tranches and the aggregated receipt_closure surfaces the defect."""
+    """(e) One tranche's certificate carries a partial global declaration —
+    a genuine top-level/nested asymmetry (untouched by the Bug B identity/
+    hash checks, which still pass) -> that tranche's q still resolves
+    (2026-09-03 fix: receipt closure is an audit signal, not a q gate) -> the
+    position aggregates successfully across both tranches and the aggregated
+    receipt_closure surfaces the defect."""
     from src.analysis.settlement_skill_attribution import (
         _resolve_aggregated_decision_q_for_position,
     )
@@ -2821,14 +2947,15 @@ def test_bugA_one_tranche_cert_with_partial_declaration_still_aggregates(
         trades, command_id="cmd-partial", position_id="pos-badcert",
         token_id="tok-badcert", size=50.0,
     )
-    # Partial global declaration: marker present, both receipt references absent.
+    # Partial global declaration: a top-level receipt reference declared with
+    # NO nested qkernel_execution_economics.global_auction_receipt at all — a
+    # genuine top/nested asymmetry (not the marker, which is never part of
+    # the declaration signal — 2026-09-03 forensic pass).
     _seed_belief_certificate(
         world, certificate_hash="9" * 64, condition_id="cond-badcert",
         token_id="tok-badcert", direction="buy_no", q_live=0.5, q_lcb_5pct=0.4,
         payload_extra={
-            "qkernel_execution_economics": {
-                "global_actuation_identity": "dangling-marker",
-            },
+            "global_auction_receipt": {"dangling": "receipt"},
         },
     )
     world.commit(); trades.commit(); trades.close()

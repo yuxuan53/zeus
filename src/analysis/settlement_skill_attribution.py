@@ -96,9 +96,12 @@ provenance additionally ATTEMPTS to close through the exact schema21 global
 receipt (trades.decision_log); the outcome of that attempt is recorded
 alongside the q as ``receipt_closure`` (one of "not_global" — no global
 declaration, nothing to close; "closed" — receipt verified end-to-end;
-"partial_declaration" — marker/receipt references incomplete;
-"trades_not_attached"; "decision_log_row_missing" — the referenced row was
-removed by retention; "artifact_mismatch" — receipt shape/content disagrees)
+"partial_declaration" — one of the top-level/nested receipt references is
+present without the other; "trades_not_attached"; "decision_log_row_missing"
+— the referenced row was removed by retention (routine, expected under the
+30-day retention migration); "artifact_mismatch" — a declared receipt's
+content disagrees with the decision_log artifact (a real red flag, distinct
+from a routine retention prune))
 but a non-"closed" status is an AUDIT finding, never a reason to discard an
 otherwise-VERIFIED certificate's q_live. An ordinary exact ENTRY certificate
 (no global declaration) has no trades attachment or decision-log requirement
@@ -1054,16 +1057,35 @@ def _resolve_decision_q_from_certificate(
     migration, or a partial global declaration on a pre-2026-08-09 certificate,
     used to erase an otherwise-VERIFIED certificate's q_live wholesale — see
     the module docstring). ``receipt_closure`` is one of:
-      "not_global"             no global-auction fields declared; nothing to close.
+      "not_global"             no top-level or nested global_auction_receipt
+                                declared; nothing to close. ``global_marker``
+                                (qkernel_execution_economics
+                                .global_actuation_identity) is an EXECUTION
+                                identity stamped on every LIVE fill (verified
+                                non-empty on 100% of live VERIFIED
+                                certificates) — NOT a "went through the global
+                                auction" declaration, and is therefore never
+                                consulted when deciding whether a global
+                                auction was declared, only later when
+                                MATCHING a genuinely declared receipt.
       "closed"                 receipt verified end-to-end against decision_log.
-      "partial_declaration"    marker/top/nested receipt references incomplete.
+      "partial_declaration"    the top-level and nested global_auction_receipt
+                                references disagree on presence (one declared,
+                                the other absent) — a genuinely inconsistent
+                                certificate, not an ordinary entry.
       "trades_not_attached"    the `trades` schema is not ATTACHed on world_conn.
-      "decision_log_row_missing"  the referenced trades.decision_log id is gone.
-      "artifact_mismatch"      receipt payload malformed or content disagrees
-                                with the decision_log artifact.
-    With all three global fields absent, an ordinary exact ENTRY certificate
-    uses its already-verified q fields directly and never requires a trades
-    attachment (receipt_closure="not_global").
+      "decision_log_row_missing"  the referenced trades.decision_log id is gone
+                                — routine, expected under the 30-day retention
+                                migration (scripts/migrations/
+                                202608_decision_log_retention.py).
+      "artifact_mismatch"      a declared, symmetric receipt fails to match
+                                its own referenced decision_log artifact (bad
+                                actuation identity, mutated/corrupted content,
+                                or a malformed receipt payload) — a REAL red
+                                flag, distinct from the routine prune above.
+    With no global_auction_receipt declared at all, an ordinary exact ENTRY
+    certificate uses its already-verified q fields directly and never
+    requires a trades attachment (receipt_closure="not_global").
 
     Returns None when the hash is empty, the cert is absent, the cert is not
     VERIFIED, the payload is unparseable, identity/payload_hash fail to verify,
@@ -1144,6 +1166,13 @@ def _resolve_decision_q_from_certificate(
 
     # --- receipt closure: audit-integrity signal, NEVER gates q availability ---
     economics = payload.get("qkernel_execution_economics")
+    # global_actuation_identity is an EXECUTION identity stamped on every LIVE
+    # fill (non-empty on 100% of live VERIFIED ActionableTradeCertificates,
+    # 2026-09-03 forensic pass) — it is NOT a "this went through the global
+    # auction" declaration, and must never gate global_declared. The actual
+    # declaration is the global_auction_receipt reference (top-level and/or
+    # nested); the marker is only consulted later, to MATCH a receipt that IS
+    # genuinely declared.
     global_marker = (
         str(economics.get("global_actuation_identity") or "").strip()
         if isinstance(economics, dict)
@@ -1158,15 +1187,15 @@ def _resolve_decision_q_from_certificate(
         isinstance(economics, dict)
         and economics.get("global_auction_receipt") not in (None, "")
     )
-    global_declared = bool(global_marker) or top_receipt_declared or nested_receipt_declared
+    global_declared = top_receipt_declared or nested_receipt_declared
 
     receipt_closure = "not_global"
     if global_declared:
-        # A partial declaration is never ordinary: deleting one marker/reference
-        # is a closure defect, not a downgrade into an attachment-free path.
+        # A partial declaration is the genuinely inconsistent case: one of
+        # the two receipt references present without the other. This is a
+        # closure defect, never a downgrade into an attachment-free path.
         if (
             not isinstance(economics, dict)
-            or not global_marker
             or not top_receipt_declared
             or not nested_receipt_declared
         ):
