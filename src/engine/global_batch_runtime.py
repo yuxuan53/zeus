@@ -6200,6 +6200,7 @@ def _market_anchored_correction_resolver(
             q_raw=raw_q,
             decision_date=decision_at_utc.astimezone(timezone.utc).date(),
             target_date=target_date,
+            side=str(candidate.side),
         )
         if applied is None:
             return None

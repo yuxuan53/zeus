@@ -190,6 +190,22 @@ class MarketAnchoredFitProvider:
             return None
 
 
+# side vocabulary accepted by corrected_probability. Both the candidate.side
+# ("YES"/"NO") and direction ("buy_yes"/"buy_no") spellings are in live use
+# across the codebase, so both are recognized; anything else raises rather
+# than silently defaulting to buy_yes.
+_YES_SIDE_VALUES = frozenset({"YES", "buy_yes"})
+_NO_SIDE_VALUES = frozenset({"NO", "buy_no"})
+
+
+def _is_no_side(side: str) -> bool:
+    if side in _NO_SIDE_VALUES:
+        return True
+    if side in _YES_SIDE_VALUES:
+        return False
+    raise ValueError(f"corrected_probability: unrecognized side {side!r}")
+
+
 def corrected_probability(
     artifact: ResidualCalibratorArtifact | None,
     *,
@@ -197,13 +213,26 @@ def corrected_probability(
     q_raw: float,
     decision_date: date,
     target_date: date,
+    side: str,
 ) -> tuple[float, str, float] | None:
     """Apply ``artifact`` to one candidate, or None when it cannot be applied.
 
-    Returns ``(corrected_q, lead_bucket, alpha_lead)``. None means every
-    fail-open case at once — no artifact, an unmodeled lead, a non-finite
-    input — because each has the identical consequence for the caller: keep
-    the raw q.
+    The artifact is fit in in-bin (YES-event) space: p0 and q_raw there are
+    ``market_in_bin_prob``/``q_in_bin``, i.e. probabilities of the YES event.
+    ``p0``/``q_raw`` passed in here are in HELD-TOKEN space instead (the price
+    and payoff probability of whichever token the candidate holds). For a
+    buy_no candidate, held-token space is the in-bin space's complement
+    (q_NO = 1 - q_in, p_NO = 1 - p_in), so this complements both inputs into
+    in-bin space, applies the unchanged artifact, and complements the result
+    back: ``1 - apply_artifact(artifact, 1 - p0, 1 - q_raw, lead_bucket)``.
+    buy_yes needs no transform since held-token space already is in-bin space.
+
+    Returns ``(corrected_q, lead_bucket, alpha_lead)`` where ``alpha_lead`` is
+    the EFFECTIVE signed intercept applied in held-token space (the fitted
+    alpha for buy_yes, its negation for buy_no), so certificates record what
+    was actually applied. None means every fail-open case at once — no
+    artifact, an unmodeled lead, a non-finite input — because each has the
+    identical consequence for the caller: keep the raw q.
     """
 
     if artifact is None:
@@ -211,7 +240,17 @@ def corrected_probability(
     lead_bucket = lead_bucket_of(decision_date, target_date)
     if lead_bucket is None:
         return None
-    corrected = apply_artifact(artifact, p0, q_raw, lead_bucket)
-    if corrected is None:
-        return None
-    return corrected, lead_bucket, float(artifact.alpha[lead_bucket])
+    is_no = _is_no_side(side)
+    if is_no:
+        corrected = apply_artifact(artifact, 1.0 - p0, 1.0 - q_raw, lead_bucket)
+        if corrected is None:
+            return None
+        corrected = 1.0 - corrected
+    else:
+        corrected = apply_artifact(artifact, p0, q_raw, lead_bucket)
+        if corrected is None:
+            return None
+    alpha_lead = float(artifact.alpha[lead_bucket])
+    if is_no:
+        alpha_lead = -alpha_lead
+    return corrected, lead_bucket, alpha_lead

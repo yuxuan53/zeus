@@ -22,6 +22,13 @@ from src.calibration.market_anchored_live_fit import (
     corrected_probability,
     load_fit_rows,
 )
+from src.calibration.market_anchored_residual import (
+    CLIP_D,
+    LEAD_BUCKETS,
+    P_CLIP_HI,
+    P_CLIP_LO,
+    ResidualCalibratorArtifact,
+)
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
 
@@ -208,6 +215,7 @@ def test_corrected_probability_shrinks_an_overconfident_q_toward_the_market():
         q_raw=0.9,
         decision_date=date(2026, 8, 26),
         target_date=date(2026, 8, 27),
+        side="YES",
     )
 
     assert applied is not None
@@ -227,6 +235,7 @@ def test_corrected_probability_fails_closed_without_an_artifact():
             q_raw=0.9,
             decision_date=date(2026, 8, 26),
             target_date=date(2026, 8, 27),
+            side="YES",
         )
         is None
     )
@@ -245,6 +254,7 @@ def test_corrected_probability_fails_closed_on_unmodeled_lead():
             q_raw=0.9,
             decision_date=date(2026, 8, 20),
             target_date=date(2026, 8, 27),
+            side="YES",
         )
         is None
     )
@@ -264,6 +274,112 @@ def test_corrected_probability_fails_closed_on_non_finite_inputs(bad):
             q_raw=0.9,
             decision_date=date(2026, 8, 26),
             target_date=date(2026, 8, 27),
+            side="YES",
         )
         is None
     )
+
+
+def _synthetic_artifact(*, alpha_day1: float, beta: float) -> ResidualCalibratorArtifact:
+    alpha = {bucket: (alpha_day1 if bucket == "day1" else 0.0) for bucket in LEAD_BUCKETS}
+    return ResidualCalibratorArtifact(
+        alpha=alpha,
+        beta=beta,
+        lambda_=10.0,
+        clip_d=CLIP_D,
+        p_clip=(P_CLIP_LO, P_CLIP_HI),
+        lead_buckets=LEAD_BUCKETS,
+        training_cutoff="2026-08-27T00:00:00Z",
+        n_train=100,
+        n_excluded=0,
+        excluded_reasons={},
+        param_hash="synthetic",
+    )
+
+
+def test_corrected_probability_buy_no_is_the_exact_complement_of_buy_yes():
+    """buy_no must be algebra-exact against buy_yes in the complemented space.
+
+    q_NO = 1 - q_in and p_NO = 1 - p_in, so applying the (unchanged) in-bin
+    artifact to the complemented inputs and complementing back must equal the
+    exact complement of the buy_yes result — to floating-point precision, not
+    just approximately.
+    """
+    artifact = _synthetic_artifact(alpha_day1=0.41, beta=0.08)
+    decision_date = date(2026, 8, 26)
+    target_date = date(2026, 8, 27)
+    p0 = 0.3
+    q_raw = 0.6
+
+    yes_applied = corrected_probability(
+        artifact,
+        p0=p0,
+        q_raw=q_raw,
+        decision_date=decision_date,
+        target_date=target_date,
+        side="YES",
+    )
+    no_applied = corrected_probability(
+        artifact,
+        p0=1.0 - p0,
+        q_raw=1.0 - q_raw,
+        decision_date=decision_date,
+        target_date=target_date,
+        side="NO",
+    )
+
+    assert yes_applied is not None
+    assert no_applied is not None
+    yes_corrected, yes_lead, yes_alpha = yes_applied
+    no_corrected, no_lead, no_alpha = no_applied
+    assert no_corrected == pytest.approx(1.0 - yes_corrected, abs=1e-12)
+    assert no_lead == yes_lead == "day1"
+    assert no_alpha == pytest.approx(-yes_alpha, abs=1e-12)
+
+
+def test_corrected_probability_alpha_sign_flips_for_buy_no():
+    """With beta=0, a positive alpha must pull buy_yes up and buy_no down.
+
+    beta=0 isolates the alpha term: apply_artifact degrades to
+    sigmoid(logit(p0) + alpha), so a positive day1 alpha strictly increases
+    the corrected probability for buy_yes and strictly decreases it for
+    buy_no at the same market price.
+    """
+    artifact = _synthetic_artifact(alpha_day1=0.41, beta=0.0)
+    decision_date = date(2026, 8, 26)
+    target_date = date(2026, 8, 27)
+    p0 = 0.3
+
+    yes_corrected, _, _ = corrected_probability(
+        artifact,
+        p0=p0,
+        q_raw=p0,
+        decision_date=decision_date,
+        target_date=target_date,
+        side="buy_yes",
+    )
+    no_corrected, _, _ = corrected_probability(
+        artifact,
+        p0=p0,
+        q_raw=p0,
+        decision_date=decision_date,
+        target_date=target_date,
+        side="buy_no",
+    )
+
+    assert yes_corrected > p0
+    assert no_corrected < p0
+
+
+def test_corrected_probability_rejects_an_unrecognized_side():
+    artifact = _synthetic_artifact(alpha_day1=0.41, beta=0.08)
+
+    with pytest.raises(ValueError, match="unrecognized side"):
+        corrected_probability(
+            artifact,
+            p0=0.3,
+            q_raw=0.6,
+            decision_date=date(2026, 8, 26),
+            target_date=date(2026, 8, 27),
+            side="sell_no",
+        )
