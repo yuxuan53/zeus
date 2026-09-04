@@ -1,13 +1,22 @@
 # Created: 2026-06-12
-# Last audited: 2026-08-09
+# Last audited: 2026-09-03
 # Authority basis: immutable decision-q certificate authority for settlement skill
 #   attribution (lifecycle-alpha) — the grader resolves q_live/q_lcb_5pct from the
 #   immutable ActionableTradeCertificate (decision_certificates, LIVE/VERIFIED)
-#   reached via the exact ENTRY position_decision_attribution row. Global-auction
-#   certificates additionally close through their schema21 receipt; ordinary
-#   exact ENTRY certificates do not require a trades attachment. A position whose
-#   decision-q certificate is
-#   unresolvable grades UNATTRIBUTABLE_Q_MISSING and is never SKILL/LUCK.
+#   reached via the exact ENTRY position_decision_attribution row, once identity
+#   (condition_id/direction/token_id) and payload_hash verify. A position whose
+#   decision-q certificate is unresolvable (absent/unverified/identity mismatch/
+#   hash mismatch/no q_live) grades UNATTRIBUTABLE_Q_MISSING and is never
+#   SKILL/LUCK. Global-auction certificates additionally attempt to close
+#   through their schema21 receipt (trades.decision_log); receipt closure is an
+#   AUDIT-INTEGRITY signal recorded as ``receipt_closure`` on the resolved q, not
+#   a q-availability gate — a partial declaration or a receipt whose
+#   decision_log row was removed by the 30-day retention migration
+#   (scripts/migrations/202608_decision_log_retention.py) no longer erases an
+#   otherwise-VERIFIED certificate's q (2026-09-03 fix; previously 379/1114
+#   settled positions since 06-09 were wrongly UNATTRIBUTABLE_Q_MISSING purely
+#   on receipt-closure grounds, halving the market-anchored admission
+#   calibrator's training set).
 # Prior authority basis:
 #   - Operator skill-vs-luck law 2026-06-12 (verbatim): "wu预测92不是结算在92就算赢了
 #     说明这是一单完全运气获胜跟我们的系统无关 甚至会假装我们的系统正常因为'盈利了'
@@ -61,24 +70,41 @@ THE SIX CATEGORIES
                      posterior_id), never against settlement-eve data — see
                      _fresher_cycle_existed_at_decision.
   UNATTRIBUTABLE_Q_MISSING
-                     the immutable decision-q certificate is unresolvable, so the
-                     system's ACTUAL decision-time q is unknown. Without it the
-                     outcome cannot be attributed to skill or luck — the position
-                     is NEVER graded SKILL_WIN/LUCKY_WIN and is excluded from the
-                     skill denominator (never silently time-reconstructed as the
-                     skill authority).
+                     the immutable decision-q certificate is unresolvable — absent,
+                     not VERIFIED, identity mismatch, payload_hash mismatch, or no
+                     q_live in the payload — so the system's ACTUAL decision-time
+                     q is unknown. Without it the outcome cannot be attributed to
+                     skill or luck — the position is NEVER graded SKILL_WIN/
+                     LUCKY_WIN and is excluded from the skill denominator (never
+                     silently time-reconstructed as the skill authority). A
+                     global-auction certificate whose receipt closure is
+                     incomplete (partial declaration / missing decision_log row /
+                     artifact mismatch) is NOT unattributable on that basis alone
+                     — q_live from an identity- and hash-verified certificate is
+                     still authoritative; the closure defect is recorded as
+                     ``receipt_closure`` for audit, not folded into this gate.
 
 THE DECISION-Q AUTHORITY (provenance, 2026-06-21)
 -------------------------------------------------
 The skill authority is the IMMUTABLE decision-time q the system committed at
 entry, carried in the exact ENTRY position_decision_attribution link to an
 ActionableTradeCertificate (decision_certificates, LIVE/VERIFIED). q_live +
-q_lcb_5pct live directly in that cert's payload_json. A certificate that
-declares global-auction provenance is additionally closed through the exact
-schema21 global receipt; an ordinary exact ENTRY certificate has no trades
-attachment or decision-log requirement. The time-reconstructed posterior (the latest
-forecast_posteriors cycle at/<= decision_time) is a DEBUG aid ONLY — it is NOT
-the skill authority and never grades a position SKILL/LUCK on its own.
+q_lcb_5pct live directly in that cert's payload_json and are extracted once
+identity (condition_id/direction/token_id) and payload_hash verify — this is
+the ONLY q-availability gate. A certificate that declares global-auction
+provenance additionally ATTEMPTS to close through the exact schema21 global
+receipt (trades.decision_log); the outcome of that attempt is recorded
+alongside the q as ``receipt_closure`` (one of "not_global" — no global
+declaration, nothing to close; "closed" — receipt verified end-to-end;
+"partial_declaration" — marker/receipt references incomplete;
+"trades_not_attached"; "decision_log_row_missing" — the referenced row was
+removed by retention; "artifact_mismatch" — receipt shape/content disagrees)
+but a non-"closed" status is an AUDIT finding, never a reason to discard an
+otherwise-VERIFIED certificate's q_live. An ordinary exact ENTRY certificate
+(no global declaration) has no trades attachment or decision-log requirement
+at all. The time-reconstructed posterior (the latest forecast_posteriors cycle
+at/<= decision_time) is a DEBUG aid ONLY — it is NOT the skill authority and
+never grades a position SKILL/LUCK on its own.
 
 The skill win-rate that matters:
     SKILL_WIN / (SKILL_WIN + LUCKY_WIN + SKILL_LOSS + MISCALIBRATED_LOSS)
@@ -850,7 +876,10 @@ def _resolve_aggregated_decision_q_for_position(
     hash AND every one of those hashes resolves a valid certificate q via
     _resolve_decision_q_from_certificate. One broken, UNATTRIBUTABLE, or
     unresolvable tranche makes the WHOLE position UNATTRIBUTABLE_Q_MISSING —
-    partial attribution is never partial credit.
+    partial attribution is never partial credit. A tranche's receipt_closure
+    defect (see _resolve_decision_q_from_certificate) is NOT one of these
+    failure modes — that certificate still resolves a q and only contributes
+    its closure status to the aggregated ``receipt_closure`` below.
 
     q_live / q_lcb_5pct are the FILL-SIZE-WEIGHTED average across tranches
     (trades.venue_commands.size by command_id). When any tranche's size is
@@ -858,6 +887,13 @@ def _resolve_aggregated_decision_q_for_position(
     (equal_weight_fallback=True in the result) rather than silently present a
     partial weighting as size-weighted. q_lcb_5pct is aggregated the same way
     when every tranche carries one, else left None.
+
+    receipt_closure aggregates every tranche's status: "closed" when every
+    tranche is "closed" or "not_global"; "not_global" when every tranche is
+    "not_global"; otherwise the "+"-joined sorted set of the non-"closed",
+    non-"not_global" statuses present (e.g. "decision_log_row_missing" or
+    "artifact_mismatch+partial_declaration") — visible to the caller for the
+    audit note, never fed back into attributability.
 
     A single-tranche position (the common case, and every position before this
     fix) resolves byte-identically to the pre-fix single-hash path: one row, one
@@ -877,7 +913,7 @@ def _resolve_aggregated_decision_q_for_position(
     if not cid or not dirn or not token:
         return None
 
-    tranches: list[tuple[float, Optional[float], Optional[str], Optional[float]]] = []
+    tranches: list[tuple[float, Optional[float], Optional[str], Optional[float], str]] = []
     for resolution, cert_hash, command_id in rows:
         if resolution != "ATTRIBUTED":
             return None
@@ -891,34 +927,50 @@ def _resolve_aggregated_decision_q_for_position(
             return None
         size = _tranche_fill_size(world_conn, command_id)
         tranches.append(
-            (cert_q["q_live"], cert_q["q_lcb_5pct"], cert_q["consumed_posterior_id"], size)
+            (
+                cert_q["q_live"],
+                cert_q["q_lcb_5pct"],
+                cert_q["consumed_posterior_id"],
+                size,
+                cert_q["receipt_closure"],
+            )
         )
 
+    closures = [c for _, _, _, _, c in tranches]
+    bad_closures = sorted({c for c in closures if c not in ("closed", "not_global")})
+    if bad_closures:
+        receipt_closure = "+".join(bad_closures)
+    elif "closed" in closures:
+        receipt_closure = "closed"
+    else:
+        receipt_closure = "not_global"
+
     if len(tranches) == 1:
-        q_live, q_lcb, consumed_posterior_id, _size = tranches[0]
+        q_live, q_lcb, consumed_posterior_id, _size, _closure = tranches[0]
         return {
             "q_live": q_live,
             "q_lcb_5pct": q_lcb,
             "consumed_posterior_id": consumed_posterior_id,
             "tranche_count": 1,
             "equal_weight_fallback": False,
+            "receipt_closure": receipt_closure,
         }
 
-    equal_weight_fallback = any(size is None for _, _, _, size in tranches)
+    equal_weight_fallback = any(size is None for _, _, _, size, _ in tranches)
     weights = (
         [1.0] * len(tranches)
         if equal_weight_fallback
-        else [size for _, _, _, size in tranches]
+        else [size for _, _, _, size, _ in tranches]
     )
     total_weight = sum(weights)
     if total_weight <= 0.0:
         return None
     q_live_agg = sum(
-        q * w for (q, _, _, _), w in zip(tranches, weights)
+        q * w for (q, _, _, _, _), w in zip(tranches, weights)
     ) / total_weight
-    if all(qlcb is not None for _, qlcb, _, _ in tranches):
+    if all(qlcb is not None for _, qlcb, _, _, _ in tranches):
         q_lcb_agg = sum(
-            qlcb * w for (_, qlcb, _, _), w in zip(tranches, weights)
+            qlcb * w for (_, qlcb, _, _, _), w in zip(tranches, weights)
         ) / total_weight
     else:
         q_lcb_agg = None
@@ -930,6 +982,7 @@ def _resolve_aggregated_decision_q_for_position(
         "consumed_posterior_id": None,
         "tranche_count": len(tranches),
         "equal_weight_fallback": equal_weight_fallback,
+        "receipt_closure": receipt_closure,
     }
 
 
@@ -988,16 +1041,34 @@ def _resolve_decision_q_from_certificate(
 
     Reads the unique LIVE/VERIFIED ActionableTradeCertificate from
     ``decision_certificates`` by the exact ENTRY attribution hash and validates
-    its canonical payload hash and exact position identity. Certificates with
-    any global-auction declaration must carry the complete, internally
-    consistent marker plus top-level and nested receipt references, then close
-    through the exact schema21 artifact in ``trades.decision_log``. With all
-    three global fields absent, an ordinary exact ENTRY certificate uses its
-    already-verified q fields directly and never requires a trades attachment.
+    its canonical payload hash and exact position identity. These identity and
+    hash checks, plus a non-null in-range ``q_live`` in the payload, are the
+    ONLY conditions that make q unresolvable (UNATTRIBUTABLE_Q_MISSING at the
+    caller).
+
+    Certificates with any global-auction declaration additionally ATTEMPT to
+    close through the exact schema21 artifact in ``trades.decision_log``. The
+    outcome of that attempt is returned as ``receipt_closure`` — an
+    AUDIT-INTEGRITY signal, never a q-availability gate (2026-09-03 fix: a
+    receipt whose decision_log row was pruned by the 30-day retention
+    migration, or a partial global declaration on a pre-2026-08-09 certificate,
+    used to erase an otherwise-VERIFIED certificate's q_live wholesale — see
+    the module docstring). ``receipt_closure`` is one of:
+      "not_global"             no global-auction fields declared; nothing to close.
+      "closed"                 receipt verified end-to-end against decision_log.
+      "partial_declaration"    marker/top/nested receipt references incomplete.
+      "trades_not_attached"    the `trades` schema is not ATTACHed on world_conn.
+      "decision_log_row_missing"  the referenced trades.decision_log id is gone.
+      "artifact_mismatch"      receipt payload malformed or content disagrees
+                                with the decision_log artifact.
+    With all three global fields absent, an ordinary exact ENTRY certificate
+    uses its already-verified q fields directly and never requires a trades
+    attachment (receipt_closure="not_global").
 
     Returns None when the hash is empty, the cert is absent, the cert is not
-    VERIFIED, the payload is unparseable, or it carries no q_live (the position
-    is then UNATTRIBUTABLE — never time-reconstructed as the skill authority).
+    VERIFIED, the payload is unparseable, identity/payload_hash fail to verify,
+    or the payload carries no valid q_live (the position is then
+    UNATTRIBUTABLE — never time-reconstructed as the skill authority).
     Reuses the grader's existing world_conn (INV-37: no new DB connection).
     """
     h = str(certificate_hash or "").strip()
@@ -1044,78 +1115,8 @@ def _resolve_decision_q_from_certificate(
             return None
     except (TypeError, ValueError):
         return None
-    economics = payload.get("qkernel_execution_economics")
-    global_marker = (
-        str(economics.get("global_actuation_identity") or "").strip()
-        if isinstance(economics, dict)
-        else ""
-    )
-    # The production actionable payload keeps the top-level key present with
-    # ``None`` for ordinary entries.  Presence alone is therefore not a global
-    # declaration; any non-empty reference still is, including a malformed
-    # non-empty object that must fail closed below.
-    top_receipt_declared = payload.get("global_auction_receipt") not in (None, "")
-    nested_receipt_declared = (
-        isinstance(economics, dict)
-        and economics.get("global_auction_receipt") not in (None, "")
-    )
-    global_declared = bool(global_marker) or top_receipt_declared or nested_receipt_declared
-    if global_declared:
-        # A partial declaration is never ordinary: deleting one marker/reference
-        # must not downgrade a certificate into an attachment-free path.
-        if (
-            not isinstance(economics, dict)
-            or not global_marker
-            or not top_receipt_declared
-            or not nested_receipt_declared
-        ):
-            return None
-        receipt_payload = payload.get("global_auction_receipt")
-        nested_payload = economics.get("global_auction_receipt")
-        try:
-            expected_receipt = GlobalAuctionReceiptRef.from_payload(receipt_payload)
-            nested_receipt = GlobalAuctionReceiptRef.from_payload(nested_payload)
-            expected_receipt.assert_matches_actuation(
-                winner_event_id=economics.get("global_winner_event_id"),
-                winner_candidate_id=economics.get("global_candidate_id"),
-                winner_actuation_identity=global_marker,
-                selection_epoch_identity=economics.get(
-                    "global_selection_epoch_identity"
-                ),
-            )
-        except (TypeError, ValueError):
-            return None
-        if nested_receipt != expected_receipt:
-            return None
-        try:
-            attached = {
-                str(schema)
-                for _, schema, *_ in world_conn.execute(
-                    "PRAGMA database_list"
-                ).fetchall()
-            }
-        except sqlite3.Error:
-            return None
-        if "trades" not in attached:
-            return None
-        try:
-            receipt_row = world_conn.execute(
-                "SELECT mode, artifact_json FROM trades.decision_log WHERE id = ?",
-                (expected_receipt.decision_log_id,),
-            ).fetchone()
-        except sqlite3.Error:
-            return None
-        if receipt_row is None:
-            return None
-        try:
-            assert_global_auction_receipt_artifact(
-                expected=expected_receipt,
-                decision_log_id=expected_receipt.decision_log_id,
-                decision_log_mode=str(receipt_row[0]),
-                artifact_json=receipt_row[1],
-            )
-        except (TypeError, ValueError):
-            return None
+
+    # --- q extraction: identity + payload_hash verified above is the ONLY gate ---
     q_live = payload.get("q_live")
     if q_live is None:
         return None  # cert carries no decision-q — unattributable, never guessed
@@ -1137,6 +1138,96 @@ def _resolve_decision_q_from_certificate(
     ):
         return None
     consumed = payload.get("posterior_id")
+    consumed_posterior_id = (
+        (str(consumed).strip() or None) if consumed is not None else None
+    )
+
+    # --- receipt closure: audit-integrity signal, NEVER gates q availability ---
+    economics = payload.get("qkernel_execution_economics")
+    global_marker = (
+        str(economics.get("global_actuation_identity") or "").strip()
+        if isinstance(economics, dict)
+        else ""
+    )
+    # The production actionable payload keeps the top-level key present with
+    # ``None`` for ordinary entries.  Presence alone is therefore not a global
+    # declaration; any non-empty reference still is, including a malformed
+    # non-empty object that must be recorded as a closure defect below.
+    top_receipt_declared = payload.get("global_auction_receipt") not in (None, "")
+    nested_receipt_declared = (
+        isinstance(economics, dict)
+        and economics.get("global_auction_receipt") not in (None, "")
+    )
+    global_declared = bool(global_marker) or top_receipt_declared or nested_receipt_declared
+
+    receipt_closure = "not_global"
+    if global_declared:
+        # A partial declaration is never ordinary: deleting one marker/reference
+        # is a closure defect, not a downgrade into an attachment-free path.
+        if (
+            not isinstance(economics, dict)
+            or not global_marker
+            or not top_receipt_declared
+            or not nested_receipt_declared
+        ):
+            receipt_closure = "partial_declaration"
+        else:
+            receipt_payload = payload.get("global_auction_receipt")
+            nested_payload = economics.get("global_auction_receipt")
+            expected_receipt = None
+            nested_receipt = None
+            closure_ok = True
+            try:
+                expected_receipt = GlobalAuctionReceiptRef.from_payload(receipt_payload)
+                nested_receipt = GlobalAuctionReceiptRef.from_payload(nested_payload)
+                expected_receipt.assert_matches_actuation(
+                    winner_event_id=economics.get("global_winner_event_id"),
+                    winner_candidate_id=economics.get("global_candidate_id"),
+                    winner_actuation_identity=global_marker,
+                    selection_epoch_identity=economics.get(
+                        "global_selection_epoch_identity"
+                    ),
+                )
+            except (TypeError, ValueError):
+                closure_ok = False
+            if closure_ok and nested_receipt != expected_receipt:
+                closure_ok = False
+            if not closure_ok:
+                receipt_closure = "artifact_mismatch"
+            else:
+                try:
+                    attached = {
+                        str(schema)
+                        for _, schema, *_ in world_conn.execute(
+                            "PRAGMA database_list"
+                        ).fetchall()
+                    }
+                except sqlite3.Error:
+                    attached = set()
+                if "trades" not in attached:
+                    receipt_closure = "trades_not_attached"
+                else:
+                    try:
+                        receipt_row = world_conn.execute(
+                            "SELECT mode, artifact_json FROM trades.decision_log WHERE id = ?",
+                            (expected_receipt.decision_log_id,),
+                        ).fetchone()
+                    except sqlite3.Error:
+                        receipt_row = None
+                    if receipt_row is None:
+                        receipt_closure = "decision_log_row_missing"
+                    else:
+                        try:
+                            assert_global_auction_receipt_artifact(
+                                expected=expected_receipt,
+                                decision_log_id=expected_receipt.decision_log_id,
+                                decision_log_mode=str(receipt_row[0]),
+                                artifact_json=receipt_row[1],
+                            )
+                            receipt_closure = "closed"
+                        except (TypeError, ValueError):
+                            receipt_closure = "artifact_mismatch"
+
     return {
         "q_live": q_live_f,
         "q_lcb_5pct": q_lcb_f,
@@ -1144,7 +1235,9 @@ def _resolve_decision_q_from_certificate(
         # The posterior the decision ACTUALLY consumed. The staleness predicate is
         # measured against THIS, never against a settlement-eve reconstruction.
         # None on a cert whose payload carries no posterior_id.
-        "consumed_posterior_id": (str(consumed).strip() or None) if consumed is not None else None,
+        "consumed_posterior_id": consumed_posterior_id,
+        # Audit-integrity signal only (see docstring) — never a q gate.
+        "receipt_closure": receipt_closure,
     }
 
 
@@ -1513,14 +1606,17 @@ def load_settled_positions(
         except ValueError:
             continue
 
-        # --- Decision-q AUTHORITY: every exact ENTRY tranche -> cert -> receipt ---
+        # --- Decision-q AUTHORITY: every exact ENTRY tranche -> cert ---
         # The ancillary audit row is never a q authority. Bug A repair (2026-08-24,
         # docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md Item 2):
         # a position may carry MULTIPLE ENTRY tranches (scale-in); each is resolved
         # and fill-size-weight-averaged, never collapsed by a single-hash purity
         # gate. Missing/invalid attribution on ANY tranche, or an unresolvable
-        # certificate/schema21 receipt on ANY tranche, leaves the WHOLE position's
-        # q unknown (fail-closed, no partial credit).
+        # certificate on ANY tranche, leaves the WHOLE position's q unknown
+        # (fail-closed, no partial credit). A resolved certificate's
+        # global-auction receipt closure defect (2026-09-03 fix) does NOT make
+        # the tranche unresolvable — it is recorded as an audit note only, see
+        # receipt_closure below.
         agg_q = _resolve_aggregated_decision_q_for_position(
             world_conn,
             position_id=position_id,
@@ -1533,16 +1629,23 @@ def load_settled_positions(
             q_live = agg_q["q_live"]
             q_lcb_5pct = agg_q["q_lcb_5pct"]
             consumed_posterior_id = agg_q["consumed_posterior_id"]
+            provenance_parts: list[str] = []
             if agg_q["tranche_count"] > 1:
                 weighting = (
                     "equal-weight fallback (a tranche fill size was unresolvable)"
                     if agg_q["equal_weight_fallback"]
                     else "fill-size-weighted"
                 )
-                q_provenance_note = (
+                provenance_parts.append(
                     f"multi-tranche decision-q: {agg_q['tranche_count']} ENTRY "
                     f"certificates aggregated ({weighting})."
                 )
+            if agg_q["receipt_closure"] not in ("closed", "not_global"):
+                provenance_parts.append(
+                    f"receipt_closure={agg_q['receipt_closure']}."
+                )
+            if provenance_parts:
+                q_provenance_note = " ".join(provenance_parts)
         else:
             # No resolvable immutable decision-q. Do NOT fall back to the
             # column value when the cert is unresolvable — without the cert the

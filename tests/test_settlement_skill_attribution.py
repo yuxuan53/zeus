@@ -1269,6 +1269,74 @@ def test_q_certificate_sqlite_read_errors_fail_closed() -> None:
     malformed.close()
 
 
+def test_missing_q_live_is_still_unattributable(tmp_path) -> None:
+    """(c) A VERIFIED, identity- and hash-matched certificate with no q_live in
+    its payload is STILL unresolvable — the 2026-09-03 receipt-closure fix does
+    not touch this gate."""
+    from src.analysis.settlement_skill_attribution import (
+        _resolve_decision_q_from_certificate,
+    )
+
+    world = sqlite3.connect(tmp_path / "world.db")
+    init_schema(world)
+    certificate_hash = "c" * 64
+    _seed_belief_certificate(
+        world,
+        certificate_hash=certificate_hash,
+        condition_id="condition-no-qlive",
+        token_id="token-no-qlive",
+        direction="buy_no",
+        q_live=0.5,
+        q_lcb_5pct=0.4,
+        payload_extra={"q_live": None},
+    )
+    world.commit()
+    assert _resolve_decision_q_from_certificate(
+        world,
+        certificate_hash,
+        condition_id="condition-no-qlive",
+        direction="buy_no",
+        held_token_id="token-no-qlive",
+    ) is None
+    world.close()
+
+
+def test_payload_hash_mismatch_is_still_unattributable(tmp_path) -> None:
+    """(d) A stored payload_hash that no longer matches the canonical hash of
+    payload_json (tamper or corruption) is STILL unresolvable regardless of
+    receipt closure — the 2026-09-03 fix only relaxes the receipt-closure gate,
+    never the payload integrity gate."""
+    from src.analysis.settlement_skill_attribution import (
+        _resolve_decision_q_from_certificate,
+    )
+
+    world = sqlite3.connect(tmp_path / "world.db")
+    init_schema(world)
+    certificate_hash = "d" * 64
+    _seed_belief_certificate(
+        world,
+        certificate_hash=certificate_hash,
+        condition_id="condition-bad-hash",
+        token_id="token-bad-hash",
+        direction="buy_no",
+        q_live=0.8,
+        q_lcb_5pct=0.7,
+    )
+    world.execute(
+        "UPDATE decision_certificates SET payload_hash = ? WHERE certificate_hash = ?",
+        ("0" * 64, certificate_hash),
+    )
+    world.commit()
+    assert _resolve_decision_q_from_certificate(
+        world,
+        certificate_hash,
+        condition_id="condition-bad-hash",
+        direction="buy_no",
+        held_token_id="token-bad-hash",
+    ) is None
+    world.close()
+
+
 def test_ordinary_entry_certificate_resolves_and_grades_without_trades_receipt(
     tmp_path,
 ) -> None:
@@ -1445,13 +1513,19 @@ def test_partial_global_declaration_never_downgrades_to_ordinary(
     )
     world.commit()
     receipt_db.commit()
-    assert _resolve_decision_q_from_certificate(
+    resolved = _resolve_decision_q_from_certificate(
         world,
         certificate_hash,
         condition_id="condition-partial-global",
         direction="buy_no",
         held_token_id="token-partial-global",
-    ) is None
+    )
+    # 2026-09-03 fix: a partial global declaration is a receipt-closure AUDIT
+    # defect, never a reason to discard an identity/hash-verified certificate's
+    # q_live — the certificate still resolves, flagged for audit.
+    assert resolved is not None
+    assert resolved["q_live"] == pytest.approx(0.80)
+    assert resolved["receipt_closure"] == "partial_declaration"
     world.close()
     receipt_db.close()
 
@@ -1641,13 +1715,29 @@ def test_global_receipt_is_revalidated_through_position_settlement_chain(
 
     grades = load_settled_positions(world)
 
+    # 2026-09-03 fix: the receipt is still re-validated through the exact
+    # decision_log row on every fault, but a closure defect is now an AUDIT
+    # finding (recorded in derivation_note) rather than a reason to discard
+    # the identity/hash-verified certificate's q_live. Every fault therefore
+    # still resolves the SAME q and SKILL category as the no-fault case.
+    expected_receipt_closure = {
+        None: "closed",
+        "missing_ref": "partial_declaration",
+        "deleted": "decision_log_row_missing",
+        "mutated": "artifact_mismatch",
+        "missing_binding_field": "artifact_mismatch",
+        "nonbinding_mutation": "artifact_mismatch",
+    }[fault]
     assert len(grades) == 1
+    assert grades[0].q_live == pytest.approx(0.80)
+    assert grades[0].category == "SKILL_WIN"
     if fault is None:
-        assert grades[0].q_live == pytest.approx(0.80)
-        assert grades[0].category == "SKILL_WIN"
+        assert "receipt_closure=" not in (grades[0].derivation_note or "")
     else:
-        assert grades[0].q_live is None
-        assert grades[0].category == "UNATTRIBUTABLE_Q_MISSING"
+        assert (
+            f"receipt_closure={expected_receipt_closure}"
+            in (grades[0].derivation_note or "")
+        ), grades[0].derivation_note
     world.close()
 
 
@@ -2703,12 +2793,14 @@ def test_bugA_one_unattributable_tranche_makes_whole_position_unattributable(
     world.close()
 
 
-def test_bugA_one_tranche_cert_fails_partial_declaration_check_unattributable(
+def test_bugA_one_tranche_cert_with_partial_declaration_still_aggregates(
     tmp_path,
 ) -> None:
-    """(e) One tranche's certificate fails the Bug B partial-global-declaration
-    check (untouched by this fix) -> that tranche is unresolvable -> the WHOLE
-    position is UNATTRIBUTABLE, even though the other tranche's cert is fine."""
+    """(e) One tranche's certificate carries a partial global declaration
+    (untouched by the Bug B identity/hash checks, which still pass) -> that
+    tranche's q still resolves (2026-09-03 fix: receipt closure is an audit
+    signal, not a q gate) -> the position aggregates successfully across both
+    tranches and the aggregated receipt_closure surfaces the defect."""
     from src.analysis.settlement_skill_attribution import (
         _resolve_aggregated_decision_q_for_position,
     )
@@ -2746,7 +2838,12 @@ def test_bugA_one_tranche_cert_fails_partial_declaration_check_unattributable(
         world, position_id="pos-badcert", condition_id="cond-badcert",
         direction="buy_no", held_token_id="tok-badcert",
     )
-    assert agg is None
+    assert agg is not None
+    # fill-size-weighted: (0.8*100 + 0.5*50) / 150 == 0.7
+    assert agg["q_live"] == pytest.approx(0.7)
+    assert agg["tranche_count"] == 2
+    assert agg["equal_weight_fallback"] is False
+    assert agg["receipt_closure"] == "partial_declaration"
     world.close()
 
 
