@@ -7634,6 +7634,26 @@ def execute_monitoring_phase(
     ) -> bool:
         nonlocal portfolio_dirty
 
+        # A direct reduce-only trigger's retry-pending state must never be
+        # released into a fresh global-auction reauction: that reauction
+        # re-enters execute_exit through the generic auction adapter, which
+        # carries no hard_fact_authority/RED handoff/flash-crash receipt, so
+        # the direct authority recheck fails forever (the DAY0_HARD_FACT_
+        # BIN_DEAD retry-starvation bug). The ordinary requester=None retry
+        # path (check_pending_exits above, and the primary per-position
+        # pos.evaluate_exit() redecision) already clears a normal retry
+        # cooldown without any auction; only this auxiliary historical-debt
+        # scan supplied a live requester unconditionally.
+        direct_reduce_only_trigger = (
+            str(getattr(position, "exit_trigger", "") or "")
+            in _DIRECT_REDUCE_ONLY_SELL_TRIGGERS
+        )
+        reauction_requester = (
+            None
+            if direct_reduce_only_trigger
+            else request_global_sell_snapshot_reauction
+        )
+
         def defer_retry_runtime() -> bool:
             defer_optional_maintenance("GLOBAL_SELL_RETRY_RUNTIME_DEADLINE")
             summary["global_sell_snapshot_reauction_retry_runtime_deferred"] = (
@@ -7657,9 +7677,7 @@ def execute_monitoring_phase(
                 released = check_pending_retries(
                     position,
                     conn=conn,
-                    global_sell_reauction_requester=(
-                        request_global_sell_snapshot_reauction
-                    ),
+                    global_sell_reauction_requester=reauction_requester,
                 )
             else:
                 # This compatibility retry path re-reads durable SELL lineage
@@ -7678,9 +7696,7 @@ def execute_monitoring_phase(
                     released = check_pending_retries(
                         position,
                         conn=conn,
-                        global_sell_reauction_requester=(
-                            request_global_sell_snapshot_reauction
-                        ),
+                        global_sell_reauction_requester=reauction_requester,
                     )
         except (sqlite3.Error, TimeoutError):
             restore_global_retry_runtime({id(position): previous_runtime})
@@ -10768,7 +10784,12 @@ def execute_monitoring_phase(
                         else None
                     ),
                 )
-                if _drain_same_turn_global_sell_reauction_after_no_fill(
+                if (
+                    not posterior_support_zero_direct_sell
+                    and _global_auction_owns_statistical_sell(
+                        exit_decision, exit_reason
+                    )
+                ) and _drain_same_turn_global_sell_reauction_after_no_fill(
                     pos,
                     conn=conn,
                     requester=lambda position, force_new: (

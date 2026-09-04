@@ -2922,6 +2922,188 @@ def test_monitoring_phase_releases_writer_before_retry_quote_and_exit_io(
     conn.close()
 
 
+def test_hard_fact_direct_exit_no_fill_skips_global_sell_reauction_handoff(
+    monkeypatch,
+):
+    """FIX 1 (DAY0_HARD_FACT_BIN_DEAD retry-starvation): a direct-trigger
+    exit's no-fill outcome must never be handed to the same-turn global-sell
+    reauction drain. That drain's eventual re-auction re-enters execute_exit
+    via the global auction WITHOUT hard_fact_authority, so
+    ``_hard_fact_sell_authority_valid`` fails forever and the position spins
+    on ``hard_fact_sell_authority_invalid`` every retry.
+    """
+    from src.engine import cycle_runtime
+
+    conn = sqlite3.connect(":memory:")
+    pos = _make_position(
+        trade_id="hard-fact-direct-no-reauction-handoff",
+        token_id="hard-fact-direct-no-reauction-handoff-token",
+        direction="buy_yes",
+        state="holding",
+        chain_state="synced",
+        city="Chicago",
+    )
+    conn.execute("CREATE TEMP TABLE monitor_writer_probe (stage TEXT NOT NULL)")
+    conn.commit()
+
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_monitoring_phase_positions",
+        lambda *_args, **_kwargs: [pos],
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_fresh_local_held_monitor_orderbooks",
+        lambda *_args, **_kwargs: {
+            pos.token_id: {
+                "asset_id": pos.token_id,
+                "bids": [{"price": "0.40", "size": "20"}],
+                "asks": [{"price": "0.42", "size": "20"}],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_closed_non_accepting_market_info",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_day0_hard_fact_position_eligible",
+        lambda *_args, **_kwargs: True,
+    )
+    from src.execution.day0_hard_fact_exit import HardFactVerdict
+
+    monkeypatch.setattr(
+        "src.execution.day0_hard_fact_exit.evaluate_hard_fact_exit",
+        lambda **_kwargs: HardFactVerdict(
+            action="EXIT_DEAD_BIN",
+            reason="current observed extreme killed held bin",
+            metric="high",
+            rounded_extreme=36.0,
+            source="durable_observation_instants",
+        ),
+    )
+
+    def refresh(current_conn, _clob, position, **_kwargs):
+        current_conn.execute(
+            "INSERT INTO monitor_writer_probe(stage) VALUES ('refresh')"
+        )
+        position.last_monitor_prob = 0.20
+        position.last_monitor_prob_is_fresh = True
+        position.last_monitor_edge = -0.20
+        position.last_monitor_market_price = 0.40
+        position.last_monitor_market_price_is_fresh = False
+        position.last_monitor_best_bid = 0.40
+        position.last_monitor_best_ask = 0.42
+        position._zeus_held_monitor_full_depth_action_authority = True
+        position._zeus_held_monitor_min_order_size = 1.0
+        edge_ctx = _monitor_test_edge_context(position)
+        edge_ctx.divergence_score = 0.41
+        edge_ctx.market_velocity_1h = 0.0
+        return edge_ctx
+
+    def retry_quote(*, conn: object, exit_context, **_kwargs):
+        conn.execute(
+            "INSERT INTO monitor_writer_probe(stage) VALUES ('retry_quote')"
+        )
+        return exit_context, False
+
+    def emit(current_conn, *_args, **_kwargs):
+        current_conn.execute(
+            "INSERT INTO monitor_writer_probe(stage) VALUES ('canonical')"
+        )
+        return True
+
+    def execute_exit(*, conn: object, **_kwargs):
+        # A synchronous FAK no-fill on the direct hard-fact path: not a fill.
+        return "sell_error: venue_fak_no_match_400"
+
+    drain_calls: list[tuple] = []
+
+    def drain(*args, **kwargs):
+        drain_calls.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr(
+        "src.engine.monitor_refresh.refresh_exact_zero_position",
+        refresh,
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_refresh_pending_exit_retry_quote_from_current_clob",
+        retry_quote,
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_emit_monitor_refreshed_canonical_if_available",
+        emit,
+    )
+    monkeypatch.setattr(
+        "src.execution.exit_lifecycle.build_exit_intent",
+        lambda *_args, **_kwargs: SimpleNamespace(reason="DAY0_HARD_FACT_BIN_DEAD"),
+    )
+    monkeypatch.setattr(
+        "src.execution.exit_lifecycle.execute_exit",
+        execute_exit,
+    )
+    monkeypatch.setattr(
+        "src.execution.exit_lifecycle._drain_same_turn_global_sell_reauction_after_no_fill",
+        drain,
+    )
+    monkeypatch.setattr(
+        cycle_runtime,
+        "_emit_portfolio_rotation_evaluation_status",
+        lambda *_args, **_kwargs: None,
+    )
+
+    summary = {"monitors": 0, "exits": 0}
+    deps = _monitor_test_deps("hard_fact_direct_no_reauction_handoff")
+    deps.cities_by_name = {
+        "Chicago": type("City", (), {"timezone": "America/Chicago"})()
+    }
+    cycle_runtime.execute_monitoring_phase(
+        conn,
+        object(),
+        _make_portfolio(pos),
+        _monitor_test_artifact(),
+        _monitor_test_tracker(),
+        summary,
+        deps=deps,
+        run_exit_preflight=True,
+        held_position_monitor_budget_seconds=20.0,
+    )
+
+    assert drain_calls == []
+    conn.close()
+
+
+def test_global_auction_owns_statistical_sell_direct_vs_mirror_triggers():
+    """Pure boundary check for the single gate FIX 1 consults at the
+    post-execute_exit reauction-handoff call site (cycle_runtime.py ~10771):
+    every direct reduce-only trigger is owned locally (drain must be
+    skipped); an ordinary statistical trigger (e.g. the global-auction
+    GLOBAL_CAPITAL_OPTIMAL_SELL sell) remains owned by the global auction
+    (drain must still run), unchanged by FIX 1.
+    """
+    from src.engine.cycle_runtime import _global_auction_owns_statistical_sell
+
+    for direct_trigger in (
+        "RED_FORCE_EXIT",
+        "DAY0_HARD_FACT_BIN_DEAD",
+        "POSTERIOR_SUPPORT_ZERO_SELL_DOMINATES",
+        "FLASH_CRASH_PANIC",
+    ):
+        decision = SimpleNamespace(trigger=direct_trigger)
+        assert _global_auction_owns_statistical_sell(decision, direct_trigger) is False
+
+    statistical = SimpleNamespace(trigger="GLOBAL_CAPITAL_OPTIMAL_SELL")
+    assert (
+        _global_auction_owns_statistical_sell(statistical, statistical.trigger)
+        is True
+    )
+
+
 def test_refresh_position_finishes_read_only_work_before_quote_writer(monkeypatch):
     """CLOB I/O and edge reads must finish before monitor quote persistence."""
     from src.engine import monitor_refresh
@@ -7515,7 +7697,16 @@ def test_current_global_monitor_sell_has_one_statistical_actuator_and_preserves_
         else:
             assert execute_authorities == [None]
         assert execute_calls == [pos]
-        assert same_turn_reauction_drain_attempts == [pos.trade_id]
+        # FIX 1 (DAY0_HARD_FACT_BIN_DEAD retry-starvation): this branch is
+        # reached only for the "direct" outcome (RED_FORCE_EXIT,
+        # DAY0_HARD_FACT_BIN_DEAD, FLASH_CRASH_PANIC, and the branchwise
+        # posterior-support-zero SELL) -- every _DIRECT_REDUCE_ONLY_SELL_
+        # TRIGGERS member. A direct trigger's no-fill must never be handed to
+        # the same-turn global-sell reauction drain: that drain's eventual
+        # reauction re-enters execute_exit through the generic global-auction
+        # adapter, which carries no hard_fact_authority/RED handoff/flash-
+        # crash receipt, so the direct authority recheck fails forever.
+        assert same_turn_reauction_drain_attempts == []
     if outcome not in {
         "blocked",
         "incomplete_coverage_lineage",
@@ -7524,8 +7715,11 @@ def test_current_global_monitor_sell_has_one_statistical_actuator_and_preserves_
         "lineage_upgrade",
     }:
         assert auction_completion_requests == []
-    if outcome != "direct":
-        assert same_turn_reauction_drain_attempts == []
+    # FIX 1: no outcome (direct or otherwise) attempts the same-turn drain
+    # for a statistical-owned reauction anymore when the trigger is direct;
+    # non-direct outcomes never called execute_exit in this test to begin
+    # with, so the drain was never attempted for them either.
+    assert same_turn_reauction_drain_attempts == []
     assert invalidations == ([] if outcome != "direct" else ["venue_side_effect"])
     conn.close()
 
