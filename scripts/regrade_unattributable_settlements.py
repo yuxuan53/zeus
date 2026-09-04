@@ -52,9 +52,14 @@ but produces no further category migration.
 
 Usage:
     python3 scripts/regrade_unattributable_settlements.py [--limit N]
-        [--chunk-size N] [--db PATH] [--fcst-db PATH] [--apply]
+        [--chunk-size N] [--db PATH] [--fcst-db PATH] [--trades-db PATH] [--apply]
 
 Default is dry-run (report only, no writes). --apply performs the UPDATEs.
+The trade DB is ALWAYS attached read-only via the explicit --trades-db path
+(or one derived from --db's directory) — never via src.state.db's
+STATE_DIR-relative resolver, which is wrong outside the canonical repo
+checkout (e.g. inside a git worktree) and fails ATTACH silently, producing a
+0-candidate dry-run with no error.
 """
 from __future__ import annotations
 
@@ -91,6 +96,25 @@ def _attach_forecasts(conn: sqlite3.Connection, fcst_db_path: Path) -> None:
         conn.execute("ATTACH DATABASE ? AS forecasts", (str(fcst_db_path),))
 
 
+def _attach_trades_ro(conn: sqlite3.Connection, trades_db_path: Path) -> None:
+    """ATTACH the trade DB as 'trades', READ-ONLY, using the EXPLICIT path this
+    script was given — never src.state.db._zeus_trade_db_path()'s STATE_DIR
+    resolution, which is worktree-relative and silently resolves to an empty
+    directory outside the canonical repo checkout (the root cause of an
+    earlier candidates_seen=0 dry-run: load_settled_positions' own
+    _ensure_trades_attached attach failed silently against the wrong path and
+    the grader returned []). Attaching here FIRST makes that helper's own
+    attach attempt a no-op (it only attaches when 'trades' is not already
+    present), so this explicit path always wins.
+    """
+    attached = {row[1] for row in conn.execute("PRAGMA database_list").fetchall()}
+    if "trades" not in attached:
+        conn.execute(
+            "ATTACH DATABASE ? AS trades",
+            (f"file:{trades_db_path}?mode=ro",),
+        )
+
+
 def _fit_row_would_qualify(grade) -> bool:
     return (
         grade.q_in_bin is not None
@@ -104,6 +128,7 @@ def run(
     *,
     world_db_path: Path,
     fcst_db_path: Path,
+    trades_db_path: Path,
     limit: int | None,
     chunk_size: int,
     apply: bool,
@@ -132,6 +157,9 @@ def run(
     }
     try:
         _attach_forecasts(conn, fcst_db_path)
+        # Explicit, read-only, given-path ATTACH — see _attach_trades_ro's
+        # docstring for why this must run before load_settled_positions.
+        _attach_trades_ro(conn, trades_db_path)
 
         target_ids = {
             str(row[0])
@@ -215,21 +243,39 @@ def main() -> None:
         "--fcst-db", type=Path, default=None,
         help="Forecasts DB path (default: canonical zeus-forecasts.db).",
     )
+    parser.add_argument(
+        "--trades-db", type=Path, default=None,
+        help=(
+            "Trade DB path (default: zeus_trades.db beside --db's directory "
+            "when --db is given, else the canonical zeus_trades.db). Always "
+            "attached read-only, explicitly by this path — never resolved via "
+            "src.state.db's STATE_DIR, which is worktree-relative and silently "
+            "wrong outside the canonical repo checkout."
+        ),
+    )
     args = parser.parse_args()
 
-    from src.state.db import ZEUS_FORECASTS_DB_PATH, ZEUS_WORLD_DB_PATH
+    from src.state.db import ZEUS_FORECASTS_DB_PATH, ZEUS_WORLD_DB_PATH, _zeus_trade_db_path
 
     world_db_path = args.db or ZEUS_WORLD_DB_PATH
     fcst_db_path = args.fcst_db or ZEUS_FORECASTS_DB_PATH
+    if args.trades_db is not None:
+        trades_db_path = args.trades_db
+    elif args.db is not None:
+        trades_db_path = args.db.parent / "zeus_trades.db"
+    else:
+        trades_db_path = _zeus_trade_db_path()
 
     logger.info(
-        "world_db=%s fcst_db=%s apply=%s limit=%s chunk_size=%d",
-        world_db_path, fcst_db_path, args.apply, args.limit, args.chunk_size,
+        "world_db=%s fcst_db=%s trades_db=%s apply=%s limit=%s chunk_size=%d",
+        world_db_path, fcst_db_path, trades_db_path, args.apply, args.limit,
+        args.chunk_size,
     )
 
     stats = run(
         world_db_path=world_db_path,
         fcst_db_path=fcst_db_path,
+        trades_db_path=trades_db_path,
         limit=args.limit,
         chunk_size=args.chunk_size,
         apply=args.apply,
