@@ -22,7 +22,7 @@ import sqlite3
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Collection, Literal, Mapping, Optional
@@ -149,6 +149,8 @@ _DECISION_SCOPED_VALIDATIONS: frozenset[str] = frozenset({
     "current_held_ci_invalid",
     "entry_held_ci_invalid",
     "predicted_bin_exit_law",
+    "exit_q:market_anchored",
+    "exit_q:raw",
     "sell_reversal",
     "hold",
     "evidence_unavailable_third_state",
@@ -938,6 +940,77 @@ class Position:
             return _ZERO_D, False
         return Decimal(str(point)), True
 
+    def _exit_q_mean_and_source(
+        self, exit_context: ExitContext
+    ) -> tuple[Decimal, bool, str]:
+        """Held-side q for the exit stop, preferring the market-anchored
+        correction over the raw posterior-predictive point.
+
+        Entries act on the market-anchored corrected probability
+        (src.calibration.market_anchored_live_fit.corrected_probability); the
+        exit stop compared the raw point instead, which is measured +0.170
+        over-biased on filled positions (0.55 predicted vs 0.38 realised) and
+        so essentially never fires. This applies the SAME correction to the
+        held-side point so entry and exit act on one calibrated probability.
+
+        Fail-open, identical to pre-fix behavior, whenever: evidence is not
+        ok, no provider is registered (this batch cycle wired none), the
+        held-side market price is unavailable, the target date does not
+        parse, or the correction is unavailable/non-finite/out of (0, 1).
+        The registered provider lends an ALREADY-OPEN connection (or serves
+        from its TTL cache) — this never opens a new DB connection itself.
+        """
+        q_raw, evidence_ok = self._held_side_point_with_confidence(exit_context)
+        if not evidence_ok:
+            return q_raw, evidence_ok, "raw"
+
+        from src.calibration.market_anchored_live_fit import (
+            corrected_probability,
+            get_active_provider,
+        )
+
+        provider = get_active_provider()
+        if provider is None:
+            return q_raw, evidence_ok, "raw"
+
+        p0: Optional[float] = None
+        if ExitContext._is_finite(exit_context.current_market_price):
+            p0 = float(exit_context.current_market_price)
+        elif ExitContext._is_finite(exit_context.best_bid) and ExitContext._is_finite(
+            exit_context.best_ask
+        ):
+            p0 = (float(exit_context.best_bid) + float(exit_context.best_ask)) / 2.0
+        if p0 is None:
+            return q_raw, evidence_ok, "raw"
+
+        try:
+            target_date = date.fromisoformat(str(self.target_date)[:10])
+        except (TypeError, ValueError):
+            return q_raw, evidence_ok, "raw"
+
+        now_utc = datetime.now(timezone.utc)
+        try:
+            artifact = provider.artifact(now=now_utc)
+            applied = corrected_probability(
+                artifact,
+                p0=p0,
+                q_raw=float(q_raw),
+                decision_date=now_utc.date(),
+                target_date=target_date,
+                side=self.direction.value,
+            )
+        except Exception:  # noqa: BLE001 - correction unavailable, keep raw q
+            return q_raw, evidence_ok, "raw"
+
+        if applied is None:
+            return q_raw, evidence_ok, "raw"
+
+        corrected_q = applied[0]
+        if not (math.isfinite(corrected_q) and 0.0 < corrected_q < 1.0):
+            return q_raw, evidence_ok, "raw"
+
+        return Decimal(str(corrected_q)), evidence_ok, "market_anchored"
+
     def _settlement_preimage_lock(self, exit_context: ExitContext) -> LockState:
         """Map the Day0 absorbing hard-fact authority to a settlement lock.
 
@@ -1050,7 +1123,7 @@ class Position:
         ]
 
         held_shares = Decimal(str(self.effective_shares))
-        q_mean, evidence_ok = self._held_side_point_with_confidence(exit_context)
+        q_mean, evidence_ok, exit_q_source = self._exit_q_mean_and_source(exit_context)
         lock = self._settlement_preimage_lock(exit_context)
         bid_breakpoints = self._exit_bid_breakpoints(exit_context, held_shares)
 
@@ -1095,6 +1168,7 @@ class Position:
         )
 
         applied.append("predicted_bin_exit_law")
+        applied.append(f"exit_q:{exit_q_source}")
         if lock is LockState.IMPOSSIBLE:
             applied.append("settlement_preimage_lock:impossible")
         elif lock is LockState.GUARANTEED:

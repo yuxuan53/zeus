@@ -190,6 +190,31 @@ class MarketAnchoredFitProvider:
             return None
 
 
+# Process-wide handle to the ONE provider the live batch runtime constructs
+# against its own already-open world connection (global_batch_runtime.py
+# registers it once the connection is threaded through). This lets the
+# monitor/exit path (src.state.portfolio, which has no world connection of
+# its own and must never open one — a second connection inside the reactor
+# SAVEPOINT is a known deadlock class) reuse the SAME cached provider that
+# entries use, instead of constructing a fresh one per position or dialing
+# sqlite directly. Unset (None) until the batch runtime registers one; a
+# caller that finds it unset simply keeps its raw q (fail-open).
+_active_provider: MarketAnchoredFitProvider | None = None
+
+
+def register_active_provider(provider: MarketAnchoredFitProvider | None) -> None:
+    """Register (or clear, with None) the process-wide active provider."""
+
+    global _active_provider
+    _active_provider = provider
+
+
+def get_active_provider() -> MarketAnchoredFitProvider | None:
+    """The registered active provider, or None when unset."""
+
+    return _active_provider
+
+
 # side vocabulary accepted by corrected_probability. Both the candidate.side
 # ("YES"/"NO") and direction ("buy_yes"/"buy_no") spellings are in live use
 # across the codebase, so both are recognized; anything else raises rather

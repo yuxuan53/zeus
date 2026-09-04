@@ -6184,10 +6184,16 @@ def _market_anchored_correction_resolver(
     from src.calibration.market_anchored_live_fit import (
         MarketAnchoredFitProvider,
         corrected_probability,
+        register_active_provider,
     )
     from src.contracts.payoff_q_correction import PayoffQCorrection
 
     provider = MarketAnchoredFitProvider(lambda: world_conn)
+    # Make this batch's provider reachable from Position.evaluate_exit (the
+    # monitor path), which has no world connection of its own and must never
+    # open one. The exit path reuses this cached provider instead of
+    # constructing its own or dialing sqlite directly.
+    register_active_provider(provider)
 
     def resolve(candidate, raw_q: float, p0: float, decision_at_utc: datetime):
         target_date = target_date_by_family.get(str(candidate.family_key))
