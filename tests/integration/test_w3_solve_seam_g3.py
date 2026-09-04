@@ -31205,7 +31205,7 @@ def test_global_batch_falls_through_family_local_preflight_block(
         {scope.family_keys[0]: blocked_reason},
     ]
     assert calls["epoch"][1] != calls["epoch"][0]
-    assert calls["q_correction_resolvers"] == [None, None]
+    assert all(callable(r) for r in calls["q_correction_resolvers"])
     assert calls["venue"] == 1
     assert result.winner_event_id == event_b.event_id
     assert result.venue_submit_count == 1

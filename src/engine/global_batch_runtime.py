@@ -8034,10 +8034,13 @@ def process_current_global_batch(
             )
         except (TypeError, ValueError) as exc:
             return reject(f"GLOBAL_CANDIDATE_PAYOFF_Q_LCB_CAPS_INVALID:{exc}")
-        # Live replacement q is the sole probability authority.  Market-anchored
-        # fits remain offline evidence and must not rewrite q before edge, sizing,
-        # ranking, or submit-time reproduction.
-        payoff_q_correction_resolver = None
+        payoff_q_correction_resolver = _market_anchored_correction_resolver(
+            world_conn,
+            target_date_by_family=_target_date_by_family(
+                full_scope_event_by_family,
+                payload_reader=payload_reader,
+            ),
+        )
         selection_epoch_identity = (
             _selection_epoch_identity_with_preflight_exclusions(
                 selection_epoch_base_identity,
