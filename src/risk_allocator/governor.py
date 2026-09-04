@@ -691,12 +691,24 @@ def assert_global_submit_allows(*, reduce_only: bool = False) -> AllocationDecis
     """Guard non-entry submits against global kill-switch state.
 
     Exits may continue through reduce-only modes, but a true kill-switch reason
-    blocks all submit paths before command persistence or SDK contact.
+    blocks all submit paths before command persistence or SDK contact. A SELL
+    of already-held shares cannot increase risk, so a reduce-only submit is
+    exempt from the allocator-singleton-not-yet-configured gate specifically
+    (typically hit right after a restart, before the singleton is published);
+    every other allocator verdict -- kill switch, staleness, reduce-only-mode
+    -- still applies to exits unchanged.
     """
 
     try:
         allocator, governor_state = _snapshot_global_actuation_authority()
     except AllocationDenied as exc:
+        if reduce_only and exc.decision.reason == "allocator_not_configured":
+            return AllocationDecision(
+                True,
+                "reduce_only_exempt_allocator_not_configured",
+                0,
+                reduce_only=reduce_only,
+            )
         raise AllocationDenied(
             replace(exc.decision, reduce_only=reduce_only)
         ) from exc

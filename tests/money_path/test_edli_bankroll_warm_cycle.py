@@ -440,9 +440,17 @@ def test_collateral_publish_identity_mismatch_revokes_reduce_only_authority(monk
 
         assert result["configured"] is False
         assert result["error"] == "collateral_snapshot_identity_mismatch"
-        with pytest.raises(AllocationDenied) as excinfo:
-            assert_global_submit_allows(reduce_only=True)
-        assert excinfo.value.decision.reason == "allocator_not_configured"
+        # FIX 4 (2026-09-04): a reduce-only (exit) submit cannot increase
+        # risk, so it is exempt from the allocator-not-configured gate
+        # regardless of why the singleton is unconfigured -- a genuine
+        # startup gap or (as here) a revoked collateral-identity-mismatch
+        # allocator both leave allocator=None with no distinguishing state.
+        # Spend/BUY authority is still fully revoked (see
+        # test_global_allocator_defaults_fail_closed_until_cycle_refresh /
+        # assert_global_allocation_allows for the entry-side guarantee).
+        exit_decision = assert_global_submit_allows(reduce_only=True)
+        assert exit_decision.allowed is True
+        assert exit_decision.reason == "reduce_only_exempt_allocator_not_configured"
     finally:
         configure_global_allocator(None, None)
 

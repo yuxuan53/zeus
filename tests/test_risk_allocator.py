@@ -852,8 +852,12 @@ def test_global_allocator_defaults_fail_closed_until_cycle_refresh():
     try:
         with pytest.raises(AllocationDenied) as entry_exc:
             assert_global_allocation_allows(_intent(size=1))
-        with pytest.raises(AllocationDenied) as exit_exc:
-            assert_global_submit_allows(reduce_only=True)
+        # FIX 4: a reduce-only (exit) submit cannot increase risk, so it is
+        # exempt from the allocator-singleton-not-yet-configured gate -- the
+        # exit is allowed, not raised, distinct from every other allocator
+        # verdict (kill switch, staleness, reduce-only-mode) which remains
+        # blocking for exits unchanged.
+        exit_decision = assert_global_submit_allows(reduce_only=True)
         with pytest.raises(AllocationDenied) as order_type_exc:
             select_global_order_type(SimpleNamespace(orderbook_depth_micro=100_000_000))
         snapshot = risk_allocator_summary()
@@ -861,12 +865,36 @@ def test_global_allocator_defaults_fail_closed_until_cycle_refresh():
         clear_global_allocator()
 
     assert entry_exc.value.decision.reason == "allocator_not_configured"
-    assert exit_exc.value.decision.reason == "allocator_not_configured"
+    assert exit_decision.allowed is True
+    assert exit_decision.reason == "reduce_only_exempt_allocator_not_configured"
     assert order_type_exc.value.decision.reason == "allocator_not_configured"
     assert snapshot["entry"] == {
         "allow_submit": False,
         "reason": "allocator_not_configured",
     }
+
+
+def test_reduce_only_exit_submit_allowed_when_allocator_unconfigured_buy_still_refused():
+    """FIX 4: a SELL of already-held shares cannot increase risk.
+
+    An unconfigured allocator singleton (typically hit right after a restart,
+    before the singleton is published) must not block a reduce-only exit
+    submission the way it correctly blocks a BUY.
+    """
+    clear_global_allocator()
+
+    try:
+        exit_decision = assert_global_submit_allows(reduce_only=True)
+
+        with pytest.raises(AllocationDenied) as buy_exc:
+            assert_global_allocation_allows(_intent(size=1))
+    finally:
+        clear_global_allocator()
+
+    assert exit_decision.allowed is True
+    assert exit_decision.reason == "reduce_only_exempt_allocator_not_configured"
+    assert exit_decision.reduce_only is True
+    assert buy_exc.value.decision.reason == "allocator_not_configured"
 
 
 def test_executor_pre_submit_allocator_routes_entry_to_fok_when_heartbeat_lost():
