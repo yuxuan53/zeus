@@ -140,7 +140,12 @@ def _queue_read_only_connection(db_path: Path) -> sqlite3.Connection:
 
     current = _active_claim_read_deadline()
     deadline = None if current is None else current.deadline_monotonic
-    conn = _connect_read_only(db_path, deadline_monotonic=deadline)
+    try:
+        conn = _connect_read_only(db_path, deadline_monotonic=deadline)
+    except sqlite3.OperationalError as exc:
+        if exc.args == ("DB_CONNECTION_DEADLINE_EXPIRED",):
+            raise _ClaimReadDeadlineExceeded() from exc
+        raise
     if current is None:
         return conn
 

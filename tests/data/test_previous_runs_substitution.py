@@ -5079,6 +5079,32 @@ def test_claim_read_deadline_releases_lock_for_priority_held_day0(tmp_path, monk
     assert priority.processed_count == 1
 
 
+def test_queue_connection_deadline_aborts_claim_instead_of_retrying_priority_reads(
+    tmp_path,
+    monkeypatch,
+):
+    """A spent connection deadline terminates the claim before fallback reopens."""
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    db_path = tmp_path / "forecasts.db"
+    sqlite3.connect(db_path).close()
+    open_attempts = []
+
+    def expired_open(path, *, deadline_monotonic):
+        open_attempts.append((path, deadline_monotonic))
+        raise sqlite3.OperationalError("DB_CONNECTION_DEADLINE_EXPIRED")
+
+    monkeypatch.setattr("src.state.db._connect_read_only", expired_open)
+
+    with pytest.raises(queue_mod._ClaimReadDeadlineExceeded):
+        with queue_mod._claim_read_deadline_guard():
+            queue_mod._queue_read_only_connection(db_path)
+
+    assert len(open_attempts) == 1
+    assert open_attempts[0][0] == db_path
+    assert open_attempts[0][1] is not None
+
+
 def test_priority_stale_inflight_defers_then_background_recovers(tmp_path, monkeypatch):
     """A same-family stale batch defers priority until the background drain restores it."""
     import src.data.replacement_forecast_live_materialization_queue as queue_mod
