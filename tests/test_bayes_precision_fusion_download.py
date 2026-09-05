@@ -2038,3 +2038,207 @@ def test_default_previous_runs_fetch_uses_om_ecmwf_id_for_anchor(monkeypatch) ->
     assert captured["models"] == "ecmwf_ifs025", (
         "anchor previous-runs OM fetch must use the OM ECMWF id ecmwf_ifs025"
     )
+
+
+_MEMO_GAP_REASON = (
+    "ValueError:partial local-day coverage is not an elapsed-prefix-only "
+    "Day0 slice with remaining-day coverage"
+)
+
+
+def _one_city_two_date_targets(date_a: str, date_b: str):
+    from src.data.bayes_precision_fusion_download import BayesPrecisionFusionDownloadTarget
+
+    return [
+        BayesPrecisionFusionDownloadTarget(
+            city="Paris", metric=metric, target_date=target_date,
+            lead_days=lead_days, latitude=48.967, longitude=2.428,
+            timezone_name="Europe/Paris",
+        )
+        for target_date, lead_days in ((date_a, 0), (date_b, 4))
+        for metric in ("high", "low")
+    ]
+
+
+def _memo_locations_stub(dl, calls, date_a, gap_reason):
+    """Location-batched stub: date_a materializes, every other date reports a run gap."""
+
+    def _locations(**kwargs):
+        calls.append([tuple(location[3]) for location in kwargs["locations"]])
+        return [
+            {
+                target_local_date: (
+                    {"icon_eu": (30.0, 20.0)}
+                    if target_local_date == date_a
+                    else {
+                        dl._BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY: {"icon_eu": gap_reason}
+                    }
+                )
+                for target_local_date in location[3]
+            }
+            for location in kwargs["locations"]
+        ]
+
+    return _locations
+
+
+def test_memoized_exact_run_gap_is_not_refetched_for_the_same_run(
+    tmp_path, monkeypatch
+) -> None:
+    """QUOTA (2026-09-04): 3,132 of 4,114 single_runs units that day were the SAME
+    (model, latitude, run) re-issued, because an unmaterializable scope never persists a
+    row and so was never skipped. A run is immutable: prove it empty once, never ask again.
+    """
+    import src.data.bayes_precision_fusion_download as dl
+
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+    db = _forecast_db(tmp_path)
+    run = datetime(2026, 9, 3, 18, tzinfo=UTC)
+    date_a, date_b = date(2026, 9, 3), date(2026, 9, 7)
+    targets = _one_city_two_date_targets(date_a.isoformat(), date_b.isoformat())
+    calls: list[list[tuple]] = []
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_locations_batched",
+        _memo_locations_stub(dl, calls, date_a, _MEMO_GAP_REASON),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_batched",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("per-city single_runs fetch must not be reached")
+        ),
+    )
+
+    first = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db, cycle=run, targets=targets, models=("icon_eu",),
+        include_previous_runs=False, prune_after=False,
+        allow_single_runs_fallback=False,
+        frozen_source_runs={"icon_eu": (run, run)},
+    )
+
+    assert first["written_row_count"] == 2
+    assert _count(db, target_date=date_a.isoformat()) == 2
+    assert [row["target_date"] for row in first["exact_run_unmaterializable"]] == [
+        date_b.isoformat()
+    ]
+    assert calls == [[(date_a, date_b)]]
+
+    second = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db, cycle=run, targets=targets, models=("icon_eu",),
+        include_previous_runs=False, prune_after=False,
+        allow_single_runs_fallback=False,
+        frozen_source_runs={"icon_eu": (run, run)},
+    )
+
+    # A persisted, B memoized -> nothing left to request, so NO HTTP call at all.
+    assert calls == [[(date_a, date_b)]]
+    assert second["written_row_count"] == 0
+    assert second["single_runs_location_batch_count"] == 0
+    assert second["exact_run_unmaterializable"] == (
+        {
+            "model": "icon_eu",
+            "city": "Paris",
+            "target_date": date_b.isoformat(),
+            "source_cycle_time": run.isoformat(),
+            "reason": _MEMO_GAP_REASON,
+        },
+    )
+    assert second["status"] != "BAYES_PRECISION_FUSION_EXTRA_TRANSPORT_RETRYABLE"
+    assert second["status"] == "BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE"
+
+
+def test_memoized_exact_run_gap_is_scoped_to_the_run_not_the_target(
+    tmp_path, monkeypatch
+) -> None:
+    """A NEW run may well cover the target local day the old run could not — the memo must
+    be keyed on the run, never on (model, city, target_date) alone."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+    db = _forecast_db(tmp_path)
+    date_a, date_b = date(2026, 9, 3), date(2026, 9, 7)
+    targets = _one_city_two_date_targets(date_a.isoformat(), date_b.isoformat())
+    calls: list[list[tuple]] = []
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_locations_batched",
+        _memo_locations_stub(dl, calls, date_a, _MEMO_GAP_REASON),
+    )
+
+    for run in (
+        datetime(2026, 9, 3, 18, tzinfo=UTC),
+        datetime(2026, 9, 4, 0, tzinfo=UTC),
+    ):
+        dl.download_bayes_precision_fusion_extra_raw_inputs(
+            forecast_db=db, cycle=run, targets=targets, models=("icon_eu",),
+            include_previous_runs=False, prune_after=False,
+            allow_single_runs_fallback=False,
+            frozen_source_runs={"icon_eu": (run, run)},
+        )
+
+    assert calls == [[(date_a, date_b)], [(date_a, date_b)]]
+    assert set(dl._EXACT_RUN_UNMATERIALIZABLE_MEMO) == {
+        ("icon_eu", "Paris", date_b.isoformat(), "2026-09-03T18:00:00+00:00"),
+        ("icon_eu", "Paris", date_b.isoformat(), "2026-09-04T00:00:00+00:00"),
+    }
+
+
+def test_exact_run_memo_prunes_runs_older_than_three_days(tmp_path, monkeypatch) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+    db = _forecast_db(tmp_path)
+    cycle = datetime(2026, 6, 8, 0, tzinfo=UTC)
+    stale = ("icon_eu", "Paris", "2026-06-05", "2026-06-04T00:00:00+00:00")
+    fresh = ("icon_eu", "Paris", "2026-06-09", "2026-06-07T00:00:00+00:00")
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO[stale] = _MEMO_GAP_REASON
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO[fresh] = _MEMO_GAP_REASON
+
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        dl, "_default_live_fetch_batched", lambda **_kwargs: {"ecmwf_ifs": (22.0, 10.0)}
+    )
+
+    dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db, cycle=cycle, targets=_targets(), models=("ecmwf_ifs",),
+        include_previous_runs=False, prune_after=False,
+    )
+
+    assert set(dl._EXACT_RUN_UNMATERIALIZABLE_MEMO) == {fresh}
+
+
+def test_transport_shaped_gap_reason_is_never_memoized(tmp_path, monkeypatch) -> None:
+    """temperature_series_missing can flip to present on the next response — memoizing it
+    would silently starve a model of an obtainable row."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+    db = _forecast_db(tmp_path)
+    run = datetime(2026, 9, 3, 18, tzinfo=UTC)
+    date_a, date_b = date(2026, 9, 3), date(2026, 9, 7)
+    targets = _one_city_two_date_targets(date_a.isoformat(), date_b.isoformat())
+    calls: list[list[tuple]] = []
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        dl,
+        "_default_live_fetch_locations_batched",
+        _memo_locations_stub(dl, calls, date_a, "temperature_series_missing"),
+    )
+
+    for _ in range(2):
+        dl.download_bayes_precision_fusion_extra_raw_inputs(
+            forecast_db=db, cycle=run, targets=targets, models=("icon_eu",),
+            include_previous_runs=False, prune_after=False,
+            allow_single_runs_fallback=False,
+            frozen_source_runs={"icon_eu": (run, run)},
+        )
+
+    assert dl._EXACT_RUN_UNMATERIALIZABLE_MEMO == {}
+    # A is persisted after call 1, so call 2 re-requests exactly the unmemoizable B.
+    assert calls == [[(date_a, date_b)], [(date_b,)]]

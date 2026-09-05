@@ -525,6 +525,57 @@ _BATCH_EXACT_RUN_UNMATERIALIZABLE_KEY = (
 )
 _SOURCE_CLOCK_LOCATION_BATCH_SIZE = 25
 
+# Parser-level gaps that are a property of the RUN, not of the transport: an immutable run
+# either covers the target local day or it never will, so re-issuing the identical request
+# can only burn quota. Every other gap reason (transport, timeout, quota abort, 4xx/5xx,
+# temperature_series_missing, malformed payload) may succeed on a retry and is NOT memoized.
+_EXACT_RUN_IMMUTABLE_GAP_REASONS = (
+    "ValueError:partial local-day coverage is not an elapsed-prefix-only "
+    "Day0 slice with remaining-day coverage",
+    "ValueError:insufficient Open-Meteo hourly samples inside target local day",
+)
+# (model, city, target_date, run_iso) -> reason. A run is immutable: once a target local day
+# is proven unmaterializable from it, re-fetching the same run cannot change the answer.
+_EXACT_RUN_UNMATERIALIZABLE_MEMO: dict[tuple[str, str, str, str], str] = {}
+_EXACT_RUN_MEMO_RETENTION_DAYS = 3
+
+
+def _memoize_exact_run_gap(
+    scope: tuple[str, str, str, str],
+    reason: str,
+) -> None:
+    """Record a RUN-immutable parser gap. Transport-shaped reasons are never memoized."""
+    if not reason.startswith(_EXACT_RUN_IMMUTABLE_GAP_REASONS):
+        return
+    if scope not in _EXACT_RUN_UNMATERIALIZABLE_MEMO:
+        _LOG.debug(
+            "BAYES_PRECISION_FUSION memoized exact-run gap %s: %s", scope, reason
+        )
+    _EXACT_RUN_UNMATERIALIZABLE_MEMO[scope] = reason
+
+
+def _prune_exact_run_memo(*, cycle_utc: datetime) -> None:
+    """Drop memo entries whose run predates the retention floor. O(len(memo))."""
+    floor = cycle_utc - timedelta(days=_EXACT_RUN_MEMO_RETENTION_DAYS)
+    stale = [
+        scope
+        for scope, run_utc in (
+            (scope, _exact_run_memo_run_utc(scope[3]))
+            for scope in _EXACT_RUN_UNMATERIALIZABLE_MEMO
+        )
+        if run_utc is None or run_utc < floor
+    ]
+    for scope in stale:
+        del _EXACT_RUN_UNMATERIALIZABLE_MEMO[scope]
+
+
+def _exact_run_memo_run_utc(run_iso: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(run_iso)
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
 
 def _typed_transport_outcome(error: object) -> dict[str, object] | None:
     """Preserve a redacted HTTP outcome through BPF's fail-soft report boundary."""
@@ -1722,6 +1773,7 @@ def download_bayes_precision_fusion_extra_raw_inputs(
 
     cycle_utc = cycle.astimezone(UTC)
     cycle_iso = cycle_utc.isoformat()
+    _prune_exact_run_memo(cycle_utc=cycle_utc)
     captured_at = datetime.now(tz=UTC)
     captured_iso = max(captured_at, cycle_utc).isoformat()
     # HONEST AVAILABILITY (U5 step 2a, freshness investigation 2026-06-12 §Q2A/§(d)): the prior
@@ -1925,6 +1977,35 @@ def download_bayes_precision_fusion_extra_raw_inputs(
             model, city, target_date, metric, source_cycle_time, endpoint
         ) in persisted_cycle_keys
 
+    def _memoized_unmaterializable(
+        *,
+        model: str,
+        city: str,
+        target_date: str,
+        source_cycle_time: str,
+    ) -> bool:
+        """A prior pass proved this (model, city, target_date) unmaterializable from THIS run.
+
+        The scope still enters the report (so the source-clock status stays honest and the
+        cursor commits) but never enters attempted_single_scopes — no request is issued.
+        """
+        scope = (model, city, target_date, source_cycle_time)
+        reason = _EXACT_RUN_UNMATERIALIZABLE_MEMO.get(scope)
+        if reason is None:
+            return False
+        if scope not in exact_run_unmaterializable_scopes:
+            exact_run_unmaterializable_scopes.add(scope)
+            exact_run_unmaterializable.append(
+                {
+                    "model": model,
+                    "city": city,
+                    "target_date": target_date,
+                    "source_cycle_time": source_cycle_time,
+                    "reason": reason,
+                }
+            )
+        return True
+
     # De-duplicate targets by (city, target_date, lead_days) for the batched fetch path.
     # The metric dimension is NOT a fetch axis — both high and low come from one payload.
     # All target objects for the same (city, target_date) are kept for row-writing; only
@@ -1982,7 +2063,7 @@ def download_bayes_precision_fusion_extra_raw_inputs(
             ):
                 continue
             request_cycle_iso = request.run.isoformat()
-            if all(
+            persisted_metric_count = sum(
                 _has_persisted_row(
                     model=model,
                     city=city,
@@ -1992,8 +2073,20 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                     endpoint="single_runs",
                 )
                 for metric in required_metrics
-            ):
+            )
+            if persisted_metric_count == len(required_metrics):
                 single_success_models.add(model)
+                continue
+            if _memoized_unmaterializable(
+                model=model,
+                city=city,
+                target_date=target_date,
+                source_cycle_time=request_cycle_iso,
+            ):
+                # A memo-only skip proves nothing was captured — only a persisted metric
+                # may claim single-runs success for this model.
+                if persisted_metric_count:
+                    single_success_models.add(model)
                 continue
             city_plan = locations_by_run[request.run].get(city)
             if city_plan is None:
@@ -2190,11 +2283,22 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                         endpoint="single_runs",
                     )
                 ]
-                if metrics_needed:
-                    single_request_by_model[model] = request
-                    single_models_by_run[request.run].append(model)
-                else:
+                if not metrics_needed:
                     single_success_models.add(model)
+                    continue
+                if _memoized_unmaterializable(
+                    model=model,
+                    city=city,
+                    target_date=target_date,
+                    source_cycle_time=request_cycle_iso,
+                ):
+                    # Immutable run × target local day already proven empty — drop the model
+                    # from this city/date request so no HTTP call is made when none remain.
+                    if len(metrics_needed) < len(required_metrics):
+                        single_success_models.add(model)
+                    continue
+                single_request_by_model[model] = request
+                single_models_by_run[request.run].append(model)
 
             # ONE batched single_runs fetch covers all in-domain models + both metrics.
             for single_run, single_models in sorted(single_models_by_run.items()):
@@ -2247,6 +2351,7 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                         if model not in single_models:
                             continue
                         scope = (model, city, target_date, single_run.isoformat())
+                        reason = str(raw_reason)[:220]
                         exact_run_unmaterializable_scopes.add(scope)
                         exact_run_unmaterializable.append(
                             {
@@ -2254,9 +2359,10 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                                 "city": city,
                                 "target_date": target_date,
                                 "source_cycle_time": single_run.isoformat(),
-                                "reason": str(raw_reason)[:220],
+                                "reason": reason,
                             }
                         )
+                        _memoize_exact_run_gap(scope, reason)
                 if single_transport_error is not None:
                     single_error_text = str(single_transport_error[0])
                     transport_errors.append(
@@ -2484,8 +2590,12 @@ def download_bayes_precision_fusion_extra_raw_inputs(
         else "BAYES_PRECISION_FUSION_EXTRA_TRANSPORT_RETRYABLE"
         if transport_errors and (abort_transport or not single_success_models)
         else "BAYES_PRECISION_FUSION_EXTRA_EXACT_RUN_UNMATERIALIZABLE"
+        # Memoized scopes are skipped WITHOUT being attempted, so the terminal verdict keys
+        # on the unmaterializable set: every scope still in play is proven empty for this
+        # immutable run. That maps to SOURCE_CLOCK_SOURCE_PERMANENT_FAILURE upstream, which
+        # commits the source cursor instead of re-detecting the same change every 15s.
         if (
-            attempted_single_scopes
+            exact_run_unmaterializable_scopes
             and attempted_single_scopes <= exact_run_unmaterializable_scopes
         )
         else "BAYES_PRECISION_FUSION_EXTRA_RAW_INPUTS_DOWNLOADED"
