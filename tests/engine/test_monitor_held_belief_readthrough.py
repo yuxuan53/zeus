@@ -1,6 +1,6 @@
 # Created: 2026-06-21
-# Last reused or audited: 2026-09-03
-# Lifecycle: created=2026-06-21; last_reviewed=2026-09-03; last_reused=2026-09-03
+# Last reused or audited: 2026-09-04
+# Lifecycle: created=2026-06-21; last_reviewed=2026-09-04; last_reused=2026-09-04
 # Authority basis: docs/evidence/live_order_pathology/2026-06-21_forward_chain_diagnosis.md
 #   "CHOSEN FIX (consult-validated, two layers)" — LAYER 2 monitor read-through.
 """ANTIBODY: stale held belief must recover without blocking portfolio monitoring.
@@ -1785,7 +1785,11 @@ def test_day0_pinned_current_local_day_requires_hwm_station_witness(
         source_available_at="2026-06-09T06:00:00+00:00",
         provenance_json=pinned_provenance,
     )
-    observed = {"hwm_callback": 0, "generic_reader": 0}
+    observed = {
+        "hwm_callback": 0,
+        "generic_reader": 0,
+        "current_day0_facts": None,
+    }
 
     class _Bound:
         def evaluate(self, _request):
@@ -1832,10 +1836,9 @@ def test_day0_pinned_current_local_day_requires_hwm_station_witness(
     )
     monkeypatch.setattr(day0_hard_fact_exit, "_final_daily_observation_extreme", lambda **_: None)
     monkeypatch.setattr(target_plan, "_latest_authorized_day0_fact", lambda *_a, **_k: fact)
-    monkeypatch.setattr(
-        era,
-        "_global_day0_execution_payload",
-        lambda *_args, **_kwargs: {
+    def capture_global_day0_payload(*_args, **kwargs):
+        observed["current_day0_facts"] = kwargs.get("current_day0_facts")
+        return {
             "_edli_global_day0_binding": {"observation_time": observation_time},
             "settlement_source": "aviationweather_metar",
             "observation_time": observation_time,
@@ -1850,7 +1853,12 @@ def test_day0_pinned_current_local_day_requires_hwm_station_witness(
                 "posterior_identity_hash": pinned_bundle.posterior_identity_hash,
                 "source_cycle_time": pinned_bundle.source_cycle_time,
             },
-        },
+        }
+
+    monkeypatch.setattr(
+        era,
+        "_global_day0_execution_payload",
+        capture_global_day0_payload,
     )
     monkeypatch.setattr(
         era,
@@ -1917,7 +1925,11 @@ def test_day0_pinned_current_local_day_requires_hwm_station_witness(
         pinned_complete_bundle=pinned_bundle,
     )
 
-    assert observed == {"hwm_callback": 0, "generic_reader": 0}
+    assert observed == {
+        "hwm_callback": 0,
+        "generic_reader": 0,
+        "current_day0_facts": (fact, fact),
+    }
     assert prepared.posterior_id == pinned_bundle.posterior_id
     assert isinstance(
         prepared.probability_witness,

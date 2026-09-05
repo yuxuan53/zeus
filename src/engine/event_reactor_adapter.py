@@ -36215,6 +36215,11 @@ def _global_day0_execution_payload(
     posterior_id: object | None,
     probability_base_identity: object | None = None,
     allow_equivalent_conditioning_clock_advance: bool = False,
+    current_day0_facts: tuple[
+        Mapping[str, object] | None,
+        Mapping[str, object] | None,
+    ]
+    | None = None,
 ) -> dict[str, object]:
     """Bind Day0 q to one current canonical observation state."""
 
@@ -36229,22 +36234,25 @@ def _global_day0_execution_payload(
 
     carrier = _payload(event)
     assert_live_day0_payload_authority(carrier)
-    settlement_fact = _latest_authorized_day0_fact(
-        observation_conn,
-        city=str(getattr(family, "city", "") or ""),
-        target_date=str(getattr(family, "target_date", "") or ""),
-        temperature_metric=str(getattr(family, "metric", "") or ""),
-        decision_time=decision_time,
-        require_settlement_channel=True,
-    )
-    physical_fact = _latest_authorized_day0_fact(
-        observation_conn,
-        city=str(getattr(family, "city", "") or ""),
-        target_date=str(getattr(family, "target_date", "") or ""),
-        temperature_metric=str(getattr(family, "metric", "") or ""),
-        decision_time=decision_time,
-        require_settlement_channel=False,
-    )
+    if current_day0_facts is None:
+        settlement_fact = _latest_authorized_day0_fact(
+            observation_conn,
+            city=str(getattr(family, "city", "") or ""),
+            target_date=str(getattr(family, "target_date", "") or ""),
+            temperature_metric=str(getattr(family, "metric", "") or ""),
+            decision_time=decision_time,
+            require_settlement_channel=True,
+        )
+        physical_fact = _latest_authorized_day0_fact(
+            observation_conn,
+            city=str(getattr(family, "city", "") or ""),
+            target_date=str(getattr(family, "target_date", "") or ""),
+            temperature_metric=str(getattr(family, "metric", "") or ""),
+            decision_time=decision_time,
+            require_settlement_channel=False,
+        )
+    else:
+        settlement_fact, physical_fact = current_day0_facts
     city = runtime_cities_by_name().get(str(getattr(family, "city", "") or ""))
     if city is None:
         raise ValueError("GLOBAL_DAY0_CITY_CONFIG_MISSING")
@@ -38420,7 +38428,9 @@ def _prepare_current_global_probability_family(
     provisional_day0_observation = False
     post_local_incomplete_monitor_authority = False
     provisional_day0_fact: Mapping[str, object] | None = None
+    settlement_day0_fact: Mapping[str, object] | None = None
     physical_day0_fact: Mapping[str, object] | None = None
+    day0_facts_loaded = False
     fast_residual_conditioning: Mapping[str, object] | None = None
     probability_conditioning_is_provisional = False
     physical_frontier_requires_confirmation = False
@@ -38520,6 +38530,8 @@ def _prepare_current_global_probability_family(
                     decision_time=decision_time,
                     require_settlement_channel=False,
                 )
+                settlement_day0_fact = provisional_day0_fact
+                day0_facts_loaded = True
                 physical_frontier_requires_confirmation = bool(
                     entry_authority
                     and _day0_physical_frontier_supersedes_settlement(
@@ -39142,6 +39154,11 @@ def _prepare_current_global_probability_family(
                 allow_equivalent_conditioning_clock_advance=(
                     not entry_authority
                     or remaining_path_supporting_conditioning
+                ),
+                current_day0_facts=(
+                    (settlement_day0_fact, physical_day0_fact)
+                    if day0_facts_loaded
+                    else None
                 ),
             )
             redecision_scope = _day0_redecision_authority_scope(
