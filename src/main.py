@@ -2646,6 +2646,15 @@ def _run_ws_gap_reconcile_if_required(
         summary = ws_guard.summary()
     if not bool(summary.get("m5_reconcile_required", False)):
         return {"status": "not_required"}
+    can_clear = getattr(ws_guard, "m5_reconcile_can_clear", None)
+    if callable(can_clear) and not can_clear(now=current):
+        logger.debug(
+            "M5 WS-gap reconcile skipped: latch cannot clear from this process "
+            "(ws_gap=%s:%s); no venue read or trade write issued",
+            summary.get("subscription_state"),
+            summary.get("gap_reason"),
+        )
+        return {"status": "skipped", "reason": "m5_latch_not_clearable"}
     def _release_retries(conn, result: dict) -> dict:
         if result.get("status") != "cleared":
             logger.info("M5 WS-gap reconcile kept submit latch closed: %s", result)

@@ -358,6 +358,20 @@ def clear_after_no_local_side_effects(
     return _status
 
 
+def m5_reconcile_can_clear(*, now: datetime | None = None) -> bool:
+    """Whether ``clear_after_m5_reconcile`` can succeed on this process's own status.
+
+    The clear reads the module singleton, never the sidecar-derived
+    ``summary()``. In the order daemon that singleton stays at the clean-boot
+    default, so a sweep run there can only roll back; callers check this before
+    enumerating the venue or opening the exclusive trade write transaction.
+    """
+    current = _status
+    return current.subscription_state in {"AUTHED", "SUBSCRIBED"} and not current.is_stale(
+        now=now or _utcnow()
+    )
+
+
 def clear_after_m5_reconcile(
     *,
     observed_at: datetime | None = None,

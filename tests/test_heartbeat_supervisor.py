@@ -2541,6 +2541,75 @@ def test_venue_background_m5_reconcile_cold_boot_failure_keeps_latch(monkeypatch
     assert guard.summary()["m5_reconcile_required"] is True
 
 
+def test_venue_background_m5_skips_sweep_when_latch_cannot_clear(monkeypatch):
+    """A latch this process cannot clear must not cost a venue read or a trade write."""
+    from src import main
+    from src.execution import exchange_reconcile, venue_sync_contract
+
+    class Guard:
+        def summary(self, *, now=None):
+            return {
+                "m5_reconcile_required": True,
+                "subscription_state": "DISCONNECTED",
+                "gap_reason": "not_configured",
+                "stale_after_seconds": 60,
+            }
+
+        def m5_reconcile_can_clear(self, *, now=None):
+            return False
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("sweep phases must not run when the latch cannot clear")
+
+    monkeypatch.setattr(exchange_reconcile, "ws_gap_local_order_ids", _forbidden)
+    monkeypatch.setattr(exchange_reconcile, "fresh_reconcile_snapshot", _forbidden)
+    monkeypatch.setattr(
+        exchange_reconcile, "apply_ws_gap_reconcile_snapshot_and_clear", _forbidden
+    )
+    monkeypatch.setattr(venue_sync_contract, "run_three_phase", _forbidden)
+    result = main._run_ws_gap_reconcile_if_required(
+        object(),
+        ws_guard=Guard(),
+        now=datetime(2026, 9, 5, 7, 0, tzinfo=timezone.utc),
+    )
+    assert result == {"status": "skipped", "reason": "m5_latch_not_clearable"}
+
+
+def test_ws_gap_guard_m5_can_clear_mirrors_clear_precondition():
+    """``m5_reconcile_can_clear`` is exactly the guard ``clear_after_m5_reconcile`` enforces."""
+    from src.control import ws_gap_guard
+
+    now = datetime(2026, 9, 5, 7, 0, tzinfo=timezone.utc)
+    booted = ws_gap_guard.WSGapStatus(
+        connected=False,
+        last_message_at=None,
+        subscription_state="DISCONNECTED",
+        gap_reason="not_configured",
+        m5_reconcile_required=True,
+        updated_at=now,
+    )
+    healthy = ws_gap_guard.WSGapStatus(
+        connected=True,
+        last_message_at=now,
+        subscription_state="SUBSCRIBED",
+        gap_reason="message_received",
+        m5_reconcile_required=True,
+        updated_at=now,
+    )
+    previous = ws_gap_guard.status()
+    try:
+        ws_gap_guard.configure_status(booted)
+        assert ws_gap_guard.m5_reconcile_can_clear(now=now) is False
+        with pytest.raises(ws_gap_guard.WSGapSubmitBlocked):
+            ws_gap_guard.clear_after_m5_reconcile(observed_at=now)
+        ws_gap_guard.configure_status(healthy)
+        assert ws_gap_guard.m5_reconcile_can_clear(now=now) is True
+        cleared = ws_gap_guard.clear_after_m5_reconcile(observed_at=now)
+        assert cleared.m5_reconcile_required is False
+    finally:
+        ws_gap_guard.configure_status(previous)
+
+
 def test_venue_background_m5_default_route_separates_db_and_network(monkeypatch):
     """The live route must capture venue truth between two closed DB phases."""
     from src import main

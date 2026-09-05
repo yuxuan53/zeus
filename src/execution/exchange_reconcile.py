@@ -977,10 +977,10 @@ def _is_market_in_zeus_domain(conn: sqlite3.Connection, market_id: str) -> bool:
     if not market_id:
         return True
     try:
-        snapshot_total = conn.execute(
-            "SELECT COUNT(*) FROM executable_market_snapshots"
+        any_snapshot = conn.execute(
+            "SELECT 1 FROM executable_market_snapshots LIMIT 1"
         ).fetchone()
-        if snapshot_total is None or int(snapshot_total[0]) == 0:
+        if any_snapshot is None:
             return True
         in_snapshots = conn.execute(
             "SELECT 1 FROM executable_market_snapshots WHERE condition_id = ? LIMIT 1",
