@@ -12919,12 +12919,8 @@ def _full_close_intent_matches_command_size(
     ):
         return False
     share_grid = Decimal("0.01")
-    numeric_tolerance = Decimal("0.000001")
     floored_intent = intended_shares.quantize(share_grid, rounding=ROUND_FLOOR)
-    return bool(
-        Decimal("0") <= intended_shares - command_size < share_grid
-        and abs(command_size - floored_intent) <= numeric_tolerance
-    )
+    return command_size == floored_intent
 
 
 def _post_exit_residual_holding_from_command_flow(

@@ -30671,18 +30671,18 @@ class TestRecoveryResolutionTable:
         mock_client,
     ):
         """A full-close FAK may floor to venue share precision, never more."""
-        _insert(conn, command_id="cmd-entry", position_id="pos-001", size=14.84, price=0.50)
+        _insert(conn, command_id="cmd-entry", position_id="pos-001", size=48.22, price=0.50)
         _advance_to_acked(conn, command_id="cmd-entry", venue_order_id="ord-entry")
         _seed_pending_entry_projection(conn, command_id="cmd-entry", order_id="ord-entry")
         conn.execute(
             """
             UPDATE position_current
                SET phase = 'pending_exit',
-                   shares = 14.845,
+                   shares = 48.2258,
                    chain_state = 'synced',
-                   chain_shares = 1.845,
-                   chain_cost_basis_usd = 0.9225,
-                   cost_basis_usd = 7.4225,
+                   chain_shares = 43.2258,
+                   chain_cost_basis_usd = 21.6129,
+                   cost_basis_usd = 24.1129,
                    entry_price = 0.50,
                    order_status = 'sell_pending_confirmation'
              WHERE position_id = 'pos-001'
@@ -30691,7 +30691,7 @@ class TestRecoveryResolutionTable:
         _seed_full_exit_intent(
             conn,
             position_id="pos-001",
-            shares=14.845,
+            shares=48.2258,
             occurred_at="2026-07-28T00:01:00Z",
         )
         _insert(
@@ -30701,7 +30701,7 @@ class TestRecoveryResolutionTable:
             intent_kind="EXIT",
             side="SELL",
             order_type="FAK",
-            size=14.84,
+            size=48.22,
             price=0.86,
             token_id="tok-001",
             created_at="2026-07-28T00:01:01Z",
@@ -30717,7 +30717,7 @@ class TestRecoveryResolutionTable:
             order_id="ord-exit-underfill",
             trade_id="0xunderfill",
             state="CONFIRMED",
-            filled_size="13",
+            filled_size="5",
             fill_price="0.86",
             tx_hash="0xunderfill",
         )
@@ -30748,9 +30748,9 @@ class TestRecoveryResolutionTable:
         ).fetchone()
         assert dict(current) == {
             "phase": "active",
-            "shares": 1.845,
-            "chain_shares": 1.845,
-            "cost_basis_usd": 0.9225,
+            "shares": 43.2258,
+            "chain_shares": 43.2258,
+            "cost_basis_usd": 21.6129,
         }
 
     @pytest.mark.parametrize(
@@ -30759,6 +30759,8 @@ class TestRecoveryResolutionTable:
             ("48.2258", "48.22", True),
             ("48.2258", "48.21", False),
             ("48.2258", "48.23", False),
+            ("48.2258", "48.2200001", False),
+            ("48.2258", "48.2199999", False),
         ),
     )
     def test_terminal_partial_full_close_accepts_only_floor_grid_command_size(
