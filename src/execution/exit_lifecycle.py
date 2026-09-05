@@ -3116,7 +3116,9 @@ def _flash_crash_monitor_semantic_receipt(
         # Keeping the absolute price band at the protective-order boundary lets
         # an out-of-band crash persist EXIT_INTENT and retry without minting an
         # illegal venue command.
+        or isinstance(payload.get("last_monitor_best_bid"), bool)
         or not math.isfinite(best_bid)
+        or not 0.0 <= best_bid <= 1.0
         or not {
             "flash_crash_persistent_market_evidence",
             "flash_crash_trigger",

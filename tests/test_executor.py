@@ -1,4 +1,4 @@
-# Lifecycle: created=2026-04-27; last_reviewed=2026-08-22; last_reused=2026-08-22
+# Lifecycle: created=2026-04-27; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Purpose: Regression coverage for executor and portfolio mechanics under R3 cutover preflight opt-outs.
 # Reuse: Run when executor order submission or portfolio save/load mechanics change.
 # Created: 2026-04-27
@@ -3060,6 +3060,10 @@ class TestExecutor:
         (
             {"held_sell_full_depth_action_authority": False},
             {"last_monitor_market_price_is_fresh": False},
+            {"last_monitor_best_bid": -1},
+            {"last_monitor_best_bid": 1.01},
+            {"last_monitor_best_bid": True},
+            {"last_monitor_best_bid": False},
             {"market_velocity_1h": None},
             {"flash_crash_count": None},
             {"applied_validations": ["flash_crash_trigger"]},
@@ -3126,6 +3130,15 @@ class TestExecutor:
             _TEST_CONN,
             position_id=position_id,
         ) is None
+        assert _TEST_CONN.execute(
+            "SELECT COUNT(*) FROM position_events "
+            "WHERE position_id=? AND event_type='EXIT_INTENT'",
+            (position_id,),
+        ).fetchone()[0] == 0
+        assert _TEST_CONN.execute(
+            "SELECT COUNT(*) FROM venue_commands WHERE position_id=?",
+            (position_id,),
+        ).fetchone()[0] == 0
 
     def test_untyped_protective_fak_is_rejected_before_persistence(self, monkeypatch):
         from src.state.snapshot_repo import get_snapshot
