@@ -2103,16 +2103,17 @@ def _quote_only_monitor_repair_handoff_admission(
         != open_count
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:open_partition_incomplete"
-    # Closed-market/settlement-recoverable positions do not acquire a newer
-    # executable quote by waiting.  Permit only that exact stale subset; an
-    # active position with stale monitor evidence still refuses the restart.
+    # Closed-market positions do not acquire a newer executable quote by
+    # waiting.  A stale active position may also hand off only when it is an
+    # exact restart blocker whose current held book independently proves that
+    # no legal SELL exists; the proof is rechecked below before admission.
     if (
         len(settlement_ids)
         != int(handoff.get("settlement_recoverable_position_count") or 0)
         or len(settlement_set) != len(settlement_ids)
         or not settlement_set.issubset(no_action_set)
         or stale_timestamp_set != stale_classified_set
-        or not stale_timestamp_set.issubset(settlement_set)
+        or not stale_timestamp_set.issubset(settlement_set | restart_ids)
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:stale_partition_invalid"
     settlement_ids = {

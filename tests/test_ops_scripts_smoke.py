@@ -4897,11 +4897,12 @@ def test_deploy_live_stale_monitor_repair_never_abandons_executable_exit(
         fresh_failed_monitor_no_action_position_count=1,
         fresh_failed_monitor_no_action_position_ids=("pos-stale",),
         fresh_failed_monitor_other_classified_position_ids=(),
+        fresh_failed_monitor_timestamp_stale_position_ids=("pos-stale",),
         restart_blocking_position_count=1,
         restart_blocking_position_ids=("pos-stale",),
         settlement_recoverable_position_count=0,
         settlement_recoverable_position_ids=(),
-        stale_classified_position_ids=(),
+        stale_classified_position_ids=("pos-stale",),
     )
     monkeypatch.setattr(
         dl,
