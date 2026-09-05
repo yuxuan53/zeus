@@ -2228,12 +2228,15 @@ def load_portfolio(
     *,
     open_positions_only: bool = False,
     target_families: Collection[tuple[str, str, str]] | None = None,
+    monitor_bootstrap_only: bool = False,
     connection: sqlite3.Connection | None = None,
     deadline_monotonic: float | None = None,
 ) -> PortfolioState:
     """Load canonical portfolio truth, optionally limited to runtime-open rows."""
     if target_families is not None and not open_positions_only:
         raise ValueError("target_families requires open_positions_only=True")
+    if monitor_bootstrap_only and not open_positions_only:
+        raise ValueError("monitor_bootstrap_only requires open_positions_only=True")
     if (
         deadline_monotonic is not None
         and time.monotonic() >= float(deadline_monotonic)
@@ -2314,6 +2317,7 @@ def load_portfolio(
             conn,
             open_positions_only=open_positions_only,
             target_families=target_families,
+            monitor_bootstrap_only=monitor_bootstrap_only,
         )
         if not open_positions_only:
             entry_proof_review_reasons = _query_edli_entry_proof_review_reasons(

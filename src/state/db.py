@@ -12447,7 +12447,10 @@ def query_portfolio_loader_view(
     runtime_exposure_only: bool = False,
     open_positions_only: bool = False,
     target_families: Iterable[tuple[str, str, str]] | None = None,
+    monitor_bootstrap_only: bool = False,
 ) -> dict:
+    if monitor_bootstrap_only and not open_positions_only:
+        raise ValueError("monitor_bootstrap_only requires open_positions_only=True")
     if conn is None:
         return {
             "status": "skipped_no_connection",
@@ -12604,6 +12607,11 @@ def query_portfolio_loader_view(
 
     trade_ids = [str(row["trade_id"] or row["position_id"] or "") for row in rows]
     position_ids = [str(row["position_id"] or row["trade_id"] or "") for row in rows]
+    fill_hints = _query_entry_execution_fill_hints(
+        conn,
+        trade_ids,
+        strict=runtime_exposure_only,
+    )
     # Sizing consumes current exposure and fill economics only. Entry/Day0/exit
     # timestamps and event-derived env are recovery/monitoring concerns; avoid
     # their per-position event seeks on the reactor's runtime-open hot path.
@@ -12612,12 +12620,11 @@ def query_portfolio_loader_view(
         transitional_hints: dict[str, dict] = {}
     else:
         event_envs = _latest_position_event_envs(conn, position_ids)
-        transitional_hints = _query_transitional_position_hints(conn, trade_ids)
-    fill_hints = _query_entry_execution_fill_hints(
-        conn,
-        trade_ids,
-        strict=runtime_exposure_only,
-    )
+        transitional_hints = (
+            _query_held_monitor_transition_hints(conn, rows, fill_hints)
+            if monitor_bootstrap_only
+            else _query_transitional_position_hints(conn, trade_ids)
+        )
 
     positions: list[dict] = []
     for row in rows:
@@ -14048,6 +14055,93 @@ def _assert_runtime_exposure_hydrated_economics(
 
 
 
+
+
+def _query_held_monitor_transition_hints(
+    conn: sqlite3.Connection,
+    rows: Iterable[sqlite3.Row],
+    fill_hints: Mapping[str, dict],
+) -> dict[str, dict]:
+    """Read only lifecycle clocks that a current held position can consume.
+
+    The general portfolio loader reconstructs a broad compatibility envelope
+    from up to forty event rows per position.  A held monitor already has the
+    current phase, order state, retry state, and economics in
+    ``position_current`` plus ``execution_fact``.  Replaying that broad event
+    envelope ahead of every probability decision made dense monitor history an
+    I/O multiplier on the live claim.  This projection therefore reads only:
+
+    * the latest canonical entry-fill clock (with ``fill_hints`` fallback);
+    * the latest Day0 transition for a row currently in ``day0_window``; and
+    * the existing full transition reconstruction only for ``pending_exit``.
+
+    All queries are exact ``position_id`` seeks on existing indexes.  Historical
+    and operator views keep the full transitional reconstruction.
+    """
+
+    current_rows = tuple(rows)
+    pending_trade_ids = [
+        str(row["trade_id"] or row["position_id"] or "")
+        for row in current_rows
+        if str(row["phase"] or "") == "pending_exit"
+    ]
+    # Pending-exit recovery consumes the full transition state machine. Keep
+    # the existing exact reconstruction for that small phase-scoped subset;
+    # the hot-path reduction applies to ordinary active/Day0 holdings.
+    hints = _query_transitional_position_hints(conn, pending_trade_ids)
+    for row in current_rows:
+        trade_id = str(row["trade_id"] or row["position_id"] or "")
+        if not trade_id:
+            continue
+        phase = str(row["phase"] or "")
+        if phase == "pending_exit":
+            continue
+
+        entry = conn.execute(
+            """
+            SELECT occurred_at
+              FROM position_events
+             WHERE position_id = ?
+               AND event_type = 'ENTRY_ORDER_FILLED'
+             ORDER BY sequence_no DESC
+             LIMIT 1
+            """,
+            (trade_id,),
+        ).fetchone()
+        entered_at = str(entry["occurred_at"] or "") if entry is not None else ""
+        if not entered_at:
+            entered_at = str(
+                (fill_hints.get(trade_id) or {}).get(
+                    "execution_fact_filled_at"
+                )
+                or ""
+            )
+        if entered_at:
+            hints.setdefault(trade_id, {})["entered_at"] = entered_at
+
+        if phase == "day0_window":
+            event = conn.execute(
+                """
+                SELECT occurred_at, payload_json
+                  FROM position_events
+                 WHERE position_id = ?
+                   AND event_type = 'DAY0_WINDOW_ENTERED'
+                 ORDER BY sequence_no DESC
+                 LIMIT 1
+                """,
+                (trade_id,),
+            ).fetchone()
+            if event is not None:
+                try:
+                    payload = json.loads(event["payload_json"] or "{}")
+                except Exception:
+                    payload = {}
+                entered = str(
+                    payload.get("day0_entered_at") or event["occurred_at"] or ""
+                )
+                if entered:
+                    hints.setdefault(trade_id, {})["day0_entered_at"] = entered
+    return hints
 
 
 def _query_transitional_position_hints(

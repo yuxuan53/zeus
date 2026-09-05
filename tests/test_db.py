@@ -2076,6 +2076,76 @@ def test_portfolio_loader_open_only_filters_target_families_in_sql(tmp_path):
     assert [row["position_id"] for row in view["positions"]] == ["paris-position"]
 
 
+def test_held_monitor_loader_does_not_replay_dense_generic_transition_history(tmp_path):
+    from src.state.db import query_portfolio_loader_view
+
+    conn = get_connection(tmp_path / "held-monitor-bootstrap.db")
+    init_schema(conn)
+    position_id = "dense-held-monitor-history"
+    _insert_current_position_for_fill_authority_view_test(
+        conn,
+        position_id=position_id,
+        phase="day0_window",
+    )
+    _insert_entry_execution_fact_for_fill_authority_view_test(
+        conn,
+        position_id=position_id,
+        terminal_exec_status="filled",
+        filled_at="2026-04-01T00:00:03+00:00",
+    )
+    _insert_status_position_event_for_view_test(
+        conn,
+        position_id=position_id,
+        event_type="DAY0_WINDOW_ENTERED",
+        status="entered",
+        occurred_at="2026-04-01T00:05:00+00:00",
+        payload={"day0_entered_at": "2026-04-01T00:05:00+00:00"},
+    )
+    conn.executemany(
+        """
+        INSERT INTO position_events (
+            event_id, position_id, event_version, sequence_no, event_type, occurred_at,
+            phase_before, phase_after, strategy_key, decision_id, snapshot_id, order_id,
+            command_id, caused_by, idempotency_key, venue_status, source_module, env,
+            payload_json
+        ) VALUES (?, ?, 1, ?, 'MONITOR_REFRESHED', ?, 'day0_window', 'day0_window',
+                  'center_buy', NULL, 'snap-fill', NULL, NULL, 'test', ?, NULL,
+                  'tests', 'test', '{}')
+        """,
+        (
+            (
+                f"{position_id}:monitor:{sequence_no}",
+                position_id,
+                sequence_no,
+                f"2026-04-01T01:{sequence_no // 60:02d}:{sequence_no % 60:02d}+00:00",
+                f"{position_id}:monitor:{sequence_no}",
+            )
+            for sequence_no in range(2, 3002)
+        ),
+    )
+    conn.commit()
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    view = query_portfolio_loader_view(
+        conn,
+        open_positions_only=True,
+        monitor_bootstrap_only=True,
+    )
+    conn.set_trace_callback(None)
+    conn.close()
+
+    assert view["positions"][0]["entered_at"] == "2026-04-01T00:00:03+00:00"
+    assert view["positions"][0]["day0_entered_at"] == "2026-04-01T00:05:00+00:00"
+    event_reads = [
+        statement
+        for statement in statements
+        if "FROM position_events" in statement
+    ]
+    assert len(event_reads) == 3
+    assert all("event_type IN" not in statement for statement in event_reads)
+
+
 def test_position_current_views_use_fill_authority_current_open_economics(tmp_path):
     from src.state.db import (
         query_portfolio_loader_view,

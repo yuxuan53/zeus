@@ -14207,6 +14207,7 @@ def _load_held_monitor_bootstrap(
             portfolio = load_portfolio(
                 open_positions_only=True,
                 target_families=target_families,
+                monitor_bootstrap_only=True,
                 connection=conn,
                 deadline_monotonic=deadline_monotonic,
             )
