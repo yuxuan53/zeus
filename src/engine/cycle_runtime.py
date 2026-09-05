@@ -23,6 +23,7 @@ import time
 import uuid
 from bisect import bisect_right
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -3449,6 +3450,83 @@ def _canonical_trade_write_lease(conn, *, owner: str, deadline_ms: int, max_hold
     )
 
 
+def _is_canonical_trade_connection(conn) -> bool:
+    """Whether ``conn`` is the live TRADE DB rather than a test fixture."""
+
+    from pathlib import Path
+
+    from src.state.db import _zeus_trade_db_path
+
+    try:
+        main_path = next(
+            (
+                Path(str(row[2])).resolve(strict=False)
+                for row in conn.execute("PRAGMA database_list").fetchall()
+                if str(row[1]) == "main" and str(row[2])
+            ),
+            None,
+        )
+    except Exception as exc:
+        raise CanonicalTradeWriteIdentityError(
+            "CANONICAL_TRADE_DB_IDENTITY_UNAVAILABLE"
+        ) from exc
+    return main_path == _zeus_trade_db_path().resolve(strict=False)
+
+
+@contextmanager
+def _fresh_canonical_trade_write_transaction(
+    conn,
+    *,
+    owner: str,
+    deadline_ms: int,
+    max_hold_ms: int,
+):
+    """Yield one fresh MONITOR TRADE transaction for canonical monitor evidence.
+
+    A long-lived monitor connection can retain a pre-write WAL snapshot. A
+    coordinator lease cannot make that snapshot upgradeable after another writer
+    commits, so canonical writes use a newly opened ``BEGIN IMMEDIATE`` unit.
+    Noncanonical fixtures retain the historical connection seam.
+    """
+
+    if not _is_canonical_trade_connection(conn):
+        from src.state.write_coordinator import bounded_sqlite_write
+
+        with _canonical_trade_write_lease(
+            conn,
+            owner=owner,
+            deadline_ms=deadline_ms,
+            max_hold_ms=max_hold_ms,
+        ) as lease:
+            if lease is None:
+                yield conn, False
+                return
+            with bounded_sqlite_write(conn, lease, max_hold_ms=max_hold_ms):
+                yield conn, False
+        return
+
+    from src.state.db import connect_existing_trade_db_without_journal_bootstrap
+    from src.state.db_writer_lock import WriteClass
+    from src.state.write_coordinator import (
+        DBIdentity,
+        TransactionMode,
+        WritePriority,
+        default_runtime_write_coordinator,
+    )
+
+    with default_runtime_write_coordinator().transaction(
+        (DBIdentity.TRADE,),
+        owner=owner,
+        write_class=WriteClass.LIVE,
+        priority=WritePriority.MONITOR,
+        deadline_ms=deadline_ms,
+        max_hold_ms=max_hold_ms,
+        mode=TransactionMode.IMMEDIATE,
+        connection_factory=connect_existing_trade_db_without_journal_bootstrap,
+    ) as write_tx:
+        yield write_tx.connection, True
+
+
 def _emit_monitor_refreshed_canonical_if_available(
     conn,
     pos,
@@ -3466,7 +3544,7 @@ def _emit_monitor_refreshed_canonical_if_available(
 
     from src.engine.lifecycle_events import build_monitor_refreshed_canonical_write
     from src.state.db import append_many_and_project
-    from src.state.write_coordinator import WriteLeaseTimeout, bounded_sqlite_write
+    from src.state.write_coordinator import WriteLeaseTimeout
 
     position_id = str(getattr(pos, "trade_id", "") or "").strip()
     if not position_id:
@@ -3503,8 +3581,8 @@ def _emit_monitor_refreshed_canonical_if_available(
             )
             return False
 
-    def append_frozen_monitor_refreshed() -> bool:
-        current = conn.execute(
+    def append_frozen_monitor_refreshed(write_conn, *, transaction_managed: bool) -> bool:
+        current = write_conn.execute(
             "SELECT phase, updated_at FROM position_current WHERE position_id = ?",
             (position_id,),
         ).fetchone()
@@ -3569,7 +3647,7 @@ def _emit_monitor_refreshed_canonical_if_available(
         # long-held positions and could retain the monitor claim far beyond the
         # nominal writer-lease budget, starving both exits and the global
         # auction.
-        latest_monitor = conn.execute(
+        latest_monitor = write_conn.execute(
             """
             SELECT occurred_at
               FROM position_events
@@ -3586,7 +3664,7 @@ def _emit_monitor_refreshed_canonical_if_available(
         ):
             pos.last_monitor_at = monitor_occurred_at
             return True
-        row = conn.execute(
+        row = write_conn.execute(
             "SELECT COALESCE(MAX(sequence_no), 0) FROM position_events WHERE position_id = ?",
             (position_id,),
         ).fetchone()
@@ -3655,11 +3733,12 @@ def _emit_monitor_refreshed_canonical_if_available(
                         default=str,
                         sort_keys=True,
                     )
-            append_many_and_project(conn, events, projection)
-            conn.commit()
+            append_many_and_project(write_conn, events, projection)
+            if not transaction_managed:
+                write_conn.commit()
         except Exception:
             try:
-                conn.rollback()
+                write_conn.rollback()
             except Exception:
                 pass
             pos.last_monitor_at = previous_monitor_at
@@ -3667,36 +3746,28 @@ def _emit_monitor_refreshed_canonical_if_available(
         return True
 
     try:
-        with _canonical_trade_write_lease(
+        with _fresh_canonical_trade_write_transaction(
             conn,
             owner="monitor_canonical_append",
             deadline_ms=_MONITOR_CANONICAL_WRITE_LEASE_DEADLINE_MS,
             max_hold_ms=_MONITOR_CANONICAL_WRITE_LEASE_MAX_HOLD_MS,
-        ) as lease:
-            if lease is None:
-                return append_frozen_monitor_refreshed()
-            with bounded_sqlite_write(
-                conn,
-                lease,
-                max_hold_ms=_MONITOR_CANONICAL_WRITE_LEASE_MAX_HOLD_MS,
-            ):
-                return append_frozen_monitor_refreshed()
+        ) as (write_conn, transaction_managed):
+            return append_frozen_monitor_refreshed(
+                write_conn,
+                transaction_managed=transaction_managed,
+            )
     except WriteLeaseTimeout as exc:
         try:
-            with _canonical_trade_write_lease(
+            with _fresh_canonical_trade_write_transaction(
                 conn,
                 owner="monitor_canonical_append_retry",
                 deadline_ms=_MONITOR_CANONICAL_WRITE_RETRY_DEADLINE_MS,
                 max_hold_ms=_MONITOR_CANONICAL_WRITE_LEASE_MAX_HOLD_MS,
-            ) as lease:
-                if lease is None:
-                    return append_frozen_monitor_refreshed()
-                with bounded_sqlite_write(
-                    conn,
-                    lease,
-                    max_hold_ms=_MONITOR_CANONICAL_WRITE_LEASE_MAX_HOLD_MS,
-                ):
-                    return append_frozen_monitor_refreshed()
+            ) as (write_conn, transaction_managed):
+                return append_frozen_monitor_refreshed(
+                    write_conn,
+                    transaction_managed=transaction_managed,
+                )
         except WriteLeaseTimeout as retry_exc:
             deps.logger.info(
                 "CANONICAL_MONITOR_REFRESHED_RETRY_DEFERRED_NEXT_CYCLE "

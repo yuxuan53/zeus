@@ -1,7 +1,7 @@
 """Runtime guard and live-cycle wiring tests."""
 # Lifecycle: created=2026-04-28; last_reviewed=2026-08-31; last_reused=2026-08-31
 # Created: 2026-04-28
-# Last reused/audited: 2026-08-31
+# Last reused/audited: 2026-09-05
 # Authority basis: docs/archive/2026-Q2/task_2026-05-15_live_order_e2e_verification/LIVE_ORDER_E2E_VERIFICATION_PLAN.md; task_2026-04-28_contamination_remediation Batch G; Phase 1B ENS snapshot persistence; Phase 1D forecast source policy; PR #56 MarketPhaseEvidence sidecar propagation; Wave26 explicit position env authority; task.md B3 exit executable snapshot identity; docs/operations/task_2026-05-21_live_side_effect_risk_boundaries/task.md P1-2 cluster projection; docs/archive/2026-Q2/task_2026-05-22_crosscheck_valid_window/CROSSCHECK_VALID_WINDOW_PLAN.md.
 #                  2026-08-15 economic-ready recent-exit hotfix.
 # Purpose: Lock runtime guard and live-cycle wiring contracts.
@@ -2216,6 +2216,65 @@ def test_exit_monitor_artifact_reports_bounded_defer_without_partial_row(monkeyp
     assert conn.execute("SELECT COUNT(*) FROM decision_log").fetchone()[0] == 0
     assert conn.in_transaction is False
     conn.close()
+
+
+def test_exit_artifact_fresh_transaction_commits_after_stale_snapshot_upgrade(
+    tmp_path, monkeypatch
+):
+    """Exit artifact persistence must not upgrade a long-lived stale WAL reader."""
+    from src.execution import exit_lifecycle
+    from src.state import db as state_db
+    from src.state import write_coordinator
+    from src.state.write_coordinator import DBIdentity, WriteCoordinator, WritePriority
+
+    db_path = tmp_path / "exit-artifact-stale-snapshot.db"
+    bootstrap = sqlite3.connect(db_path)
+    bootstrap.execute("PRAGMA journal_mode=WAL")
+    bootstrap.execute("CREATE TABLE facts (fact TEXT PRIMARY KEY)")
+    bootstrap.commit()
+    bootstrap.close()
+
+    stale_reader = sqlite3.connect(db_path, timeout=0)
+    advance_writer = sqlite3.connect(db_path, timeout=0)
+    try:
+        stale_reader.execute("BEGIN")
+        stale_reader.execute("SELECT * FROM facts").fetchall()
+        advance_writer.execute("INSERT INTO facts (fact) VALUES ('advanced')")
+        advance_writer.commit()
+
+        with pytest.raises(sqlite3.OperationalError) as stale_upgrade:
+            stale_reader.execute("INSERT INTO facts (fact) VALUES ('old-upgrade')")
+        assert stale_upgrade.value.sqlite_errorcode == sqlite3.SQLITE_BUSY_SNAPSHOT
+
+        coordinator = WriteCoordinator({DBIdentity.TRADE: db_path})
+        monkeypatch.setattr(state_db, "_zeus_trade_db_path", lambda: db_path)
+        monkeypatch.setattr(
+            write_coordinator,
+            "default_runtime_write_coordinator",
+            lambda: coordinator,
+        )
+        with exit_lifecycle._fresh_exit_monitor_artifact_transaction(
+            stale_reader,
+            owner="exit_monitor_artifact",
+            deadline_ms=250,
+            max_hold_ms=250,
+            priority=WritePriority.MONITOR,
+        ) as (fresh_conn, transaction_managed):
+            assert transaction_managed is True
+            assert fresh_conn is not stale_reader
+            fresh_conn.execute("INSERT INTO facts (fact) VALUES ('fresh-artifact')")
+    finally:
+        stale_reader.rollback()
+        stale_reader.close()
+        advance_writer.close()
+
+    check = sqlite3.connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT 1 FROM facts WHERE fact = 'fresh-artifact'"
+        ).fetchone()
+    finally:
+        check.close()
 
 
 @pytest.mark.parametrize(

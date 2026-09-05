@@ -14312,6 +14312,79 @@ def _load_held_monitor_bootstrap(
             conn.close()
 
 
+def _is_canonical_trade_connection(conn: sqlite3.Connection) -> bool:
+    """Whether ``conn`` is the live TRADE DB rather than a test fixture."""
+
+    from pathlib import Path
+
+    from src.state.db import _zeus_trade_db_path
+
+    try:
+        main_path = next(
+            (
+                Path(str(row[2])).resolve(strict=False)
+                for row in conn.execute("PRAGMA database_list").fetchall()
+                if str(row[1]) == "main" and str(row[2])
+            ),
+            None,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "canonical TRADE DB identity unavailable for artifact write"
+        ) from exc
+    return main_path == _zeus_trade_db_path().resolve(strict=False)
+
+
+@contextmanager
+def _fresh_exit_monitor_artifact_transaction(
+    conn: sqlite3.Connection,
+    *,
+    owner: str,
+    deadline_ms: int,
+    max_hold_ms: int,
+    priority,
+):
+    """Yield a fresh MONITOR TRADE transaction for exit-monitor evidence."""
+
+    from src.execution.executor import _canonical_trade_write_lease
+    from src.state.write_coordinator import bounded_sqlite_write
+
+    if not _is_canonical_trade_connection(conn):
+        with _canonical_trade_write_lease(
+            conn,
+            owner=owner,
+            deadline_ms=deadline_ms,
+            max_hold_ms=max_hold_ms,
+            priority=priority,
+        ) as lease:
+            if lease is None:
+                yield conn, False
+                return
+            with bounded_sqlite_write(conn, lease, max_hold_ms=max_hold_ms):
+                yield conn, False
+        return
+
+    from src.state.db import connect_existing_trade_db_without_journal_bootstrap
+    from src.state.db_writer_lock import WriteClass
+    from src.state.write_coordinator import (
+        DBIdentity,
+        TransactionMode,
+        default_runtime_write_coordinator,
+    )
+
+    with default_runtime_write_coordinator().transaction(
+        (DBIdentity.TRADE,),
+        owner=owner,
+        write_class=WriteClass.LIVE,
+        priority=priority,
+        deadline_ms=deadline_ms,
+        max_hold_ms=max_hold_ms,
+        mode=TransactionMode.IMMEDIATE,
+        connection_factory=connect_existing_trade_db_without_journal_bootstrap,
+    ) as write_tx:
+        yield write_tx.connection, True
+
+
 def _persist_exit_monitor_artifact(
     conn: sqlite3.Connection,
     artifact,
@@ -14320,13 +14393,11 @@ def _persist_exit_monitor_artifact(
     deadline_monotonic: float | None = None,
 ) -> tuple[bool, int | None]:
     """Persist the final monitor artifact within the owning claim deadline."""
-    from src.execution.executor import _canonical_trade_write_lease
     from src.state.canonical_write import commit_then_export
     from src.state.decision_chain import store_artifact
     from src.state.write_coordinator import (
         WriteLeaseTimeout,
         WritePriority,
-        bounded_sqlite_write,
     )
 
     if conn.in_transaction:
@@ -14354,26 +14425,21 @@ def _persist_exit_monitor_artifact(
             deadline_ms,
         )
 
-        def db_op():
-            artifact_id[0] = store_artifact(conn, artifact)
+        def db_op(write_conn):
+            artifact_id[0] = store_artifact(write_conn, artifact)
             return artifact_id[0]
 
-        with _canonical_trade_write_lease(
+        with _fresh_exit_monitor_artifact_transaction(
             conn,
             owner=owner,
             deadline_ms=deadline_ms,
             max_hold_ms=max_hold_ms,
             priority=WritePriority.MONITOR,
-        ) as lease:
-            if lease is None:
-                commit_then_export(conn, db_op=db_op)
-                return
-            with bounded_sqlite_write(
-                conn,
-                lease,
-                max_hold_ms=max_hold_ms,
-            ):
-                commit_then_export(conn, db_op=db_op)
+        ) as (write_conn, transaction_managed):
+            if transaction_managed:
+                db_op(write_conn)
+            else:
+                commit_then_export(write_conn, db_op=lambda: db_op(write_conn))
 
     try:
         persist_once(

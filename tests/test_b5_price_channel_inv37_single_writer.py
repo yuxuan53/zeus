@@ -1,6 +1,6 @@
 # Created: 2026-06-20
 # Last audited: 2026-07-30
-# Last reused/audited: 2026-09-02
+# Last reused/audited: 2026-09-05
 # Authority basis: PR415 ChatGPT deep-review blocker B5 (INV-37). Quote projection
 #   writes TRADE only; derived redecision and NEW_MARKET_DISCOVERED facts write WORLD
 #   through independently coordinated lanes. TRADE quote refresh must never acquire
@@ -1103,6 +1103,62 @@ def test_background_fast_yield_releases_trade_gate_for_monitor_append(
     try:
         assert check.execute(
             "SELECT 1 FROM facts WHERE fact = 'monitor-appended'"
+        ).fetchone()
+    finally:
+        check.close()
+
+
+def test_monitor_fresh_transaction_commits_after_stale_snapshot_upgrade(tmp_path, monkeypatch):
+    """A WAL reader that cannot upgrade must not poison canonical monitor append."""
+    from src.engine import cycle_runtime
+    from src.state import db as state_db
+    from src.state import write_coordinator
+    from src.state.write_coordinator import DBIdentity, WriteCoordinator
+
+    db_path = tmp_path / "monitor-stale-snapshot.db"
+    bootstrap = sqlite3.connect(db_path)
+    bootstrap.execute("PRAGMA journal_mode=WAL")
+    bootstrap.execute("CREATE TABLE facts (fact TEXT PRIMARY KEY)")
+    bootstrap.commit()
+    bootstrap.close()
+
+    stale_reader = sqlite3.connect(db_path, timeout=0)
+    advance_writer = sqlite3.connect(db_path, timeout=0)
+    try:
+        stale_reader.execute("BEGIN")
+        stale_reader.execute("SELECT * FROM facts").fetchall()
+        advance_writer.execute("INSERT INTO facts (fact) VALUES ('advanced')")
+        advance_writer.commit()
+
+        with pytest.raises(sqlite3.OperationalError) as stale_upgrade:
+            stale_reader.execute("INSERT INTO facts (fact) VALUES ('old-upgrade')")
+        assert stale_upgrade.value.sqlite_errorcode == sqlite3.SQLITE_BUSY_SNAPSHOT
+
+        coordinator = WriteCoordinator({DBIdentity.TRADE: db_path})
+        monkeypatch.setattr(state_db, "_zeus_trade_db_path", lambda: db_path)
+        monkeypatch.setattr(
+            write_coordinator,
+            "default_runtime_write_coordinator",
+            lambda: coordinator,
+        )
+        with cycle_runtime._fresh_canonical_trade_write_transaction(
+            stale_reader,
+            owner="monitor_canonical_append",
+            deadline_ms=250,
+            max_hold_ms=250,
+        ) as (fresh_conn, transaction_managed):
+            assert transaction_managed is True
+            assert fresh_conn is not stale_reader
+            fresh_conn.execute("INSERT INTO facts (fact) VALUES ('fresh-monitor')")
+    finally:
+        stale_reader.rollback()
+        stale_reader.close()
+        advance_writer.close()
+
+    check = sqlite3.connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT 1 FROM facts WHERE fact = 'fresh-monitor'"
         ).fetchone()
     finally:
         check.close()
