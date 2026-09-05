@@ -5401,10 +5401,12 @@ def test_seed_cycle_boundary_uses_ordered_live_family_index(
 
 
 def _no_center_debias(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the de-bias to inactive — today's fail-open behaviour."""
+    """Install an offline provider result that live materialization must ignore."""
+
+    from src.calibration import center_debias_live_fit
 
     monkeypatch.setattr(
-        materializer_mod.center_debias_live_fit.PROVIDER,
+        center_debias_live_fit.PROVIDER,
         "correction",
         lambda *args, **kwargs: None,
     )
@@ -5413,9 +5415,11 @@ def _no_center_debias(monkeypatch: pytest.MonkeyPatch) -> None:
 def _fixed_center_debias(
     monkeypatch: pytest.MonkeyPatch, *, shift_c: float, metric: str = "high"
 ) -> None:
-    """Serve ``shift_c`` for ``metric`` and nothing for any other metric."""
+    """Install an offline correction that live materialization must ignore."""
 
-    correction = materializer_mod.center_debias_live_fit.CenterDebiasCorrection(
+    from src.calibration import center_debias_live_fit
+
+    correction = center_debias_live_fit.CenterDebiasCorrection(
         shift_c=shift_c,
         param_hash="c" * 64,
         training_cutoff="2026-06-07T00:00:00Z",
@@ -5427,7 +5431,7 @@ def _fixed_center_debias(
         return correction if metric == enabled_metric else None
 
     monkeypatch.setattr(
-        materializer_mod.center_debias_live_fit.PROVIDER, "correction", _correction
+        center_debias_live_fit.PROVIDER, "correction", _correction
     )
 
 
@@ -5443,10 +5447,10 @@ def _materialize_q(
     return json.loads(row["q_json"]), json.loads(row["provenance_json"])
 
 
-def test_center_debias_shifts_the_served_center_and_stamps_provenance(
+def test_historical_center_debias_cannot_shift_live_current_evidence_q(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A positive HIGH shift warms the served belief: mass moves toward hotter bins."""
+    """Offline residual fits cannot become a second live probability authority."""
 
     baseline_conn = _conn()
     _install_live_fusion(monkeypatch)
@@ -5458,22 +5462,11 @@ def test_center_debias_shifts_the_served_center_and_stamps_provenance(
     _fixed_center_debias(monkeypatch, shift_c=1.0)
     shifted_q, shifted_provenance = _materialize_q(shifted_conn, _request())
 
-    # The fused center is 25.0 with bins cool(<20) / warm(21-30) / hot(>31): a +1.0
-    # shift moves the center to 26.0, so mass leaves the cool tail for the hot one.
-    assert shifted_q["hot"] > baseline_q["hot"]
-    assert shifted_q["cool"] < baseline_q["cool"]
-    assert shifted_q != baseline_q
-
-    assert shifted_provenance["center_debias_c"] == pytest.approx(1.0)
-    assert shifted_provenance["center_debias_param_hash"] == "c" * 64
-    assert shifted_provenance["center_debias_training_cutoff"] == "2026-06-07T00:00:00Z"
-    assert shifted_provenance["bayes_precision_fusion"]["center_debias_c"] == (
-        pytest.approx(1.0)
-    )
-
-    # anchor_value_c stays the UNCORRECTED fused center — the fitter's residual
-    # basis. Storing the corrected center here would make the next fit measure an
-    # already-corrected error and unwind the correction.
+    assert shifted_q == baseline_q
+    assert shifted_provenance["center_debias_c"] is None
+    assert shifted_provenance["center_debias_param_hash"] is None
+    assert shifted_provenance["center_debias_training_cutoff"] is None
+    assert shifted_provenance["bayes_precision_fusion"]["center_debias_c"] is None
     assert shifted_provenance["anchor_value_c"] == pytest.approx(25.0)
     assert baseline_provenance["anchor_value_c"] == pytest.approx(25.0)
     assert shifted_provenance["bayes_precision_fusion"]["anchor_value_c"] == (
