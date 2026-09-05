@@ -1721,7 +1721,9 @@ def test_seed_discovery_prioritizes_held_family_and_skips_unchanged_blocked_budg
                    '2026-06-08', 'high', 'ecmwf_opendata_mx2t3_local_calendar_day_max',
                    'COMPLETE', 'LIVE_ELIGIBLE', '2026-06-06T02:05:00+00:00')
                 """,
-                (f"coverage-{city}", run_id, city, city, tz),
+                # city_id is the canonical upper-snake name the production writer
+                # stores (src/data/ecmwf_open_data.py).
+                (f"coverage-{city}", run_id, city.upper().replace(" ", "_"), city, tz),
             )
         conn.commit()
     finally:

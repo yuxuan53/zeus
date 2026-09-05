@@ -133,6 +133,13 @@ _INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_day0_hourly_vectors_city_date "
     "ON day0_hourly_vectors(city, target_date, captured_at)"
 )
+# The retention prune in persist_day0_hourly_vectors filters on captured_at
+# alone; without this index it scans the whole table under the forecasts
+# LIVE flock every refresh cycle.
+_PRUNE_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_day0_hourly_vectors_captured_at "
+    "ON day0_hourly_vectors(captured_at)"
+)
 
 
 def day0_hourly_target_dates_for_refresh(
@@ -960,6 +967,7 @@ def _current_provider_bundle_already_persisted(
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_TABLE_DDL)
     conn.execute(_INDEX_DDL)
+    conn.execute(_PRUNE_INDEX_DDL)
 
 
 def _vector_id(model: str, city: str, target_date: str, captured_at: str) -> str:

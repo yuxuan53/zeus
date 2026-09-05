@@ -350,13 +350,23 @@ def latest_baseline_coverage_for_replacement_seed(
         as_of_time,
         field_name="baseline_as_of_time",
     ).isoformat()
+    # idx_source_run_coverage_scope leads with (city_id, city_timezone); the
+    # bare city predicate falls back to the readiness index and walks every
+    # LIVE_ELIGIBLE row. city_id is the canonical upper-snake city name
+    # (src/data/ecmwf_open_data.py); the timezone predicate is added only when
+    # the city is configured, so unknown cities keep the original scope.
+    city_timezone = str(getattr(cities_by_name.get(city), "timezone", "") or "")
+    timezone_clause = "AND c.city_timezone = ?" if city_timezone else ""
+    timezone_params: tuple[str, ...] = (city_timezone,) if city_timezone else ()
     row = conn.execute(
-        """
+        f"""
         SELECT c.*, sr.source_cycle_time AS source_cycle_time,
                sr.source_available_at AS source_available_at
         FROM source_run_coverage c
         JOIN source_run sr ON sr.source_run_id = c.source_run_id
-        WHERE c.city = ?
+        WHERE c.city_id = ?
+          {timezone_clause}
+          AND c.city = ?
           AND c.target_local_date = ?
           AND c.temperature_metric = ?
           AND c.source_id = ?
@@ -375,6 +385,8 @@ def latest_baseline_coverage_for_replacement_seed(
         LIMIT 1
         """,
         (
+            city.upper().replace(" ", "_"),
+            *timezone_params,
             city,
             target_date,
             temperature_metric,
