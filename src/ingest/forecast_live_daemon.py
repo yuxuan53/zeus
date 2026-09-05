@@ -1347,22 +1347,24 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
         fast_report = _replacement_forecast_station_revision_fast_lane(cfg)
         if fast_report.get("status") not in {"NO_SEEDS", "DEFERRED"}:
             return fast_report
-        # A DEFERRED fast lane made no progress: its newest station seed is
-        # waiting on a same-cycle ENS HWM (or the claim read deadline). That
-        # seed stays in its queue; returning here would let one waiting seed
-        # starve every prepared request behind it on every one-second tick
-        # (2026-09-05: HK low 00Z ENS rejected as boundary-ambiguous, 21 held
-        # requests and the whole priority lane silent for two hours).
-        # A named station revision is a newly available causal fact, while an
-        # existing request (especially a timeout retry) is older compute debt.
-        # Publishing the fact's request first preserves information lead; the
-        # next one-second callback still drains prepared requests through the
-        # same single-writer path.
-        return _replacement_forecast_materialize_lane(
-            cfg,
-            lane="priority",
-            seed_limit=3,
-        )
+        if fast_report.get("status") == "NO_SEEDS":
+            # A named station revision is a newly available causal fact, while an
+            # existing request (especially a timeout retry) is older compute debt.
+            # Publishing the fact's request first preserves information lead; the
+            # next one-second callback still drains prepared requests through the
+            # same single-writer path.
+            return _replacement_forecast_materialize_lane(
+                cfg,
+                lane="priority",
+                seed_limit=3,
+            )
+        # DEFERRED: the newest station seed waits on its same-cycle ENS HWM (or
+        # the claim read deadline) and stays in its queue, so this branch remains
+        # active until that cycle clears. Zero progress here must take the same
+        # request-first path as a tick without station seeds: a seed-first
+        # tranche over a large seed queue either moves unrelated seeds and
+        # returns early or spends the claim deadline, and prepared requests
+        # (the held families) are never claimed (2026-09-05 08:15-10:20Z).
     request_report = _replacement_forecast_materialize_lane(
         cfg,
         lane="priority",

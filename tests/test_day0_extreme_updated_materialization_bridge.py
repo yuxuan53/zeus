@@ -3037,7 +3037,10 @@ def test_priority_job_falls_through_when_station_seed_awaits_ensemble(
         forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
     )
     receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
-    assert calls == [("priority", 3)]
+    # Request-first, exactly like a tick without station seeds: the deferred
+    # seed keeps this branch active for hours, and a seed-first tranche would
+    # never reach the prepared requests.
+    assert calls == [("priority", 0)]
     assert receipt == {"status": "PROCESSED", "processed_count": 1}
 
 
