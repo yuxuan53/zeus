@@ -153,6 +153,7 @@ _FULL_BACKGROUND_RECOVERY_QUANTUM_ROTATION_SECONDS = 60
 # compares exact identities and complete venue reads, but must not demand
 # precision that the canonical projection contract cannot represent.
 _POSITION_PROJECTION_TOLERANCE = Decimal("0.0001")
+_TERMINAL_EXIT_RESIDUAL_PRIORITY_MAX_CANDIDATES = 4
 _RESTART_ACCOUNT_TRUTH_DEADLINE_ENV = (
     "ZEUS_RESTART_RECOVERY_ACCOUNT_TRUTH_DEADLINE_SECONDS"
 )
@@ -12615,6 +12616,9 @@ def _exit_lifecycle_alignment_candidates(conn: sqlite3.Connection) -> list[dict]
 
 def _terminal_partial_exit_projection_candidates(
     conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    terminal_residual_only: bool = False,
 ) -> list[dict]:
     """Return terminal SELL commands whose positive fill may be a reduction.
 
@@ -12630,15 +12634,20 @@ def _terminal_partial_exit_projection_candidates(
         and _table_exists(conn, "position_current")
     ):
         return []
-    rows = conn.execute(
-        """
+    states = ("EXPIRED", "PARTIAL") if terminal_residual_only else (
+        "FILLED",
+        "EXPIRED",
+        "PARTIAL",
+    )
+    placeholders = ", ".join("?" for _ in states)
+    query = f"""
         SELECT cmd.*, pc.phase AS position_phase
           FROM venue_commands cmd
           JOIN position_current pc
             ON pc.position_id = cmd.position_id
          WHERE cmd.intent_kind = 'EXIT'
            AND UPPER(COALESCE(cmd.side, '')) = 'SELL'
-           AND cmd.state IN ('FILLED', 'EXPIRED', 'PARTIAL')
+           AND cmd.state IN ({placeholders})
            AND COALESCE(cmd.venue_order_id, '') <> ''
            AND pc.phase IN ('active', 'day0_window', 'pending_exit')
            AND EXISTS (
@@ -12652,8 +12661,14 @@ def _terminal_partial_exit_projection_candidates(
                    AND CAST(COALESCE(fact.filled_size, '0') AS REAL) > 0
            )
          ORDER BY datetime(cmd.updated_at), cmd.command_id
-        """
-    ).fetchall()
+    """
+    params: tuple[object, ...] = states
+    if limit is not None:
+        if limit <= 0:
+            return []
+        query += " LIMIT ?"
+        params = (*params, limit)
+    rows = conn.execute(query, params).fetchall()
     from src.state.fill_dedup import (
         economic_exit_fills_for_position,
         recorded_partial_exit_fill_cursors,
@@ -13366,11 +13381,21 @@ def _repair_exit_matched_order_fact_projection(
     )
 
 
-def reconcile_exit_lifecycle_alignment_repairs(conn: sqlite3.Connection) -> dict:
+def reconcile_exit_lifecycle_alignment_repairs(
+    conn: sqlite3.Connection,
+    *,
+    terminal_partial_limit: int | None = None,
+    terminal_partial_only: bool = False,
+    terminal_residual_only: bool = False,
+) -> dict:
     """Repair EXIT command/projection disagreements visible at live restart."""
 
     summary = {"scanned": 0, "advanced": 0, "stayed": 0, "errors": 0}
-    for command in _terminal_partial_exit_projection_candidates(conn):
+    for command in _terminal_partial_exit_projection_candidates(
+        conn,
+        limit=terminal_partial_limit,
+        terminal_residual_only=terminal_residual_only,
+    ):
         summary["scanned"] += 1
         command_id = str(command.get("command_id") or "")
         safe_command_id = "".join(ch if ch.isalnum() else "_" for ch in command_id)
@@ -13395,6 +13420,8 @@ def reconcile_exit_lifecycle_alignment_repairs(conn: sqlite3.Connection) -> dict
                 exc,
             )
             summary["errors"] += 1
+    if terminal_partial_only:
+        return summary
     for candidate in _exit_lifecycle_alignment_candidates(conn):
         summary["scanned"] += 1
         command_id = str(candidate.get("command_id") or "")
@@ -13431,6 +13458,98 @@ def reconcile_exit_lifecycle_alignment_repairs(conn: sqlite3.Connection) -> dict
                 exc,
             )
             summary["errors"] += 1
+    return summary
+
+
+def terminal_exit_residual_projection_pending(conn: sqlite3.Connection) -> bool:
+    """Return whether one open terminal EXIT residual merits bounded priority."""
+
+    required = {"venue_commands", "venue_trade_facts", "position_current"}
+    try:
+        if not all(_table_exists(conn, table) for table in required):
+            return False
+        return conn.execute(
+            """
+            SELECT 1
+              FROM venue_commands command
+              JOIN position_current position
+                ON position.position_id = command.position_id
+             WHERE command.intent_kind = 'EXIT'
+               AND UPPER(COALESCE(command.side, '')) = 'SELL'
+               AND command.state IN ('EXPIRED', 'PARTIAL')
+               AND COALESCE(command.venue_order_id, '') <> ''
+               AND position.phase IN ('active', 'day0_window', 'pending_exit')
+               AND EXISTS (
+                    SELECT 1
+                      FROM venue_trade_facts fact
+                     WHERE fact.command_id = command.command_id
+                       AND LOWER(COALESCE(fact.venue_order_id, '')) =
+                           LOWER(COALESCE(command.venue_order_id, ''))
+                       AND UPPER(COALESCE(fact.state, '')) IN
+                           ('MATCHED', 'MINED', 'CONFIRMED')
+                       AND CAST(COALESCE(fact.filled_size, '0') AS REAL) > 0
+               )
+             LIMIT 1
+            """
+        ).fetchone() is not None
+    except Exception:  # noqa: BLE001 - a missing read never blocks scheduler work.
+        return False
+
+
+def reconcile_terminal_exit_residual_projections_priority(
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict:
+    """Project a few exact terminal EXIT residuals without venue or selector I/O.
+
+    SCOPE=at most four open EXIT SELL command/position pairs with durable positive
+    fill facts. DRAIN=this DB-only priority turn before cancel selection or venue
+    prewarm. RESET=the existing command/token/fill/chain proof projects the
+    residual, or a bounded lock/budget defers the same exact rows to next cadence.
+    """
+
+    from src.execution.venue_sync_contract import (
+        default_trade_conn_factory,
+        run_db_only_pass,
+    )
+
+    deadline = _bounded_recovery_deadline(
+        deadline_monotonic,
+        _capital_recovery_db_budget_seconds(),
+    )
+    priority_factory = _recovery_priority_conn_factory(
+        default_trade_conn_factory,
+        scope="live_tick",
+        deadline_monotonic=deadline,
+    )
+    apply_factory = _recovery_apply_conn_factory(
+        priority_factory,
+        scope="live_tick",
+        deadline_monotonic=deadline,
+        monitor_preemptible=True,
+    )
+    summary = {"scanned": 0, "advanced": 0, "stayed": 0, "errors": 0}
+    result = _run_recovery_pass_with_lock_policy(
+        "terminal_exit_residual_projection_priority",
+        lambda: run_db_only_pass(
+            lambda conn: reconcile_exit_lifecycle_alignment_repairs(
+                conn,
+                terminal_partial_limit=(
+                    _TERMINAL_EXIT_RESIDUAL_PRIORITY_MAX_CANDIDATES
+                ),
+                terminal_partial_only=True,
+                terminal_residual_only=True,
+            ),
+            conn_factory=apply_factory,
+            label="recovery.terminal_exit_residual_projection_priority",
+        ),
+        scope="live_tick",
+        summary=summary,
+        deadline_monotonic=deadline,
+        bounded_lock_retry_delays=_CAPITAL_RECOVERY_LOCK_RETRY_DELAYS,
+    )
+    if result is not None:
+        summary = result
     return summary
 
 
@@ -31033,6 +31152,20 @@ def _reconcile_passes_short_conn(
                     time.monotonic() - boot_started_monotonic,
                     max(0.0, boot_deadline - time.monotonic()),
                 )
+
+        # A terminal SELL underfill is current held collateral, not historical
+        # maintenance. Project its exact residual before any broad ENTRY scan can
+        # consume boot's finite DB turn.
+        _boot_db_pass(
+            "terminal_exit_residual_projection_priority",
+            lambda conn: reconcile_exit_lifecycle_alignment_repairs(
+                conn,
+                terminal_partial_limit=_TERMINAL_EXIT_RESIDUAL_PRIORITY_MAX_CANDIDATES,
+                terminal_partial_only=True,
+                terminal_residual_only=True,
+            ),
+            "terminal_exit_residual_projection_priority",
+        )
 
         # RiskGuard requires fill-grade portfolio rows to name their durable
         # execution_fact provenance.  Repair that narrow, already-confirmed

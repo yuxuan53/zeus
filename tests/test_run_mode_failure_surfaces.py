@@ -1,8 +1,8 @@
 # Created: 2026-05-19
-# Last reused or audited: 2026-08-18
+# Last reused or audited: 2026-09-05
 # Authority basis: codereview-may19-2.md relationship F
 #                  + docs/operations/task_2026-05-21_live_side_effect_risk_boundaries/task.md P1-1
-# Lifecycle: created=2026-05-19; last_reviewed=2026-08-18; last_reused=2026-08-18
+# Lifecycle: created=2026-05-19; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Purpose: Relationship-F antibody — assert that compute_composite_live_health()
 #   surfaces DEGRADED when run_mode has failed or status_summary is stale, even
 #   when the heartbeat is OK (closing the "scheduler alive but not trading" gap).
@@ -8233,6 +8233,59 @@ def test_edli_command_recovery_runs_live_tick_during_active_redecision(monkeypat
     main_module._edli_command_recovery_cycle()
 
     assert calls == ["live_tick"]
+
+
+def test_edli_terminal_residual_priority_precedes_stalled_screen_selector(
+    monkeypatch,
+) -> None:
+    """Current terminal EXIT collateral must advance before broad cancel selection."""
+    import src.execution.command_recovery as command_recovery
+    import src.execution.venue_cancel_journal as cancel_journal
+    import src.main as main_module
+    import src.state.db as state_db
+
+    calls: list[str] = []
+
+    class FakeConn:
+        def set_progress_handler(self, *_args) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_module, "_consume_live_control_commands", lambda: None)
+    monkeypatch.setattr(main_module, "get_mode", lambda: "live")
+    monkeypatch.setattr(
+        state_db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: FakeConn(),
+    )
+    monkeypatch.setattr(command_recovery, "capital_blocking_command_count", lambda _conn: 0)
+    monkeypatch.setattr(
+        command_recovery,
+        "terminal_exit_residual_projection_pending",
+        lambda _conn: True,
+    )
+    monkeypatch.setattr(
+        command_recovery,
+        "reconcile_terminal_exit_residual_projections_priority",
+        lambda **_kwargs: calls.append("terminal_residual")
+        or {"scanned": 1, "advanced": 1, "stayed": 0, "errors": 0},
+    )
+
+    def _stalled_selector(_conn):
+        calls.append("selector")
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        cancel_journal,
+        "find_screen_redecision_cancel_obligations",
+        _stalled_selector,
+    )
+
+    main_module._edli_command_recovery_cycle.__wrapped__()
+
+    assert calls == ["terminal_residual", "selector"]
 
 
 def test_command_recovery_yields_trade_db_to_overdue_held_monitor(monkeypatch) -> None:

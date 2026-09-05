@@ -7772,8 +7772,10 @@ def _edli_command_recovery_cycle() -> None:
     from src.execution.command_recovery import (
         capital_blocking_command_scope,
         capital_blocking_command_count,
+        reconcile_terminal_exit_residual_projections_priority,
         reconcile_unresolved_commands,
         scheduled_recovery_budget_seconds,
+        terminal_exit_residual_projection_pending,
     )
     from src.data.polymarket_client import PolymarketClient
     from src.execution.venue_cancel_journal import find_screen_redecision_cancel_obligations
@@ -7786,6 +7788,7 @@ def _edli_command_recovery_cycle() -> None:
     )
     capital_blockers = 0
     capital_scope = None
+    terminal_exit_residual_due = False
     selector_read_completed = False
     try:
         trade_conn = get_trade_connection_read_only(
@@ -7801,7 +7804,35 @@ def _edli_command_recovery_cycle() -> None:
             capital_blockers = capital_blocking_command_count(trade_conn)
             if capital_blockers > 0:
                 capital_scope = capital_blocking_command_scope(trade_conn)
-            screen_cancel_due = bool(find_screen_redecision_cancel_obligations(trade_conn))
+            terminal_exit_residual_due = terminal_exit_residual_projection_pending(
+                trade_conn
+            )
+        finally:
+            if callable(set_progress_handler):
+                set_progress_handler(None, 0)
+            trade_conn.close()
+        if terminal_exit_residual_due:
+            terminal_summary = reconcile_terminal_exit_residual_projections_priority(
+                deadline_monotonic=invocation_deadline,
+            )
+            if terminal_summary.get("scanned"):
+                logger.info(
+                    "edli_command_recovery: terminal EXIT residual priority: %s",
+                    terminal_summary,
+                )
+        trade_conn = get_trade_connection_read_only(
+            deadline_monotonic=invocation_deadline,
+        )
+        try:
+            set_progress_handler = getattr(trade_conn, "set_progress_handler", None)
+            if callable(set_progress_handler):
+                set_progress_handler(
+                    lambda: int(_time.monotonic() >= invocation_deadline),
+                    1_000,
+                )
+            screen_cancel_due = bool(
+                find_screen_redecision_cancel_obligations(trade_conn)
+            )
             selector_read_completed = True
         finally:
             if callable(set_progress_handler):

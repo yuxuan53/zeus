@@ -1,8 +1,8 @@
 # Created: 2026-04-26
-# Lifecycle: created=2026-04-26; last_reviewed=2026-09-04; last_reused=2026-09-04
+# Lifecycle: created=2026-04-26; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Purpose: Lock INV-31 command recovery behavior plus snapshot-gated command inserts.
 # Reuse: Run when command recovery, command journal schema, or executable snapshot gating changes.
-# Last reused/audited: 2026-09-04
+# Last reused/audited: 2026-09-05
 # Authority basis: docs/operations/task_2026-04-26_execution_state_truth_p1_command_bus/implementation_plan.md u00a7P1.S4
 """INV-31 anchor tests: command recovery loop.
 
@@ -1090,6 +1090,23 @@ def test_boot_fast_recovery_does_not_capture_venue_snapshot(tmp_path, monkeypatc
     assert row["order_status"] == "voided"
     assert row["exit_retry_count"] == 0
     assert row["next_exit_retry_at"] is None
+
+
+def test_boot_fast_prioritizes_terminal_exit_residual_before_missing_entry_repair() -> None:
+    """One broad ENTRY scan cannot consume boot before current SELL collateral."""
+    import inspect
+
+    from src.execution import command_recovery
+
+    source = inspect.getsource(command_recovery._reconcile_passes_short_conn)
+    boot_idx = source.index('if scope == "boot_fast":')
+    residual_idx = source.index('"terminal_exit_residual_projection_priority"', boot_idx)
+    missing_entry_idx = source.index(
+        '"missing_filled_entry_execution_fact_repair"',
+        boot_idx,
+    )
+
+    assert residual_idx < missing_entry_idx
 
 
 def test_boot_fast_releases_review_required_exit_mutex_before_scheduler(
@@ -30746,6 +30763,114 @@ class TestRecoveryResolutionTable:
              WHERE position_id = 'pos-001'
             """
         ).fetchone()
+        assert dict(current) == {
+            "phase": "active",
+            "shares": 43.2258,
+            "chain_shares": 43.2258,
+            "cost_basis_usd": 21.6129,
+        }
+
+    def test_terminal_exit_residual_priority_projects_hkg_shape_db_only(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A stalled selector cannot strand the HKG terminal FAK residual."""
+        from src.execution import command_recovery, venue_sync_contract
+        from src.state.collateral_ledger import init_collateral_schema
+        from src.state.db import init_schema, init_schema_trade_only
+
+        db_path = tmp_path / "hkg-terminal-residual.db"
+        seed = sqlite3.connect(db_path)
+        seed.row_factory = sqlite3.Row
+        init_schema(seed)
+        init_schema_trade_only(seed)
+        init_collateral_schema(seed)
+        _insert(seed, command_id="cmd-entry", position_id="32d6009c-007", size=48.22, price=0.50)
+        _advance_to_acked(seed, command_id="cmd-entry", venue_order_id="ord-entry")
+        _seed_pending_entry_projection(
+            seed,
+            position_id="32d6009c-007",
+            command_id="cmd-entry",
+            order_id="ord-entry",
+        )
+        seed.execute(
+            """
+            UPDATE position_current
+               SET phase = 'pending_exit', city = 'Hong Kong', target_date = '2026-09-04',
+                   shares = 48.2258, chain_state = 'synced', chain_shares = 43.2258,
+                   chain_cost_basis_usd = 21.6129, cost_basis_usd = 24.1129,
+                   entry_price = 0.50, order_status = 'sell_pending_confirmation'
+             WHERE position_id = '32d6009c-007'
+            """
+        )
+        _seed_full_exit_intent(
+            seed,
+            position_id="32d6009c-007",
+            shares=48.2258,
+            occurred_at="2026-09-03T21:05:41+00:00",
+        )
+        _insert(
+            seed,
+            command_id="cmd-hkg-terminal-partial",
+            position_id="32d6009c-007",
+            intent_kind="EXIT",
+            side="SELL",
+            order_type="FAK",
+            size=48.22,
+            price=0.18,
+            token_id="tok-001",
+            created_at="2026-09-03T21:05:43+00:00",
+        )
+        _advance_to_acked(
+            seed,
+            command_id="cmd-hkg-terminal-partial",
+            venue_order_id="ord-hkg-terminal-partial",
+        )
+        _append_trade_fact(
+            seed,
+            command_id="cmd-hkg-terminal-partial",
+            order_id="ord-hkg-terminal-partial",
+            trade_id="0xhkgpartial",
+            state="CONFIRMED",
+            filled_size="5",
+            fill_price="0.18",
+            tx_hash="0xhkgpartial",
+        )
+        seed.execute(
+            """
+            UPDATE venue_commands
+               SET state = 'EXPIRED', updated_at = '2026-09-03T23:47:54+00:00'
+             WHERE command_id = 'cmd-hkg-terminal-partial'
+            """
+        )
+        seed.commit()
+        seed.close()
+
+        def _conn_factory():
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        monkeypatch.setattr(
+            venue_sync_contract,
+            "default_trade_conn_factory",
+            _conn_factory,
+        )
+        summary = command_recovery.reconcile_terminal_exit_residual_projections_priority()
+
+        assert summary == {"scanned": 1, "advanced": 1, "stayed": 0, "errors": 0}
+        verified = _conn_factory()
+        try:
+            current = verified.execute(
+                """
+                SELECT phase, shares, chain_shares, cost_basis_usd
+                  FROM position_current
+                 WHERE position_id = '32d6009c-007'
+                """
+            ).fetchone()
+        finally:
+            verified.close()
         assert dict(current) == {
             "phase": "active",
             "shares": 43.2258,
