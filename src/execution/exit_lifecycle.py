@@ -3111,10 +3111,12 @@ def _flash_crash_monitor_semantic_receipt(
         or not math.isfinite(velocity)
         or velocity > flash_crash_catastrophe_velocity()
         or confirmations < flash_crash_confirmations()
+        # The monitor establishes a semantic catastrophic-exit obligation;
+        # whether its observed bid is submit-legal is a later liquidity fact.
+        # Keeping the absolute price band at the protective-order boundary lets
+        # an out-of-band crash persist EXIT_INTENT and retry without minting an
+        # illegal venue command.
         or not math.isfinite(best_bid)
-        or not LIVE_ORDER_MIN_UNIT_PRICE
-        <= Decimal(str(best_bid))
-        <= LIVE_ORDER_MAX_UNIT_PRICE
         or not {
             "flash_crash_persistent_market_evidence",
             "flash_crash_trigger",

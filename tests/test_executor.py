@@ -2657,9 +2657,9 @@ class TestExecutor:
             token_id=token_id,
             condition_id="condition-flash-catastrophe-e2e",
             direction="sell_yes",
-            final_limit_price=Decimal("0.19"),
-            snapshot_top_bid=Decimal("0.19"),
-            snapshot_top_ask=Decimal("0.21"),
+            final_limit_price=Decimal("0.05"),
+            snapshot_top_bid=Decimal("0.05"),
+            snapshot_top_ask=Decimal("0.07"),
         )
         position = Position(
             trade_id="trade-flash-catastrophe-e2e",
@@ -2705,7 +2705,7 @@ class TestExecutor:
             "exit_decision_trigger": "FLASH_CRASH_PANIC",
             "held_sell_full_depth_action_authority": True,
             "last_monitor_market_price_is_fresh": True,
-            "last_monitor_best_bid": 0.20,
+            "last_monitor_best_bid": 0.05,
             "market_velocity_1h": flash_crash_catastrophe_velocity() - 0.01,
             "flash_crash_count": flash_crash_confirmations(),
             "applied_validations": [
@@ -2789,10 +2789,10 @@ class TestExecutor:
             ExitContext(
                 fresh_prob=None,
                 fresh_prob_is_fresh=False,
-                current_market_price=0.20,
+                current_market_price=0.05,
                 current_market_price_is_fresh=True,
-                best_bid=0.20,
-                best_ask=0.22,
+                best_bid=0.05,
+                best_ask=0.07,
                 market_vig=1.0,
                 hours_to_settlement=12.0,
                 position_state="holding",
@@ -2818,17 +2818,163 @@ class TestExecutor:
         ).fetchone()
         assert outcome.startswith("sell_pending: order=flash-catastrophe-e2e-order")
         assert captured["order_type"] == "FAK"
-        assert captured["price"] == pytest.approx(0.19)
+        assert captured["price"] == pytest.approx(0.05)
         assert captured["size"] == pytest.approx(31.51)
         assert command is not None
         assert command["side"] == "SELL"
-        assert command["price"] == pytest.approx(0.19)
+        assert command["price"] == pytest.approx(0.05)
         assert command["size"] == pytest.approx(31.51)
         assert _TEST_CONN.execute(
             """SELECT COUNT(*) FROM position_events
                 WHERE position_id = ? AND event_type = 'EXIT_INTENT'""",
             (position.trade_id,),
         ).fetchone()[0] == 1
+
+    def test_canonical_flash_catastrophe_out_of_band_bid_records_retry(self, monkeypatch):
+        """A proven flash persists intent, but never submits below the price floor."""
+        from src.execution.exit_lifecycle import execute_exit
+        from src.state.portfolio import (
+            ExitContext,
+            flash_crash_catastrophe_velocity,
+            flash_crash_confirmations,
+        )
+
+        token_id = "yes-token-flash-out-of-band"
+        _ensure_snapshot(
+            _TEST_CONN,
+            token_id=token_id,
+            condition_id="condition-flash-out-of-band",
+            direction="sell_yes",
+            final_limit_price=Decimal("0.04"),
+            snapshot_top_bid=Decimal("0.04"),
+            snapshot_top_ask=Decimal("0.06"),
+        )
+        position = Position(
+            trade_id="trade-flash-out-of-band",
+            market_id="condition-flash-out-of-band",
+            condition_id="condition-flash-out-of-band",
+            city="Test City",
+            cluster="Test Cluster",
+            target_date="2026-08-29",
+            bin_label="30C",
+            direction="buy_yes",
+            entry_price=0.50,
+            size_usd=5.0,
+            shares=10.0,
+            chain_shares=10.0,
+            cost_basis_usd=5.0,
+            state="holding",
+            chain_state="synced",
+            token_id=token_id,
+            no_token_id=f"{token_id}-no",
+            unit="C",
+            env="live",
+            strategy_key="forecast_qkernel_entry",
+        )
+        _TEST_CONN.execute(
+            """INSERT INTO position_current(
+                   position_id, phase, direction, token_id, no_token_id,
+                   shares, chain_shares, chain_state, updated_at,
+                   temperature_metric, condition_id
+               ) VALUES (?, 'active', 'buy_yes', ?, ?, 10, 10,
+                         'synced', ?, 'high', ?)""",
+            (
+                position.trade_id,
+                token_id,
+                position.no_token_id,
+                _NOW.isoformat(),
+                position.condition_id,
+            ),
+        )
+        _TEST_CONN.execute(
+            """INSERT INTO position_events(
+                   event_id, position_id, event_version, sequence_no,
+                   event_type, occurred_at, phase_before, phase_after,
+                   source_module, env, payload_json
+               ) VALUES (?, ?, 1, 1, 'MONITOR_REFRESHED', ?, 'active',
+                         'active', 'src.engine.cycle_runtime', 'live', ?)""",
+            (
+                "event-flash-out-of-band-monitor",
+                position.trade_id,
+                _NOW.isoformat(),
+                json.dumps(
+                    {
+                        "exit_decision_should_exit": True,
+                        "exit_decision_trigger": "FLASH_CRASH_PANIC",
+                        "held_sell_full_depth_action_authority": True,
+                        "last_monitor_market_price_is_fresh": True,
+                        "last_monitor_best_bid": 0.04,
+                        "market_velocity_1h": (
+                            flash_crash_catastrophe_velocity() - 0.01
+                        ),
+                        "flash_crash_count": flash_crash_confirmations(),
+                        "applied_validations": [
+                            "flash_crash_persistent_market_evidence",
+                            "flash_crash_trigger",
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        _TEST_CONN.commit()
+
+        constructed_clients = []
+
+        class NeverClient:
+            def __init__(self):
+                constructed_clients.append(True)
+
+        monkeypatch.setattr("src.data.polymarket_client.PolymarketClient", NeverClient)
+
+        outcome = execute_exit(
+            PortfolioState(positions=[position]),
+            position,
+            ExitContext(
+                fresh_prob=None,
+                fresh_prob_is_fresh=False,
+                current_market_price=0.04,
+                current_market_price_is_fresh=True,
+                best_bid=0.04,
+                best_ask=0.06,
+                market_vig=1.0,
+                hours_to_settlement=12.0,
+                position_state="holding",
+                day0_active=False,
+                whale_toxicity=False,
+                exit_reason=(
+                    "FLASH_CRASH_PANIC "
+                    f"(velocity={flash_crash_catastrophe_velocity() - 0.01:.3f}, "
+                    f"causal_quotes={flash_crash_confirmations()})"
+                ),
+            ),
+            clob=SimpleNamespace(),
+            conn=_TEST_CONN,
+        )
+
+        assert outcome == "exit_blocked: no_in_band_bid"
+        assert constructed_clients == []
+        assert _TEST_CONN.execute(
+            "SELECT COUNT(*) FROM venue_commands WHERE position_id=? AND intent_kind='EXIT'",
+            (position.trade_id,),
+        ).fetchone()[0] == 0
+        assert _TEST_CONN.execute(
+            "SELECT COUNT(*) FROM position_events WHERE position_id=? AND event_type='EXIT_INTENT'",
+            (position.trade_id,),
+        ).fetchone()[0] == 1
+        rejection = _TEST_CONN.execute(
+            """SELECT payload_json FROM position_events
+                 WHERE position_id=? AND event_type='EXIT_ORDER_REJECTED'""",
+            (position.trade_id,),
+        ).fetchone()
+        assert rejection is not None
+        assert "exit_no_in_band_bid" in rejection["payload_json"]
+        current = _TEST_CONN.execute(
+            "SELECT phase, order_status FROM position_current WHERE position_id=?",
+            (position.trade_id,),
+        ).fetchone()
+        assert current["phase"] == "pending_exit"
+        assert current["order_status"] == "retry_pending"
 
     def test_unproved_flash_catastrophe_cannot_mutate_exit_lifecycle(self):
         from src.execution.exit_lifecycle import execute_exit
@@ -2914,7 +3060,6 @@ class TestExecutor:
         (
             {"held_sell_full_depth_action_authority": False},
             {"last_monitor_market_price_is_fresh": False},
-            {"last_monitor_best_bid": 0.049},
             {"market_velocity_1h": None},
             {"flash_crash_count": None},
             {"applied_validations": ["flash_crash_trigger"]},
