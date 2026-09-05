@@ -345,7 +345,9 @@ def _day0_family_admission_for_scopes(
         forecasts_conn = None
         trade_conn = None
         try:
-            forecasts_conn = get_forecasts_connection_read_only()
+            forecasts_conn = get_forecasts_connection_read_only(
+                deadline_monotonic=deadline,
+            )
             market_rows = forecasts_conn.execute(
                 f"""
                 WITH requested(city, target_date) AS (VALUES {values})
@@ -360,7 +362,9 @@ def _day0_family_admission_for_scopes(
                 params,
             ).fetchall()
 
-            trade_conn = get_trade_connection_read_only()
+            trade_conn = get_trade_connection_read_only(
+                deadline_monotonic=deadline,
+            )
             exposure_rows = trade_conn.execute(
                 f"""
                 WITH requested(city, target_date) AS (VALUES {values})

@@ -93,7 +93,9 @@ def _no_retry_wait(monkeypatch):
 def test_resolver_never_returns_none_when_forecasts_db_read_fails(monkeypatch):
     monkeypatch.setattr(db, "get_forecasts_connection_read_only", _raise_operational_error)
     monkeypatch.setattr(
-        db, "get_trade_connection_read_only", lambda: sqlite3.connect(":memory:")
+        db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: sqlite3.connect(":memory:"),
     )
 
     family_admission = _day0_family_admission_for_scopes(SCOPES)
@@ -127,7 +129,11 @@ def test_resolver_fails_closed_even_when_only_the_trade_db_read_fails(monkeypatc
     )
     forecasts_conn.commit()
 
-    monkeypatch.setattr(db, "get_forecasts_connection_read_only", lambda: forecasts_conn)
+    monkeypatch.setattr(
+        db,
+        "get_forecasts_connection_read_only",
+        lambda **_kwargs: forecasts_conn,
+    )
     monkeypatch.setattr(db, "get_trade_connection_read_only", _raise_operational_error)
 
     family_admission = _day0_family_admission_for_scopes(SCOPES)
@@ -142,7 +148,9 @@ def test_resolver_fails_closed_even_when_only_the_trade_db_read_fails(monkeypatc
 def test_metar_wrapper_also_fails_closed_on_db_fault(monkeypatch):
     monkeypatch.setattr(db, "get_forecasts_connection_read_only", _raise_operational_error)
     monkeypatch.setattr(
-        db, "get_trade_connection_read_only", lambda: sqlite3.connect(":memory:")
+        db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: sqlite3.connect(":memory:"),
     )
 
     eligible = (
@@ -174,7 +182,7 @@ def test_bounded_retry_recovers_from_one_transient_failure(monkeypatch):
 
     calls = {"n": 0}
 
-    def _flaky_forecasts_connection():
+    def _flaky_forecasts_connection(**_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise sqlite3.OperationalError("database is locked")
@@ -183,7 +191,11 @@ def test_bounded_retry_recovers_from_one_transient_failure(monkeypatch):
         return conn
 
     monkeypatch.setattr(db, "get_forecasts_connection_read_only", _flaky_forecasts_connection)
-    monkeypatch.setattr(db, "get_trade_connection_read_only", lambda: trade_conn)
+    monkeypatch.setattr(
+        db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: trade_conn,
+    )
 
     family_admission = _day0_family_admission_for_scopes(SCOPES)
 
@@ -321,7 +333,9 @@ def test_real_trigger_emits_zero_broad_wakes_when_admission_authority_unavailabl
 
     monkeypatch.setattr(db, "get_forecasts_connection_read_only", _raise_operational_error)
     monkeypatch.setattr(
-        db, "get_trade_connection_read_only", lambda: sqlite3.connect(":memory:")
+        db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: sqlite3.connect(":memory:"),
     )
 
     family_admission = _day0_family_admission_for_scopes(SCOPES)

@@ -825,6 +825,70 @@ class TestObsFastTickSchedulerRegistration:
         pools = registry_executor_pools()
         assert pools["hko_source_clock_db"] is not pools["source_clock_db"]
 
+    def test_hko_family_admission_bounds_both_canonical_db_opens(
+        self,
+        monkeypatch,
+    ):
+        import src.ingest_main as im
+        import src.state.db as db
+
+        deadlines: list[tuple[str, float]] = []
+
+        class _Cursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        class _Conn:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def execute(self, _sql, _params=()):
+                return _Cursor(self._rows)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(im.time, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(
+            db,
+            "get_forecasts_connection_read_only",
+            lambda *, deadline_monotonic: (
+                deadlines.append(("forecasts", deadline_monotonic))
+                or _Conn([("Hong Kong", "2026-09-05", "high")])
+            ),
+        )
+        monkeypatch.setattr(
+            db,
+            "get_trade_connection_read_only",
+            lambda *, deadline_monotonic: (
+                deadlines.append(("trades", deadline_monotonic))
+                or _Conn([("Hong Kong", "2026-09-05", "low")])
+            ),
+        )
+
+        admitted = im._day0_family_admission_for_scopes(
+            (("Hong Kong", "2026-09-05"),)
+        )
+
+        assert deadlines == [("forecasts", 101.0), ("trades", 101.0)]
+        assert admitted(
+            {
+                "city": "Hong Kong",
+                "target_date": "2026-09-05",
+                "metric": "high",
+            }
+        )
+        assert admitted(
+            {
+                "city": "Hong Kong",
+                "target_date": "2026-09-05",
+                "metric": "low",
+            }
+        )
+
     def test_hko_conditional_validator_advances_only_after_acknowledge(self):
         from scripts.hko_ingest_tick import HkoExtremaPoller
 
@@ -1234,11 +1298,11 @@ class TestDay0MetarSourceClockTick:
         trades = _Conn([("Paris", "2026-06-12", "low")])
         monkeypatch.setattr(
             "src.state.db.get_forecasts_connection_read_only",
-            lambda: forecasts,
+            lambda **_kwargs: forecasts,
         )
         monkeypatch.setattr(
             "src.state.db.get_trade_connection_read_only",
-            lambda: trades,
+            lambda **_kwargs: trades,
         )
 
         admit = im._day0_source_family_admission(
