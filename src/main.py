@@ -832,6 +832,25 @@ def _defer_for_held_position_monitor(job_name: str) -> bool:
     return False
 
 
+def _defer_background_io_for_held_position_monitor(job_name: str) -> bool:
+    """Keep disk-heavy observers behind current held-capital redecision.
+
+    SCOPE: only WAL checkpoint and deployment-freshness background I/O. DRAIN:
+    the claimed monitor finishes its bounded cycle. RESET: all inputs are current
+    process events; no sticky state is written by this gate. Canonical overdue
+    debt alone does not block maintenance between claims, so a permanently
+    unexecutable residual cannot starve WAL drainage.
+    """
+
+    if (
+        _held_position_monitor_active.is_set()
+        or _held_position_monitor_handoff_pending.is_set()
+    ):
+        logger.info("%s deferred: held-position monitor owns disk I/O priority", job_name)
+        return True
+    return False
+
+
 def _current_periodic_monitor_obligation_count() -> int | None:
     """Return canonical positive exposure currently owned by the monitor lane."""
 
@@ -3494,6 +3513,9 @@ def _check_deployment_freshness(
 
     All git failures and non-git-repo environments are silent (no crash).
     """
+    if _defer_background_io_for_held_position_monitor("deployment_freshness"):
+        return
+
     import json
     import subprocess
 
@@ -8910,16 +8932,19 @@ def _make_wal_checkpoint_cycle(db_name: str, *, defer_for_monitor: bool):
     cycle re-measures). Otherwise ``_wal_checkpoint_is_starved`` (outstanding
     bytes vs 512 MiB) drives the WARNING.
 
-    ``defer_for_monitor``: world and trades yield to an in-flight held-position
-    monitor cycle (it writes world+trade); forecasts does not — the monitor
-    never writes forecasts, so deferring there would be machinery for a case
-    that cannot occur. Fail-soft via the decorator.
+    ``defer_for_monitor``: every canonical DB yields to current held-position
+    redecision.  The monitor writes world+trade and reads forecasts; a PASSIVE
+    checkpoint on any of those large files can otherwise consume the same disk
+    window until the bounded probability read expires. Fail-soft via the
+    decorator.
     """
     job_name = f"{db_name}_wal_checkpoint"
 
     @_scheduler_job(job_name)
     def _cycle() -> None:
-        if defer_for_monitor and _defer_for_held_position_monitor(job_name):
+        if defer_for_monitor and _defer_background_io_for_held_position_monitor(
+            job_name
+        ):
             return
 
         from src.state import db as _db
@@ -8987,7 +9012,7 @@ def _make_wal_checkpoint_cycle(db_name: str, *, defer_for_monitor: bool):
 
 _world_wal_checkpoint_cycle = _make_wal_checkpoint_cycle("world", defer_for_monitor=True)
 _trades_wal_checkpoint_cycle = _make_wal_checkpoint_cycle("trades", defer_for_monitor=True)
-_forecasts_wal_checkpoint_cycle = _make_wal_checkpoint_cycle("forecasts", defer_for_monitor=False)
+_forecasts_wal_checkpoint_cycle = _make_wal_checkpoint_cycle("forecasts", defer_for_monitor=True)
 
 
 @_scheduler_job("family_book_telemetry_ingest")

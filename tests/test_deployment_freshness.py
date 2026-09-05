@@ -108,6 +108,23 @@ def _run(
 # ---------------------------------------------------------------------------
 
 class TestNoAction:
+    def test_active_held_monitor_skips_git_worktree_scan(self):
+        """Operator drift observation cannot consume the monitor's disk window."""
+        main_module._held_position_monitor_bootstrap_complete.set()
+        main_module._held_position_monitor_active.set()
+        try:
+            with patch("subprocess.check_output") as git:
+                _check_deployment_freshness(
+                    boot_sha=BOOT_SHA,
+                    boot_ts=_ts(),
+                    repo_root=Path("/fake/repo"),
+                    now=_ts(),
+                )
+        finally:
+            main_module._held_position_monitor_active.clear()
+
+        git.assert_not_called()
+
     def test_no_divergence_passes(self):
         """Same SHA at boot and filesystem — no warning, no exit."""
         _run(boot_sha=BOOT_SHA, current_sha=BOOT_SHA, boot_ts_hours_ago=10.0)

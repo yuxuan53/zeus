@@ -375,3 +375,31 @@ def test_checkpoint_job_truncates_only_fully_drained_large_wal(
     )
     main_module._forecasts_wal_checkpoint_cycle()
     assert calls == [], "a small healthy WAL must not incur TRUNCATE contention"
+
+
+def test_all_checkpoint_jobs_yield_to_active_held_monitor(monkeypatch, caplog) -> None:
+    """Forecast reads share the monitor's disk window just like its DB writes."""
+    import logging
+
+    from src import main as main_module
+    from src.state import db as db_module
+
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        db_module,
+        "checkpoint_wal",
+        lambda path: (calls.append(path) or (0, 0, 0, 4096)),
+        raising=True,
+    )
+    main_module._held_position_monitor_bootstrap_complete.set()
+    main_module._held_position_monitor_active.set()
+    try:
+        with caplog.at_level(logging.INFO):
+            main_module._world_wal_checkpoint_cycle()
+            main_module._trades_wal_checkpoint_cycle()
+            main_module._forecasts_wal_checkpoint_cycle()
+    finally:
+        main_module._held_position_monitor_active.clear()
+
+    assert calls == []
+    assert caplog.text.count("held-position monitor owns disk I/O priority") == 3
