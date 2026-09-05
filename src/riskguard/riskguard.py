@@ -41,6 +41,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import uuid
 
 from src.config import settings, get_mode
@@ -67,6 +68,7 @@ from src.state.db import (
     CANONICAL_STRATEGY_KEYS,
     DECISION_LAW_IDS,
     RISK_DB_PATH,
+    connect_existing_trade_db_without_journal_bootstrap,
     get_connection,
     get_forecasts_connection_read_only,
     get_trade_connection_with_world_required,
@@ -5126,6 +5128,8 @@ class _RiskGuardAuxiliaryWriteCapture:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
         self.writes: list[tuple[str, object]] = []
+        self._pending_risk_actions: dict[str, dict[str, object]] = {}
+        self._expired_risk_action_ids: set[str] = set()
 
     @property
     def in_transaction(self) -> bool:
@@ -5140,11 +5144,96 @@ class _RiskGuardAuxiliaryWriteCapture:
                     "risk_actions / strategy_health"
                 )
             self.writes.append((sql, parameters))
+            if "RISK_ACTIONS" in normalized:
+                if normalized.startswith("INSERT"):
+                    action_id, strategy_key, value, issued_at, reason = parameters
+                    self._pending_risk_actions[str(action_id)] = {
+                        "action_id": str(action_id),
+                        "strategy_key": str(strategy_key),
+                        "action_type": "gate",
+                        "value": str(value),
+                        "issued_at": str(issued_at),
+                        "effective_until": None,
+                        "reason": str(reason),
+                        "source": "riskguard",
+                        "precedence": 50,
+                        "status": "active",
+                    }
+                elif normalized.startswith("UPDATE"):
+                    effective_until, action_id = parameters
+                    action_id = str(action_id)
+                    self._expired_risk_action_ids.add(action_id)
+                    pending = self._pending_risk_actions.get(action_id)
+                    if pending is not None:
+                        pending["effective_until"] = effective_until
+                        pending["status"] = "expired"
             return None
+        if (
+            normalized.startswith("SELECT STRATEGY_KEY, ACTION_TYPE, REASON")
+            and "FROM RISK_ACTIONS" in normalized
+        ):
+            shadow_sql = str(sql).replace(
+                "SELECT strategy_key, action_type, reason",
+                "SELECT action_id, strategy_key, action_type, reason, "
+                "value, issued_at, effective_until, source, precedence, status",
+                1,
+            )
+            rows = {
+                str(row["action_id"]): dict(row)
+                for row in self._conn.execute(shadow_sql, parameters).fetchall()
+            }
+            rows.update(self._pending_risk_actions)
+            for action_id in self._expired_risk_action_ids:
+                pending = rows.get(action_id)
+                if pending is not None:
+                    pending["status"] = "expired"
+            refresh_time = str(parameters[0]) if parameters else ""
+            return _RiskGuardCapturedCursor(
+                [
+                    {
+                        "strategy_key": row["strategy_key"],
+                        "action_type": row["action_type"],
+                        "reason": row["reason"],
+                    }
+                    for row in rows.values()
+                    if row.get("status") == "active"
+                    and (
+                        row.get("effective_until") is None
+                        or str(row["effective_until"]) > refresh_time
+                    )
+                    and str(row.get("issued_at") or "") <= refresh_time
+                ]
+            )
         return self._conn.execute(sql, parameters)
 
     def __getattr__(self, name: str):
         return getattr(self._conn, name)
+
+
+class _RiskGuardCapturedCursor:
+    """Minimal cursor surface for the overlaid health query."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return list(self._rows)
+
+
+def _riskguard_trade_writer_connection(
+    read_conn: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Open an unattached writer for the read connection's main DB file."""
+
+    rows = read_conn.execute("PRAGMA database_list").fetchall()
+    main_path = next(
+        (str(row[2]) for row in rows if str(row[1]) == "main" and str(row[2])),
+        "",
+    )
+    canonical_path = _zeus_trade_db_path().resolve(strict=False)
+    if not main_path or Path(main_path).resolve(strict=False) == canonical_path:
+        return connect_existing_trade_db_without_journal_bootstrap(canonical_path)
+    return get_connection(Path(main_path), write_class=None)
 
 
 def _sync_riskguard_strategy_gate_actions(
@@ -5426,20 +5515,28 @@ def _refresh_riskguard_auxiliary_bookkeeping(
             deadline_ms=RISKGUARD_TRADE_WRITE_LEASE_DEADLINE_MS,
             max_hold_ms=RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
         ) as lease:
-            with bounded_sqlite_write(
-                zeus_conn,
-                lease,
-                max_hold_ms=RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
-            ):
-                zeus_conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for sql, parameters in capture.writes:
-                        zeus_conn.execute(sql, parameters)
-                    zeus_conn.commit()
-                except BaseException:
-                    if zeus_conn.in_transaction:
-                        zeus_conn.rollback()
-                    raise
+            # The tick connection has WORLD/FORECASTS attached for reads. A
+            # write transaction on it would acquire SQLite writer state for all
+            # attached databases, despite the lease being TRADE-only. Open a
+            # fresh, unattached TRADE handle only after lease acquisition.
+            write_conn = _riskguard_trade_writer_connection(zeus_conn)
+            try:
+                with bounded_sqlite_write(
+                    write_conn,
+                    lease,
+                    max_hold_ms=RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
+                ):
+                    write_conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        for sql, parameters in capture.writes:
+                            write_conn.execute(sql, parameters)
+                        write_conn.commit()
+                    except BaseException:
+                        if write_conn.in_transaction:
+                            write_conn.rollback()
+                        raise
+            finally:
+                write_conn.close()
         # Read-after-write confirmation is intentionally outside the writer lease.
         strategy_health_snapshot = query_strategy_health_snapshot(
             zeus_conn,

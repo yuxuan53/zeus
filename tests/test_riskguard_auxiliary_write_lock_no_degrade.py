@@ -124,7 +124,7 @@ def _open_short_timeout_conn(db_path) -> sqlite3.Connection:
     return conn
 
 
-def test_auxiliary_write_lock_is_absorbed_not_degraded(tmp_path):
+def test_auxiliary_write_lock_is_absorbed_not_degraded(tmp_path, monkeypatch):
     """RELATIONSHIP (concurrent writer -> RiskGuard tick): with the zeus_trades WAL
     write lock held by another connection, the auxiliary bookkeeping refresh must
     NOT raise — it absorbs the lock and returns a ``skipped_dependency_lock`` status
@@ -150,6 +150,11 @@ def test_auxiliary_write_lock_is_absorbed_not_degraded(tmp_path):
     try:
         # Module B: RiskGuard's auxiliary bookkeeping over a separate short-wait conn.
         conn = _open_short_timeout_conn(db_path)
+        monkeypatch.setattr(
+            riskguard,
+            "connect_existing_trade_db_without_journal_bootstrap",
+            lambda _path: conn,
+        )
         try:
             durable, refresh, snapshot = riskguard._refresh_riskguard_auxiliary_bookkeeping(
                 conn,
@@ -210,7 +215,7 @@ def test_unwrapped_auxiliary_write_raises_database_is_locked(tmp_path):
         holder.close()
 
 
-def test_non_lock_operationalerror_in_auxiliary_write_propagates(tmp_path):
+def test_non_lock_operationalerror_in_auxiliary_write_propagates(tmp_path, monkeypatch):
     """A NON-lock OperationalError in the auxiliary bookkeeping (e.g. a genuine
     schema fault) must NOT be swallowed as a lock-skip — it propagates loudly so a
     real fault is never masked by the lock-tolerance path. Fail-loud is preserved."""
@@ -222,6 +227,11 @@ def test_non_lock_operationalerror_in_auxiliary_write_propagates(tmp_path):
     # ("no column named precedence"), NOT "database is locked".
     conn.execute("ALTER TABLE risk_actions DROP COLUMN precedence")
     conn.commit()
+    monkeypatch.setattr(
+        riskguard,
+        "connect_existing_trade_db_without_journal_bootstrap",
+        lambda _path: conn,
+    )
     try:
         with pytest.raises(sqlite3.OperationalError) as excinfo:
             riskguard._refresh_riskguard_auxiliary_bookkeeping(
@@ -246,11 +256,25 @@ def test_auxiliary_refresh_uses_one_bounded_trade_transaction(monkeypatch):
     """
     events: list[str] = []
     coordinator = _RecordingCoordinator(events)
-    conn = sqlite3.connect(":memory:", factory=lambda *args, **kwargs: _RecordingConnection(*args, events=events, **kwargs))
+    conn = sqlite3.connect(":memory:")
+    writer_conn = sqlite3.connect(
+        ":memory:",
+        factory=lambda *args, **kwargs: _RecordingConnection(*args, events=events, **kwargs),
+    )
     try:
-        conn.execute("CREATE TABLE risk_actions (name TEXT)")
-        conn.execute("CREATE TABLE strategy_health (name TEXT)")
+        conn.execute(
+            "CREATE TABLE risk_actions (action_id TEXT PRIMARY KEY, strategy_key TEXT, "
+            "action_type TEXT, value TEXT, issued_at TEXT, effective_until TEXT, "
+            "reason TEXT, source TEXT, precedence INTEGER, status TEXT)"
+        )
         conn.commit()
+        writer_conn.execute(
+            "CREATE TABLE risk_actions (action_id TEXT PRIMARY KEY, strategy_key TEXT, "
+            "action_type TEXT, value TEXT, issued_at TEXT, effective_until TEXT, "
+            "reason TEXT, source TEXT, precedence INTEGER, status TEXT)"
+        )
+        writer_conn.execute("CREATE TABLE strategy_health (name TEXT)")
+        writer_conn.commit()
         events.clear()
         lease_active = [False]
 
@@ -269,21 +293,45 @@ def test_auxiliary_refresh_uses_one_bounded_trade_transaction(monkeypatch):
         monkeypatch.setattr(riskguard, "default_runtime_write_coordinator", lambda: coordinator)
         monkeypatch.setattr(
             riskguard,
-            "_sync_riskguard_strategy_gate_actions",
-            lambda write_conn, *_args, **_kwargs: (
-                events.append(f"sync:{write_conn.in_transaction}"),
-                write_conn.execute("INSERT INTO risk_actions VALUES ('gate')"),
-                {"status": "emitted", "emitted_count": 1, "expired_count": 0},
-            )[-1],
+            "connect_existing_trade_db_without_journal_bootstrap",
+            lambda _path: writer_conn,
         )
         monkeypatch.setattr(
             riskguard,
-            "refresh_strategy_health",
-            lambda write_conn, **_kwargs: (
-                events.append(f"health:{write_conn.in_transaction}"),
-                write_conn.execute("INSERT INTO strategy_health VALUES ('health')"),
-                {"status": "refreshed", "rows_written": 1},
+            "_sync_riskguard_strategy_gate_actions",
+            lambda write_conn, *_args, **_kwargs: (
+                events.append(f"sync:{write_conn.in_transaction}"),
+                write_conn.execute(
+                    "INSERT INTO risk_actions (action_id, strategy_key, action_type, "
+                    "value, issued_at, effective_until, reason, source, precedence, status) "
+                    "VALUES (?, ?, 'gate', ?, ?, NULL, ?, 'riskguard', 50, 'active')",
+                    (
+                        "gate",
+                        "center_buy",
+                        "true",
+                        "2026-09-05T00:00:00+00:00",
+                        "same_tick_gate",
+                    ),
+                ),
+                {"status": "emitted", "emitted_count": 1, "expired_count": 0},
             )[-1],
+        )
+
+        def recording_health(write_conn, **_kwargs):
+            rows = write_conn.execute(
+                "SELECT strategy_key, action_type, reason FROM risk_actions "
+                "WHERE status = 'active' AND (effective_until IS NULL OR effective_until > ?) "
+                "AND issued_at <= ?",
+                ("2026-09-05T00:00:00+00:00", "2026-09-05T00:00:00+00:00"),
+            ).fetchall()
+            events.append(f"health:{write_conn.in_transaction}:{rows[0]['reason']}")
+            write_conn.execute("INSERT INTO strategy_health VALUES ('health')")
+            return {"status": "refreshed", "rows_written": 1}
+
+        monkeypatch.setattr(
+            riskguard,
+            "refresh_strategy_health",
+            recording_health,
         )
         monkeypatch.setattr(
             riskguard,
@@ -305,7 +353,7 @@ def test_auxiliary_refresh_uses_one_bounded_trade_transaction(monkeypatch):
         assert snapshot["status"] == "fresh"
         assert events == [
             "sync:False",
-            "health:False",
+            "health:False:same_tick_gate",
             "lease_enter",
             "begin",
             "dml",
@@ -323,6 +371,7 @@ def test_auxiliary_refresh_uses_one_bounded_trade_transaction(monkeypatch):
         }
     finally:
         conn.close()
+        writer_conn.close()
 
 
 def test_unified_trade_lease_contention_skips_without_begin_or_partial_rows(monkeypatch):
@@ -346,3 +395,100 @@ def test_unified_trade_lease_contention_skips_without_begin_or_partial_rows(monk
         assert conn.in_transaction is False
     finally:
         conn.close()
+
+
+def test_dedicated_trade_writer_does_not_lock_attached_world_or_forecasts(
+    monkeypatch, tmp_path
+):
+    """An attached read connection cannot widen the TRADE writer transaction."""
+    trade_path = tmp_path / "zeus_trades.db"
+    world_path = tmp_path / "zeus-world.db"
+    forecasts_path = tmp_path / "zeus-forecasts.db"
+    for path in (trade_path, world_path, forecasts_path):
+        setup = sqlite3.connect(str(path))
+        setup.execute("CREATE TABLE marker (value TEXT)")
+        setup.commit()
+        setup.close()
+
+    trade_setup = sqlite3.connect(str(trade_path))
+    trade_setup.execute(
+        "CREATE TABLE risk_actions (action_id TEXT PRIMARY KEY, strategy_key TEXT, "
+        "action_type TEXT, value TEXT, issued_at TEXT, effective_until TEXT, "
+        "reason TEXT, source TEXT, precedence INTEGER, status TEXT)"
+    )
+    trade_setup.execute("CREATE TABLE strategy_health (name TEXT)")
+    trade_setup.commit()
+    trade_setup.close()
+
+    read_conn = sqlite3.connect(str(trade_path))
+    read_conn.execute("ATTACH DATABASE ? AS world", (str(world_path),))
+    read_conn.execute("ATTACH DATABASE ? AS forecasts", (str(forecasts_path),))
+    writer_coord = _RecordingCoordinator([])
+    monkeypatch.setattr(riskguard, "default_runtime_write_coordinator", lambda: writer_coord)
+    monkeypatch.setattr(
+        riskguard,
+        "connect_existing_trade_db_without_journal_bootstrap",
+        lambda _path: sqlite3.connect(str(trade_path)),
+    )
+    monkeypatch.setattr(
+        riskguard,
+        "_sync_riskguard_strategy_gate_actions",
+        lambda write_conn, *_args, **_kwargs: (
+            write_conn.execute(
+                "INSERT INTO risk_actions (action_id, strategy_key, action_type, value, "
+                "issued_at, effective_until, reason, source, precedence, status) "
+                "VALUES (?, ?, 'gate', ?, ?, NULL, ?, 'riskguard', 50, 'active')",
+                (
+                    "attached-read-test",
+                    "center_buy",
+                    "true",
+                    "2026-09-05T00:00:00+00:00",
+                    "attached_read_test",
+                ),
+            ),
+            {"status": "emitted", "emitted_count": 1, "expired_count": 0},
+        )[-1],
+    )
+    monkeypatch.setattr(
+        riskguard,
+        "refresh_strategy_health",
+        lambda write_conn, **_kwargs: (
+            write_conn.execute("INSERT INTO strategy_health VALUES ('health')"),
+            {"status": "refreshed", "rows_written": 1},
+        )[-1],
+    )
+    monkeypatch.setattr(
+        riskguard,
+        "query_strategy_health_snapshot",
+        lambda *_args, **_kwargs: {
+            "status": "fresh",
+            "by_strategy": {},
+            "stale_strategy_keys": [],
+        },
+    )
+
+    world_holder = sqlite3.connect(str(world_path))
+    forecasts_holder = sqlite3.connect(str(forecasts_path))
+    world_holder.execute("BEGIN IMMEDIATE")
+    world_holder.execute("INSERT INTO marker VALUES ('held')")
+    forecasts_holder.execute("BEGIN IMMEDIATE")
+    forecasts_holder.execute("INSERT INTO marker VALUES ('held')")
+    try:
+        riskguard._refresh_riskguard_auxiliary_bookkeeping(
+            read_conn,
+            recommended_strategy_gate_reasons={},
+            now="2026-09-05T00:00:00+00:00",
+        )
+    finally:
+        world_holder.rollback()
+        forecasts_holder.rollback()
+        world_holder.close()
+        forecasts_holder.close()
+        read_conn.close()
+
+    verify = sqlite3.connect(str(trade_path))
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM risk_actions").fetchone()[0] == 1
+        assert verify.execute("SELECT COUNT(*) FROM strategy_health").fetchone()[0] == 1
+    finally:
+        verify.close()
