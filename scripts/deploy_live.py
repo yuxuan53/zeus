@@ -60,6 +60,8 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1994,6 +1996,99 @@ def _current_quote_only_repair_snapshot_ids(
     return tuple(position_id for position_id in wanted if position_id in proven)
 
 
+def _current_quote_only_repair_live_book_ids(
+    trade_db: Path,
+    *,
+    position_ids: tuple[str, ...],
+    require_no_executable_exit: bool = False,
+) -> tuple[str, ...]:
+    """Re-fetch exact held books when the stuck writer cannot persist them."""
+
+    wanted = tuple(dict.fromkeys(str(value).strip() for value in position_ids))
+    if not wanted or any(not position_id for position_id in wanted):
+        return ()
+    placeholders = ", ".join("?" for _ in wanted)
+    try:
+        conn = sqlite3.connect(f"file:{trade_db}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        if not {
+            "position_id",
+            "condition_id",
+            "direction",
+            "token_id",
+            "no_token_id",
+        }.issubset(_sqlite_table_columns(conn, "position_current")):
+            return ()
+        rows = conn.execute(
+            f"""
+            SELECT position_id,
+                   condition_id,
+                   CASE direction
+                       WHEN 'buy_yes' THEN token_id
+                       WHEN 'buy_no' THEN no_token_id
+                   END AS held_token_id
+              FROM position_current
+             WHERE position_id IN ({placeholders})
+            """,
+            wanted,
+        ).fetchall()
+    except (RuntimeError, sqlite3.Error):
+        return ()
+    finally:
+        with suppress(UnboundLocalError):
+            conn.close()
+
+    identities = {
+        str(row["position_id"] or "").strip(): (
+            str(row["condition_id"] or "").strip(),
+            str(row["held_token_id"] or "").strip(),
+        )
+        for row in rows
+    }
+    proven: set[str] = set()
+    for position_id in wanted:
+        condition_id, held_token_id = identities.get(position_id, ("", ""))
+        if not condition_id or not held_token_id:
+            continue
+        query = urllib.parse.urlencode({"token_id": held_token_id})
+        request = urllib.request.Request(
+            f"https://clob.polymarket.com/book?{query}",
+            headers={"User-Agent": "zeus-deploy-live/1"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5.0) as response:
+                book = json.load(response)
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(book, dict)
+            or str(book.get("asset_id") or "").strip() != held_token_id
+            or str(book.get("market") or "").strip() != condition_id
+            or not isinstance(book.get("bids"), list)
+        ):
+            continue
+        bid_prices: list[float] = []
+        valid = True
+        for level in book["bids"]:
+            try:
+                price = float(level["price"])
+            except (KeyError, TypeError, ValueError):
+                valid = False
+                break
+            if not math.isfinite(price) or not 0.0 <= price <= 1.0:
+                valid = False
+                break
+            bid_prices.append(price)
+        if not valid:
+            continue
+        if require_no_executable_exit and bid_prices:
+            best_bid = max(bid_prices)
+            if 0.05 <= best_bid <= 0.95:
+                continue
+        proven.add(position_id)
+    return tuple(position_id for position_id in wanted if position_id in proven)
+
+
 def _quote_only_monitor_repair_handoff_admission(
     *,
     trade_db: Path,
@@ -2129,6 +2224,18 @@ def _quote_only_monitor_repair_handoff_admission(
         trade_db,
         position_ids=quote_ids,
     )
+    missing_snapshot_ids = tuple(
+        position_id for position_id in quote_ids if position_id not in snapshot_ids
+    )
+    if missing_snapshot_ids:
+        snapshot_ids = tuple(
+            dict.fromkeys(
+                (*snapshot_ids, *_current_quote_only_repair_live_book_ids(
+                    trade_db,
+                    position_ids=missing_snapshot_ids,
+                ))
+            )
+        )
     if set(snapshot_ids) != quote_set or len(snapshot_ids) != len(quote_ids):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:exact_held_book_not_current"
     no_exit_snapshot_ids = (
@@ -2140,6 +2247,21 @@ def _quote_only_monitor_repair_handoff_admission(
         if restart_ids
         else ()
     )
+    missing_no_exit_ids = tuple(
+        position_id
+        for position_id in restart_ids
+        if position_id not in no_exit_snapshot_ids
+    )
+    if missing_no_exit_ids:
+        no_exit_snapshot_ids = tuple(
+            dict.fromkeys(
+                (*no_exit_snapshot_ids, *_current_quote_only_repair_live_book_ids(
+                    trade_db,
+                    position_ids=missing_no_exit_ids,
+                    require_no_executable_exit=True,
+                ))
+            )
+        )
     if set(no_exit_snapshot_ids) != restart_ids:
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:executable_exit_unprotected"
     quote_sidecar = _held_quote_sidecar_current_evidence()

@@ -4929,6 +4929,61 @@ def test_deploy_live_stale_monitor_repair_never_abandons_executable_exit(
         assert detail.endswith("executable_exit_unprotected")
 
 
+@pytest.mark.parametrize(
+    ("bids", "asset_id", "market", "require_no_exit", "expected"),
+    (
+        ([], "held-token", "condition-a", True, ("pos-a",)),
+        ([{"price": "0.004", "size": "10"}], "held-token", "condition-a", True, ("pos-a",)),
+        ([{"price": "0.05", "size": "10"}], "held-token", "condition-a", True, ()),
+        ([], "wrong-token", "condition-a", True, ()),
+        ([], "held-token", "wrong-condition", False, ()),
+    ),
+)
+def test_deploy_live_direct_held_book_recovery_preserves_identity_and_exit_band(
+    monkeypatch, tmp_path, bids, asset_id, market, require_no_exit, expected
+):
+    dl = _load("deploy_live_direct_held_book_recovery", "deploy_live.py")
+    trade_db = tmp_path / "zeus_trades.db"
+    conn = sqlite3.connect(trade_db)
+    conn.executescript(
+        """
+        CREATE TABLE position_current (
+            position_id TEXT PRIMARY KEY,
+            condition_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            no_token_id TEXT NOT NULL
+        );
+        INSERT INTO position_current VALUES (
+            'pos-a', 'condition-a', 'buy_no', 'yes-token', 'held-token'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    payload = json.dumps(
+        {
+            "asset_id": asset_id,
+            "market": market,
+            "bids": bids,
+            "asks": [],
+        }
+    ).encode()
+
+    def _urlopen(request, *, timeout):
+        assert "token_id=held-token" in request.full_url
+        assert timeout == 5.0
+        return contextlib.nullcontext(io.BytesIO(payload))
+
+    monkeypatch.setattr(dl.urllib.request, "urlopen", _urlopen)
+
+    assert dl._current_quote_only_repair_live_book_ids(
+        trade_db,
+        position_ids=("pos-a",),
+        require_no_executable_exit=require_no_exit,
+    ) == expected
+
+
 def test_deploy_live_quote_only_repair_allows_only_stale_settlement_subset(
     monkeypatch, tmp_path
 ):
@@ -5087,6 +5142,11 @@ def test_deploy_live_quote_only_repair_handoff_rejects_expired_held_book(
         dl,
         "_held_quote_sidecar_current_evidence",
         lambda: pytest.fail("expired exact book must refuse before sidecar proof"),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_current_quote_only_repair_live_book_ids",
+        lambda *_args, **_kwargs: (),
     )
 
     ok, detail = dl._quote_only_monitor_repair_handoff_admission(
