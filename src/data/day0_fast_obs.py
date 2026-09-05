@@ -485,6 +485,14 @@ def build_fast_station_residual_likelihood(
 
     training_cutoff = min(observed_at, decided_at)
     window_start = training_cutoff - timedelta(days=FAST_RESIDUAL_LOOKBACK_DAYS)
+    # Keep the exact julianday predicates below as the semantic authority: they
+    # accept every timestamp spelling SQLite previously accepted.  These UTC
+    # calendar-day bounds are only a sargable superset that lets the existing
+    # (city, publish_ts_utc) index avoid scanning a city's whole print ledger.
+    # The upper bound is the following UTC day, so a valid row at either edge
+    # cannot be excluded by this prefilter.
+    index_window_start = window_start.date().isoformat()
+    index_window_end = (training_cutoff + timedelta(days=1)).date().isoformat()
     table = "world.observation_prints"
     try:
         conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -497,6 +505,8 @@ def build_fast_station_residual_likelihood(
                    fetched_at_utc, raw_report
               FROM {table}
              WHERE city = ?
+               AND publish_ts_utc >= ?
+               AND publish_ts_utc < ?
                AND upper(station_id) = ?
                AND source_channel IN ('wu_icao_history', ?)
                AND julianday(publish_ts_utc) >= julianday(?)
@@ -506,6 +516,8 @@ def build_fast_station_residual_likelihood(
             """,
             (
                 str(city),
+                index_window_start,
+                index_window_end,
                 station,
                 FAST_OBS_SOURCE_ID,
                 window_start.isoformat(),

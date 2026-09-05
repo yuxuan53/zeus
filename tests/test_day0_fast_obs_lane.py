@@ -1,6 +1,6 @@
 # Created: 2026-06-10
-# Last reused/audited: 2026-09-01
-# Lifecycle: created=2026-06-10; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused/audited: 2026-09-05
+# Lifecycle: created=2026-06-10; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Authority basis: operator green-light 2026-06-10 items A/C/E (free METAR fast
 #   lane, live-obs hook wiring, WU-vs-METAR oracle anomaly guard); day0
 #   first-principles review /tmp/day0_first_principles_review.md §6.2;
@@ -316,6 +316,129 @@ def test_fast_station_residual_likelihood_is_causal_station_local_and_thin_inert
         )
         is None
     )
+
+
+def test_fast_station_residual_likelihood_bounds_city_history_before_filtering(
+    monkeypatch,
+) -> None:
+    """The seven-day residual read must not scan a city's old print ledger."""
+    from src import config as config_module
+
+    city = "Bounded Residual City"
+    station = "TEST"
+    monkeypatch.setitem(
+        config_module.cities_by_name,
+        city,
+        SimpleNamespace(
+            settlement_source_type="wu_icao",
+            wu_station=station,
+            settlement_unit="C",
+            timezone="UTC",
+        ),
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE observation_prints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT NOT NULL,
+            station_id TEXT NOT NULL,
+            source_channel TEXT NOT NULL,
+            publish_ts_utc TEXT NOT NULL,
+            value_native REAL NOT NULL,
+            unit TEXT NOT NULL,
+            fetched_at_utc TEXT NOT NULL,
+            raw_report TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX idx_observation_prints_city_publish "
+        "ON observation_prints(city, publish_ts_utc)"
+    )
+    cutoff = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
+    recent_rows: list[tuple[object, ...]] = []
+    for index in range(20):
+        published = cutoff - timedelta(minutes=30 * (20 - index))
+        for channel in ("wu_icao_history", FAST_OBS_SOURCE_ID):
+            recent_rows.append(
+                (
+                    city,
+                    station.lower(),
+                    channel,
+                    published.isoformat(),
+                    20.0 + float(index % 3),
+                    "C",
+                    (published + timedelta(minutes=1)).isoformat(),
+                    "",
+                )
+            )
+    conn.executemany(
+        "INSERT INTO observation_prints "
+        "(city,station_id,source_channel,publish_ts_utc,value_native,unit,fetched_at_utc,raw_report) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        recent_rows,
+    )
+    old_start = datetime(2025, 1, 1, tzinfo=UTC)
+    conn.executemany(
+        "INSERT INTO observation_prints "
+        "(city,station_id,source_channel,publish_ts_utc,value_native,unit,fetched_at_utc,raw_report) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (
+                city,
+                "OTHER",
+                "unrelated_channel",
+                (old_start + timedelta(minutes=index)).isoformat(),
+                5.0,
+                "C",
+                (old_start + timedelta(minutes=index + 1)).isoformat(),
+                "",
+            )
+            for index in range(12_000)
+        ],
+    )
+    traced: list[str] = []
+    progress_calls = 0
+
+    def progress() -> int:
+        nonlocal progress_calls
+        progress_calls += 1
+        return 0
+
+    conn.set_trace_callback(traced.append)
+    conn.set_progress_handler(progress, 1_000)
+    try:
+        likelihood = build_fast_station_residual_likelihood(
+            conn,
+            city=city,
+            target_date="2026-07-27",
+            metric="high",
+            observed_source=FAST_OBS_SOURCE_ID,
+            observation_time=cutoff,
+            decision_time=cutoff,
+        )
+    finally:
+        conn.set_trace_callback(None)
+        conn.set_progress_handler(None, 0)
+
+    assert likelihood is not None
+    assert likelihood.matched_pairs == 20
+    residual_query = next(
+        statement
+        for statement in traced
+        if "FROM observation_prints" in statement
+        and "source_channel IN" in statement
+    )
+    plan = conn.execute(f"EXPLAIN QUERY PLAN {residual_query}").fetchall()
+    assert any(
+        "idx_observation_prints_city_publish" in str(row[-1])
+        and "publish_ts_utc>? AND publish_ts_utc<?" in str(row[-1])
+        for row in plan
+    )
+    # 12k same-city, out-of-window rows must stay outside the VM scan.  A
+    # city-only read regresses into a ledger scan and crosses this bound.
+    assert progress_calls < 40
 
 
 def test_fast_station_extreme_invalid_timezone_fails_soft(monkeypatch) -> None:
