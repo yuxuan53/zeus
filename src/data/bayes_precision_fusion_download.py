@@ -349,6 +349,14 @@ BAYES_PRECISION_FUSION_CANDIDATE_ACCRUAL_MODELS: tuple[str, ...] = (
 # rule use the same natural-key previous_runs row when present.
 SINGLE_RUNS_UNSERVABLE_MODELS: tuple[str, ...] = ("kma_gdps", "kma_ldps")
 
+# 2026-09-04 (probed): the previous_runs surface the comment above defers KMA's current value to
+# is ALSO dead — kma_gdps returns HTTP 200 with an all-null series at every lead (Busan, Hong
+# Kong), kma_ldps returns all-null inside its Korea polygon and HTTP 400 outside it. Nothing has
+# ever persisted (zero raw_model_forecasts rows for kma_*, zero of 334,374 posteriors since
+# 08-05), so the R4a immutable skip never matches and the leg re-fires every pass: 1,123
+# single-model kma_gdps calls in one day. A leg the provider cannot serve is not fetched.
+PREVIOUS_RUNS_UNSERVABLE_MODELS: tuple[str, ...] = ("kma_gdps", "kma_ldps")
+
 # R3 — Per-model run cadence: the UTC init hours each provider actually publishes. Fetching a model
 # at a non-publishing cycle re-pulls the SAME underlying run under a wrong source_cycle_time.
 # Models not listed here default to all four {0,6,12,18}. NOTE (2026-06-17): jma_seamless and
@@ -2207,6 +2215,9 @@ def download_bayes_precision_fusion_extra_raw_inputs(
 
                     if not include_previous_runs:
                         pv = None
+                    elif model in PREVIOUS_RUNS_UNSERVABLE_MODELS:
+                        dropped.append(f"{model}:previous_runs_unservable")
+                        pv = None
                     elif (model, t.city, t.target_date, t.metric, "previous_runs") in persisted_keys:
                         pv = None
                     else:
@@ -2435,6 +2446,9 @@ def download_bayes_precision_fusion_extra_raw_inputs(
             for model in all_models if include_previous_runs and not timeboxed else []:
                 if not _model_in_domain(model, lat=ref.latitude, lon=ref.longitude, lead_days=int(ref.lead_days)):
                     continue  # domain_excluded already logged above
+                if model in PREVIOUS_RUNS_UNSERVABLE_MODELS:
+                    dropped.append(f"{model}:previous_runs_unservable")
+                    continue
                 # R4a: check both metrics already in immutable history AT THIS LEAD.
                 metrics_needed = [
                     met for met in ("high", "low")

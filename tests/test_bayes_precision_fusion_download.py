@@ -2242,3 +2242,104 @@ def test_transport_shaped_gap_reason_is_never_memoized(tmp_path, monkeypatch) ->
     assert dl._EXACT_RUN_UNMATERIALIZABLE_MEMO == {}
     # A is persisted after call 1, so call 2 re-requests exactly the unmemoizable B.
     assert calls == [[(date_a, date_b)], [(date_b,)]]
+
+
+def test_previous_runs_unservable_models_are_dropped_from_the_batched_leg(
+    tmp_path, monkeypatch
+) -> None:
+    """QUOTA (2026-09-04): 1,123 single-model kma_gdps previous-runs calls in one day. The
+    provider answers HTTP 200 with an all-null series, so nothing persists, so the R4a
+    immutable skip never matches and the leg re-fires forever. Never request it."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    seen_models: list[list[str]] = []
+
+    def _previous_batch(**kwargs):
+        seen_models.append(list(kwargs["models"]))
+        return {"ecmwf_ifs": (30.0, 20.0)}
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(dl, "_default_previous_runs_fetch_batched", _previous_batch)
+    monkeypatch.setattr(
+        dl, "_default_live_fetch_batched", lambda **_kwargs: {"ecmwf_ifs": (24.0, 12.0)}
+    )
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 6, 8, 0, tzinfo=UTC),
+        targets=_targets(),
+        models=("kma_gdps", "ecmwf_ifs"),
+        include_previous_runs=True,
+        prune_after=False,
+    )
+
+    assert seen_models == [["ecmwf_ifs"]]
+    assert "kma_gdps:previous_runs_unservable" in report["dropped"]
+    assert _count(db, model="kma_gdps") == 0
+    assert _count(db, model="ecmwf_ifs", endpoint="previous_runs") == 1
+
+
+def test_previous_runs_leg_is_not_requested_at_all_for_an_unservable_only_basket(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        dl,
+        "_default_previous_runs_fetch_batched",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("previous_runs must not be requested for an unservable-only basket")
+        ),
+    )
+    monkeypatch.setattr(dl, "_default_live_fetch_batched", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 6, 8, 0, tzinfo=UTC),
+        targets=_targets(),
+        models=("kma_gdps",),
+        include_previous_runs=True,
+        prune_after=False,
+    )
+
+    assert report["written_row_count"] == 0
+    assert "kma_gdps:previous_runs_unservable" in report["dropped"]
+    assert "kma_gdps:single_runs_unservable" in report["dropped"]
+
+
+def test_previous_runs_unservable_models_are_dropped_from_the_legacy_leg(
+    tmp_path, monkeypatch
+) -> None:
+    """The legacy per-model path is a separate injection surface — the same provider fact
+    holds there, so the same leg must be skipped."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    seen_models: list[str] = []
+
+    def _previous(*, model, **_kwargs):
+        seen_models.append(model)
+        return 19.5
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 6, 8, 0, tzinfo=UTC),
+        targets=_targets(),
+        models=("kma_gdps", "ecmwf_ifs"),
+        include_previous_runs=True,
+        prune_after=False,
+        single_runs_fetch=lambda **_kwargs: 20.0,
+        previous_runs_fetch=_previous,
+    )
+
+    assert seen_models == ["ecmwf_ifs"]
+    assert "kma_gdps:previous_runs_unservable" in report["dropped"]
+    assert _count(db, model="kma_gdps", endpoint="previous_runs") == 0
