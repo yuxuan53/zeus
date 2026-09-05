@@ -2958,6 +2958,46 @@ def test_priority_job_processes_existing_request_before_seed_bridge(
     assert receipt == {"status": "PROCESSED", "seed_limit": 0}
 
 
+def test_priority_job_bridges_own_clock_seed_before_existing_request(
+    monkeypatch, tmp_path
+) -> None:
+    from src.ingest import forecast_live_daemon
+    from src.data import replacement_forecast_production
+
+    cfg = {
+        "request_dir": tmp_path / "requests",
+        "seed_dir": tmp_path / "seeds",
+    }
+    cfg["request_dir"].mkdir()
+    cfg["seed_dir"].mkdir()
+    (cfg["request_dir"] / "older-timeout-retry.json").write_text("{}")
+    own_clock_seed = (
+        cfg["seed_dir"]
+        / "Hong_Kong.2026-09-05.high.station-input-revision.enqueue.json"
+    )
+    own_clock_seed.write_text("{}")
+    monkeypatch.setattr(
+        replacement_forecast_production,
+        "_replacement_forecast_live_materialization_queue_config",
+        lambda: cfg,
+    )
+    calls: list[int] = []
+
+    def run_lane(_cfg, *, lane, seed_limit):
+        calls.append(seed_limit)
+        assert lane == "priority"
+        return {"status": "PROCESSED", "seed_limit": seed_limit}
+
+    monkeypatch.setattr(
+        forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
+    )
+
+    receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
+
+    assert calls == [3]
+    assert receipt == {"status": "PROCESSED", "seed_limit": 3}
+
+
 def test_priority_job_bridges_seeds_after_request_lane_is_empty(
     monkeypatch, tmp_path
 ) -> None:

@@ -4553,6 +4553,30 @@ def test_own_clock_station_revision_enters_priority_without_becoming_held(
     assert station in window
 
 
+def test_own_clock_station_revision_preempts_older_capital_queue_tiers(tmp_path):
+    """A new source fact must remain ahead of already-known compute debt."""
+    import src.data.replacement_forecast_live_materialization_queue as queue_mod
+
+    station = tmp_path / "Hong_Kong.2026-09-05.low.station-input-revision.json"
+    held = tmp_path / "Moscow.2026-09-04.high.enqueue.json"
+    station.write_text("{}")
+    held.write_text("{}")
+
+    capital_order = queue_mod._prioritize_seed_files_by_capital_tier(
+        (station, held),
+        never_priced_scope=frozenset(),
+        current_global_scope=frozenset(),
+        current_money_risk=frozenset({("Moscow", "2026-09-04", "high")}),
+        current_probability_debt=frozenset({("Moscow", "2026-09-04", "high")}),
+    )
+    causal_order = queue_mod._prioritize_own_clock_station_revision_files(
+        capital_order
+    )
+
+    assert capital_order == (held, station)
+    assert causal_order == (station, held)
+
+
 @pytest.mark.parametrize("unheld_owner", ("global", "never_priced"))
 def test_priority_seed_tranche_preserves_held_and_unheld_truth(
     tmp_path, monkeypatch, unheld_owner

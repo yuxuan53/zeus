@@ -1337,12 +1337,23 @@ def _replacement_forecast_materialize_job(
 
 @_scheduler_job(REPLACEMENT_FORECAST_PRIORITY_MATERIALIZE_JOB_ID)
 def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
-    """Drain prepared priority requests before bridging more seeds."""
+    """Advance causal station evidence before ordinary request/retry debt."""
     from src.data.replacement_forecast_production import (
         _replacement_forecast_live_materialization_queue_config,
     )
 
     cfg = _replacement_forecast_live_materialization_queue_config()
+    if _replacement_forecast_own_clock_seed_pending(cfg):
+        # A named station revision is a newly available causal fact, while an
+        # existing request (especially a timeout retry) is older compute debt.
+        # Publishing the fact's request first preserves information lead; the
+        # next one-second callback still drains prepared requests through the
+        # same single-writer path.
+        return _replacement_forecast_materialize_lane(
+            cfg,
+            lane="priority",
+            seed_limit=3,
+        )
     request_report = _replacement_forecast_materialize_lane(
         cfg,
         lane="priority",
@@ -1407,6 +1418,18 @@ def _replacement_forecast_materialize_lane(
     result = report.as_dict()
     logger.info("replacement forecast materialization lane=%s report=%s", lane, result)
     return result
+
+
+def _replacement_forecast_own_clock_seed_pending(
+    cfg: dict[str, object],
+) -> bool:
+    configured = cfg.get("seed_dir")
+    if configured in (None, ""):
+        return False
+    path = Path(str(configured))
+    return path.exists() and next(
+        path.glob("*.station-input-revision.*.json"), None
+    ) is not None
 
 
 def _replacement_forecast_queue_pending(

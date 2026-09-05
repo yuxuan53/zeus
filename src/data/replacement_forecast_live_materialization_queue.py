@@ -4545,15 +4545,18 @@ def _prepare_seed_requests_with_connection(
             current_priority_scope,
         )
     elif lane == MATERIALIZATION_LANE_PRIORITY:
-        prioritized_raw_snapshot = _prioritize_own_clock_station_revision_files(
-            rotated_raw_snapshot
-        )
         prioritized_raw_snapshot = _prioritize_seed_files_by_capital_tier(
-            prioritized_raw_snapshot,
+            rotated_raw_snapshot,
             never_priced_scope=never_priced_scope,
             current_global_scope=current_global_scope,
             current_money_risk=current_money_risk,
             current_probability_debt=current_probability_debt,
+        )
+        # The station publication is the newest causal fact. Keep it ahead of
+        # older compute debt after capital classification so the bounded seed
+        # tranche cannot hide it behind ordinary held/global backlog.
+        prioritized_raw_snapshot = _prioritize_own_clock_station_revision_files(
+            prioritized_raw_snapshot
         )
         prioritized_raw_snapshot = _interleave_current_priority_seed_files_by_name(
             prioritized_raw_snapshot,
