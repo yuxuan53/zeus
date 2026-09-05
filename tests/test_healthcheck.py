@@ -2050,6 +2050,106 @@ def test_monitor_cadence_closed_market_hold_discharges_old_monitor_only_debt(
     assert evidence["settlement_recoverable_positions"][0]["position_id"] == "pos-1"
 
 
+def test_monitor_cadence_fresh_nonaccepting_snapshot_disposes_failed_monitor(
+    tmp_path,
+):
+    """A current exact held-token no-venue fact is sufficient for restart only."""
+    from src.ops.monitor_cadence import collect_monitor_cadence_evidence
+
+    db_path = tmp_path / "zeus_trades.db"
+    now = datetime.now(timezone.utc)
+    _init_monitor_cadence_db(db_path, monitor_at=now)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        for column in ("condition_id TEXT", "direction TEXT", "token_id TEXT", "no_token_id TEXT"):
+            conn.execute(f"ALTER TABLE position_current ADD COLUMN {column}")
+        conn.execute(
+            """
+            UPDATE position_current
+               SET condition_id = 'condition-1', direction = 'buy_yes',
+                   token_id = 'yes-1', no_token_id = 'no-1'
+             WHERE position_id = 'pos-1'
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE executable_market_snapshot_latest (
+                condition_id TEXT,
+                selected_outcome_token_id TEXT,
+                snapshot_id TEXT,
+                active INTEGER,
+                closed INTEGER,
+                accepting_orders INTEGER,
+                captured_at TEXT,
+                freshness_deadline TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO executable_market_snapshot_latest VALUES (
+                'condition-1', 'yes-1', 'snapshot-1', 0, 0, 0, ?, ?
+            )
+            """,
+            (
+                (now - timedelta(seconds=1)).isoformat(),
+                (now + timedelta(minutes=2)).isoformat(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE position_events
+               SET payload_json = ?
+             WHERE event_id = 'evt-monitor'
+            """,
+            (
+                json.dumps(
+                    {
+                        "last_monitor_prob_is_fresh": False,
+                        "last_monitor_market_price_is_fresh": False,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+        evidence = collect_monitor_cadence_evidence(
+            conn,
+            now=now,
+            max_age_seconds=60.0,
+            monitor_refreshed_only=True,
+            require_fresh_inputs=True,
+        )
+    finally:
+        conn.close()
+
+    assert evidence["stale_or_missing_position_count"] == 0
+    assert evidence["settlement_recoverable_position_count"] == 1
+    recovered = evidence["settlement_recoverable_positions"][0]
+    assert recovered["closed_market_validation"] == "snapshot_accepting_orders_false"
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "UPDATE executable_market_snapshot_latest SET freshness_deadline = ?",
+            ((now - timedelta(seconds=1)).isoformat(),),
+        )
+        conn.commit()
+        expired = collect_monitor_cadence_evidence(
+            conn,
+            now=now,
+            max_age_seconds=60.0,
+            monitor_refreshed_only=True,
+            require_fresh_inputs=True,
+        )
+    finally:
+        conn.close()
+
+    assert expired["settlement_recoverable_position_count"] == 0
+    assert expired["blocking_stale_position_count"] == 1
+
+
 def test_monitor_cadence_status_does_not_accept_review_as_monitor_refresh(
     monkeypatch,
     tmp_path,

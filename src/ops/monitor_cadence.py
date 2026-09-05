@@ -83,6 +83,7 @@ def collect_monitor_cadence_evidence(
 
     position_columns = _table_columns(conn, "position_current")
     event_columns = _table_columns(conn, "position_events")
+    snapshot_columns = _table_columns(conn, "executable_market_snapshot_latest")
     now_utc = _ensure_utc(now)
     monitored_rows = _monitor_cadence_position_rows(conn, position_columns, now_utc=now_utc)
     non_monitor_chain_risk_rows = _non_monitor_chain_risk_position_rows(
@@ -206,6 +207,12 @@ def collect_monitor_cadence_evidence(
                 if _monitor_event_closed_market_pending_settlement(
                     position_evidence,
                     monitor_event,
+                ) or _current_snapshot_nonexecutable_for_restart(
+                    conn,
+                    position,
+                    position_evidence,
+                    snapshot_columns=snapshot_columns,
+                    now_utc=now_utc,
                 ):
                     settlement_recoverable.append(position_evidence.copy())
                 else:
@@ -718,6 +725,10 @@ def _monitor_cadence_position_rows(
         "order_status",
         "exit_reason",
         "target_date",
+        "condition_id",
+        "direction",
+        "token_id",
+        "no_token_id",
     ):
         optional_selects.append(column if column in position_columns else f"NULL AS {column}")
     rows = conn.execute(
@@ -761,6 +772,10 @@ def _monitor_cadence_position_rows(
                     "shares": shares,
                     "chain_shares": chain_shares,
                     "exposure_unknown": exposure_unknown,
+                    "condition_id": str(row["condition_id"] or "").strip(),
+                    "direction": str(row["direction"] or "").strip(),
+                    "token_id": str(row["token_id"] or "").strip(),
+                    "no_token_id": str(row["no_token_id"] or "").strip(),
                 }
             )
     return monitored
@@ -965,6 +980,88 @@ def _monitor_event_closed_market_pending_settlement(
             "cadence_source": "MONITOR_REFRESHED_CLOSED_MARKET_PENDING_SETTLEMENT",
             "closed_market_validation": closed_market_validation,
             "restart_resolution": "settlement_harvester_or_market_reopen_recovery",
+        }
+    )
+    return True
+
+
+def _current_snapshot_nonexecutable_for_restart(
+    conn: sqlite3.Connection,
+    position: Mapping[str, object],
+    position_evidence: dict[str, Any],
+    *,
+    snapshot_columns: set[str],
+    now_utc: datetime,
+) -> bool:
+    """Prove a fresh exact held-token snapshot currently has no SELL venue.
+
+    This is restart-only no-action evidence, not probability or settlement
+    authority.  It expires with the snapshot, and a later executable snapshot
+    automatically restores ordinary monitor requirements.
+    """
+
+    required = {
+        "condition_id",
+        "selected_outcome_token_id",
+        "snapshot_id",
+        "active",
+        "closed",
+        "accepting_orders",
+        "captured_at",
+        "freshness_deadline",
+    }
+    if not required.issubset(snapshot_columns):
+        return False
+    condition_id = str(position.get("condition_id") or "").strip()
+    direction = str(position.get("direction") or "").strip().lower()
+    held_token = str(
+        (
+            position.get("no_token_id")
+            if direction == "buy_no"
+            else position.get("token_id")
+        )
+        or ""
+    ).strip()
+    if not condition_id or not held_token:
+        return False
+    row = conn.execute(
+        """
+        SELECT active, closed, accepting_orders, captured_at, freshness_deadline
+          FROM executable_market_snapshot_latest
+         WHERE condition_id = ?
+           AND selected_outcome_token_id = ?
+         ORDER BY captured_at DESC, snapshot_id DESC
+         LIMIT 1
+        """,
+        (condition_id, held_token),
+    ).fetchone()
+    if row is None:
+        return False
+    captured_at = _parse_iso_utc(str(row["captured_at"] or ""))
+    freshness_deadline = _parse_iso_utc(str(row["freshness_deadline"] or ""))
+    if (
+        captured_at is None
+        or freshness_deadline is None
+        or captured_at > now_utc
+        or freshness_deadline < now_utc
+    ):
+        return False
+    validation = None
+    if int(row["closed"] or 0) == 1:
+        validation = "snapshot_closed"
+    elif row["accepting_orders"] is not None and int(row["accepting_orders"]) == 0:
+        validation = "snapshot_accepting_orders_false"
+    elif int(row["active"] or 0) == 0:
+        validation = "snapshot_inactive"
+    if validation is None:
+        return False
+    position_evidence.update(
+        {
+            "cadence_source": "MONITOR_REFRESHED_CLOSED_MARKET_PENDING_SETTLEMENT",
+            "closed_market_validation": validation,
+            "snapshot_captured_at": captured_at.isoformat(),
+            "snapshot_freshness_deadline": freshness_deadline.isoformat(),
+            "restart_resolution": "fresh_executable_snapshot_or_monitor_recovery",
         }
     )
     return True
