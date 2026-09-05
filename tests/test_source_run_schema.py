@@ -1,5 +1,5 @@
 # Created: 2026-05-02
-# Last reused/audited: 2026-05-02
+# Last reused/audited: 2026-09-04
 # Authority basis: docs/operations/task_2026-05-02_data_daemon_readiness/PLAN.md PR45b source-run provenance contract.
 
 from __future__ import annotations
@@ -36,6 +36,35 @@ def test_source_run_schema_creates_scope_and_completeness_columns() -> None:
         "completeness_status",
         "partial_run",
     } <= columns
+
+
+def test_source_run_coverage_hwm_uses_run_identity_index() -> None:
+    from src.data.replacement_input_hwm import (
+        ensemble_source_authority_predicate,
+    )
+
+    conn = _conn()
+    conn.execute(
+        "CREATE TABLE ensemble_snapshots ("
+        "snapshot_id INTEGER PRIMARY KEY, source_run_id TEXT, city TEXT, "
+        "target_date TEXT, temperature_metric TEXT)"
+    )
+    predicate = ensemble_source_authority_predicate(
+        conn,
+        ensemble_alias="ensemble_snapshot",
+        decision_time=datetime(2026, 9, 4, tzinfo=timezone.utc),
+    )
+    assert predicate is not None
+    sql, params = predicate
+    plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM ensemble_snapshots "
+            f"AS ensemble_snapshot WHERE {sql}",
+            params,
+        )
+    )
+    assert "sqlite_autoindex_source_run_coverage_2" in plan
 
 
 def test_source_run_repo_round_trips_complete_run() -> None:

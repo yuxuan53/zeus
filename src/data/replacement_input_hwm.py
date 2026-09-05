@@ -317,6 +317,7 @@ def ensemble_source_authority_sql(
     source_run_ref: str,
     source_run_clock_columns: tuple[str, ...],
     coverage_ref: str | None,
+    coverage_identity_index: str | None = None,
     decision_time: datetime,
 ) -> tuple[str, tuple[object, ...]]:
     """Build the shared decision-time ENS source-authority predicate.
@@ -346,12 +347,17 @@ def ensemble_source_authority_sql(
     partial_target = "0"
     partial_params: tuple[object, ...] = ()
     if coverage_ref is not None:
+        coverage_index_clause = ""
+        if coverage_identity_index is not None:
+            if not coverage_identity_index.replace("_", "").isalnum():
+                raise ValueError("source-run coverage index identity is invalid")
+            coverage_index_clause = f" INDEXED BY {coverage_identity_index}"
         partial_target = f"""
                 source_run.status IN ('PARTIAL', 'SUCCESS')
                 AND source_run.completeness_status IN ('PARTIAL', 'COMPLETE')
                 AND EXISTS (
                     SELECT 1
-                      FROM {coverage_ref} AS source_coverage
+                      FROM {coverage_ref} AS source_coverage{coverage_index_clause}
                      WHERE source_coverage.source_run_id = source_run.source_run_id
                        AND source_coverage.source_id = 'ecmwf_open_data'
                        AND source_coverage.release_calendar_key = source_run.release_calendar_key
@@ -425,6 +431,7 @@ def ensemble_source_authority_predicate(
         return None
 
     coverage_ref = _authority_table_ref(conn, "source_run_coverage")
+    coverage_identity_index = None
     if coverage_ref is not None:
         coverage_columns = _hwm_table_ref_columns(conn, coverage_ref)
         required_coverage_columns = {
@@ -448,11 +455,34 @@ def ensemble_source_authority_predicate(
         }
         if not required_coverage_columns.issubset(coverage_columns):
             coverage_ref = None
+        else:
+            schema, table = (
+                coverage_ref.split(".", 1)
+                if "." in coverage_ref
+                else ("main", coverage_ref)
+            )
+            if all(part.replace("_", "").isalnum() for part in (schema, table)):
+                for index_row in conn.execute(
+                    f"PRAGMA {schema}.index_list({table})"
+                ).fetchall():
+                    index_name = str(index_row[1] or "")
+                    if not index_name.replace("_", "").isalnum():
+                        continue
+                    columns = tuple(
+                        str(column[2] or "")
+                        for column in conn.execute(
+                            f"PRAGMA {schema}.index_info({index_name})"
+                        ).fetchall()
+                    )
+                    if columns[:2] == ("source_run_id", "source_id"):
+                        coverage_identity_index = index_name
+                        break
     return ensemble_source_authority_sql(
         ensemble_alias=ensemble_alias,
         source_run_ref=source_run_ref,
         source_run_clock_columns=clock_columns,
         coverage_ref=coverage_ref,
+        coverage_identity_index=coverage_identity_index,
         decision_time=decision_time,
     )
 
