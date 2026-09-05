@@ -1344,6 +1344,9 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
 
     cfg = _replacement_forecast_live_materialization_queue_config()
     if _replacement_forecast_own_clock_seed_pending(cfg):
+        fast_report = _replacement_forecast_station_revision_fast_lane(cfg)
+        if fast_report.get("status") != "NO_SEEDS":
+            return fast_report
         # A named station revision is a newly available causal fact, while an
         # existing request (especially a timeout retry) is older compute debt.
         # Publishing the fact's request first preserves information lead; the
@@ -1387,6 +1390,30 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
         lane="priority",
         seed_limit=3,
     )
+
+
+def _replacement_forecast_station_revision_fast_lane(
+    cfg: dict[str, object],
+) -> dict[str, object]:
+    """Write exact own-clock station requests before generic priority debt.
+
+    SCOPE: newest bounded station-input-revision seed filenames only. DRAIN:
+    the following priority tick claims its durable request. RESET: the seed is
+    moved to a terminal receipt or no matching filename remains. This path does
+    not run global request/inflight or auction ranking.
+    """
+
+    from src.data.replacement_forecast_live_materialization_queue import (
+        process_own_clock_station_revision_fast_path,
+    )
+
+    return process_own_clock_station_revision_fast_path(
+        request_dir=cfg["request_dir"],
+        seed_dir=cfg.get("seed_dir"),
+        seed_processed_dir=cfg.get("seed_processed_dir"),
+        seed_failed_dir=cfg.get("seed_failed_dir"),
+        forecast_db=cfg.get("forecast_db"),
+    ).as_dict()
 
 
 def _replacement_forecast_materialize_lane(

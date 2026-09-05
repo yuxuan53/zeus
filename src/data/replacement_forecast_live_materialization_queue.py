@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -82,6 +83,9 @@ _DAY0_ENQUEUE_OWNERSHIP_CURSOR_NAME = ".replacement-day0-enqueue.cursor"
 _DAY0_ENQUEUE_OWNERSHIP_INSPECTION_MULTIPLIER = 4
 _DAY0_ENQUEUE_OWNERSHIP_MIN_INSPECTIONS = 8
 _MATERIALIZATION_CLAIM_DEADLINE_SECONDS = 10.0
+_OWN_CLOCK_STATION_REVISION_MARKER = ".station-input-revision."
+_OWN_CLOCK_STATION_REVISION_FAST_LIMIT = 3
+_OWN_CLOCK_STATION_REVISION_CANDIDATE_LIMIT = 12
 _CLAIM_READ_DEFERRED_REASON = "REPLACEMENT_LIVE_MATERIALIZATION_CLAIM_DEFERRED_READ_DEADLINE"
 _CLAIM_STALE_RECOVERY_DEFERRED_REASON = (
     "REPLACEMENT_LIVE_MATERIALIZATION_CLAIM_DEFERRED_STALE_RECOVERY"
@@ -1601,6 +1605,55 @@ def _current_money_risk_scopes(
         trade_db=trade_db,
         trade_conn=trade_conn,
     ) & fam_scopes
+
+
+def _current_money_risk_scopes_for_exact_seeds(
+    fam_scopes: frozenset[tuple[str, str, str]],
+    *,
+    trade_conn: sqlite3.Connection | None = None,
+) -> frozenset[tuple[str, str, str]]:
+    """Read only station-seed families; never enumerate global auction scope."""
+
+    if not fam_scopes:
+        return frozenset()
+    try:
+        from src.contracts.position_truth import CURRENT_MONEY_RISK_CHAIN_STATES  # noqa: PLC0415
+        from src.state.db import _zeus_trade_db_path  # noqa: PLC0415
+
+        owns_conn = trade_conn is None
+        conn = trade_conn or _queue_read_only_connection(_zeus_trade_db_path())
+        try:
+            chain_states = tuple(sorted(CURRENT_MONEY_RISK_CHAIN_STATES))
+            scope_values = ", ".join("(?, ?, ?)" for _ in fam_scopes)
+            state_values = ", ".join("?" for _ in chain_states)
+            rows = conn.execute(
+                f"""
+                WITH wanted(city, target_date, metric) AS (VALUES {scope_values})
+                SELECT DISTINCT p.city, p.target_date, LOWER(p.temperature_metric)
+                  FROM position_current AS p
+                  JOIN wanted AS w
+                    ON w.city = p.city
+                   AND w.target_date = p.target_date
+                   AND w.metric = LOWER(p.temperature_metric)
+                 WHERE COALESCE(p.phase, '') IN ('active', 'day0_window', 'pending_exit')
+                   AND COALESCE(p.chain_state, '') IN ({state_values})
+                   AND COALESCE(p.chain_shares, 0) > 0
+                   AND COALESCE(p.chain_cost_basis_usd, 0) > 0
+                """,
+                tuple(value for scope in fam_scopes for value in scope) + chain_states,
+            ).fetchall()
+        finally:
+            if owns_conn:
+                conn.close()
+    except _ClaimReadDeadlineExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 - exact causal work must still drain
+        _LOG.error("station-revision exact held-family read failed: %s", exc)
+        return frozenset()
+    return frozenset(
+        (str(row[0] or ""), str(row[1] or ""), str(row[2] or ""))
+        for row in rows
+    )
 
 
 def _current_money_risk_families(
@@ -4479,6 +4532,131 @@ def _prepare_seed_requests(
             trade_conn.close()
 
 
+def _newest_own_clock_station_revision_seed_files(
+    seed_path: Path,
+    *,
+    limit: int = _OWN_CLOCK_STATION_REVISION_CANDIDATE_LIMIT,
+) -> tuple[Path, ...]:
+    """Select a small newest filename window without parsing the broad seed queue."""
+
+    if not seed_path.exists() or limit <= 0:
+        return ()
+    candidates = (
+        path
+        for path in seed_path.glob("*.station-input-revision.*.json")
+        if path.is_file()
+    )
+    def freshness(path: Path) -> tuple[int, str]:
+        try:
+            return path.stat().st_mtime_ns, path.name
+        except OSError:
+            return 0, path.name
+
+    return tuple(
+        heapq.nlargest(
+            limit,
+            candidates,
+            key=freshness,
+        )
+    )
+
+
+def process_own_clock_station_revision_fast_path(
+    *,
+    request_dir: Path | str,
+    seed_dir: Path | str | None,
+    seed_processed_dir: Path | str | None,
+    seed_failed_dir: Path | str | None,
+    forecast_db: Path | str | None,
+    limit: int = _OWN_CLOCK_STATION_REVISION_FAST_LIMIT,
+) -> ReplacementForecastLiveMaterializationQueueReport:
+    """Transport newest own-clock station revisions without broad queue priority reads.
+
+    SCOPE: at most ``limit`` newest ``.station-input-revision.`` seed files.
+    DRAIN: this function writes each exact family's durable request or terminal
+    receipt; the next priority tick claims that request through the existing
+    request-only path. RESET: no matching seed remains, or its moved terminal
+    receipt/request becomes the durable handoff.  This must not read the global
+    auction scope or traverse ordinary request/inflight debt: station evidence
+    is newly available causal truth, not generic compute backlog.
+    """
+
+    request_path = Path(request_dir)
+    if seed_dir is None:
+        return ReplacementForecastLiveMaterializationQueueReport(
+            status="NO_SEEDS",
+            request_dir=str(request_path),
+            processed_dir=str(request_path),
+            failed_dir=str(request_path),
+            processed_count=0,
+            failed_count=0,
+            skipped_count=0,
+            reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_QUEUE_ABSENT",),
+        )
+    seed_path = Path(seed_dir)
+    candidates = _newest_own_clock_station_revision_seed_files(seed_path)
+    if not candidates:
+        return ReplacementForecastLiveMaterializationQueueReport(
+            status="NO_SEEDS",
+            request_dir=str(request_path),
+            processed_dir=str(request_path),
+            failed_dir=str(request_path),
+            processed_count=0,
+            failed_count=0,
+            skipped_count=0,
+            reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_QUEUE_EMPTY",),
+        )
+    if seed_processed_dir is None or seed_failed_dir is None:
+        raise ValueError("station revision fast path requires seed terminal directories")
+
+    forecast_conn: sqlite3.Connection | None = None
+    try:
+        if forecast_db is not None and Path(forecast_db).exists():
+            forecast_conn = _queue_read_only_connection(Path(forecast_db))
+        processed, failed, reasons = _prepare_seed_requests_with_connection(
+            seed_dir=seed_path,
+            seed_processed_dir=seed_processed_dir,
+            seed_failed_dir=seed_failed_dir,
+            request_dir=request_path,
+            forecast_db=forecast_db,
+            forecast_conn=forecast_conn,
+            trade_conn=None,
+            limit=min(max(int(limit), 1), len(candidates)),
+            lane=MATERIALIZATION_LANE_PRIORITY,
+            seed_files=candidates,
+            fast_own_clock_station_revision=True,
+        )
+    except _ClaimReadDeadlineExceeded:
+        return ReplacementForecastLiveMaterializationQueueReport(
+            status="DEFERRED",
+            request_dir=str(request_path),
+            processed_dir=str(request_path),
+            failed_dir=str(request_path),
+            processed_count=0,
+            failed_count=0,
+            skipped_count=0,
+            reason_codes=(_CLAIM_READ_DEFERRED_REASON,),
+        )
+    finally:
+        if forecast_conn is not None:
+            forecast_conn.close()
+
+    return ReplacementForecastLiveMaterializationQueueReport(
+        status="PROCESSED" if processed or failed else "DEFERRED",
+        request_dir=str(request_path),
+        processed_dir=str(request_path),
+        failed_dir=str(request_path),
+        processed_count=0,
+        failed_count=0,
+        skipped_count=0,
+        seed_processed_count=len(processed),
+        seed_failed_count=len(failed),
+        seed_processed_files=tuple(processed),
+        seed_failed_files=tuple(failed),
+        reason_codes=tuple(dict.fromkeys(reasons)),
+    )
+
+
 def _prepare_seed_requests_with_connection(
     *,
     seed_dir: Path | str | None,
@@ -4490,13 +4668,24 @@ def _prepare_seed_requests_with_connection(
     limit: int,
     lane: str = MATERIALIZATION_LANE_ALL,
     trade_conn: sqlite3.Connection | None = None,
+    seed_files: Sequence[Path] | None = None,
+    fast_own_clock_station_revision: bool = False,
 ) -> tuple[list[str], list[str], list[str]]:
     if seed_dir is None:
         return [], [], []
     seed_path = Path(seed_dir)
     if not seed_path.exists():
         return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_ABSENT"]
-    seed_files = tuple(path for path in seed_path.glob("*.json") if path.is_file())
+    if seed_files is None:
+        seed_files = tuple(path for path in seed_path.glob("*.json") if path.is_file())
+    else:
+        seed_files = tuple(
+            path
+            for path in seed_files
+            if path.parent == seed_path
+            and path.is_file()
+            and _OWN_CLOCK_STATION_REVISION_MARKER in path.name
+        )
     if not seed_files:
         return [], [], ["REPLACEMENT_LIVE_MATERIALIZATION_SEED_QUEUE_EMPTY"]
     if seed_processed_dir is None or seed_failed_dir is None:
@@ -4508,48 +4697,94 @@ def _prepare_seed_requests_with_connection(
     reasons: list[str] = []
     cursor_path = _day0_enqueue_ownership_cursor_path(request_dir, lane=lane)
     raw_snapshot = tuple(sorted(seed_files, key=lambda path: path.name))
-    rotated_raw_snapshot = _rotate_seed_snapshot_after_cursor(
-        raw_snapshot,
-        _read_day0_enqueue_ownership_cursor(cursor_path),
-    )
-    try:
-        current_money_risk = _current_money_risk_families(trade_conn=trade_conn)
-    except TypeError as exc:
-        if "trade_conn" not in str(exc):
-            raise
-        current_money_risk = _current_money_risk_families()
+    if fast_own_clock_station_revision:
+        # This is deliberately the only payload parse before the exact family
+        # reads below.  Do not use the generic queue priority map here: it reads
+        # every request/inflight file and global auction state.
+        seed_payloads = {
+            path: _load_request_payload_for_coalescing(path)
+            for path in raw_snapshot
+        }
+        scopes = frozenset(
+            scope
+            for scope in (
+                _request_family_scope(seed_payloads.get(path))
+                for path in raw_snapshot
+            )
+            if scope is not None
+        )
+        current_money_risk = _current_money_risk_scopes_for_exact_seeds(
+            scopes,
+            trade_conn=trade_conn,
+        )
+        rotated_raw_snapshot = tuple(
+            sorted(
+                raw_snapshot,
+                key=lambda path: (
+                    _request_family_scope(seed_payloads.get(path))
+                    not in current_money_risk,
+                    -int(_request_freshness_key(
+                        path, seed_payloads[path],
+                    )[0].timestamp() * 1_000_000)
+                    if seed_payloads.get(path) is not None
+                    else 0,
+                    -_request_freshness_key(path, seed_payloads[path])[1]
+                    if seed_payloads.get(path) is not None
+                    else 0,
+                    path.name,
+                ),
+                reverse=False,
+            )
+        )
+    else:
+        rotated_raw_snapshot = _rotate_seed_snapshot_after_cursor(
+            raw_snapshot,
+            _read_day0_enqueue_ownership_cursor(cursor_path),
+        )
+        try:
+            current_money_risk = _current_money_risk_families(trade_conn=trade_conn)
+        except TypeError as exc:
+            if "trade_conn" not in str(exc):
+                raise
+            current_money_risk = _current_money_risk_families()
     current_probability_debt = (
         _current_probability_debt_families(
             held=current_money_risk,
             trade_conn=trade_conn,
         )
-        if lane == MATERIALIZATION_LANE_PRIORITY
+        if lane == MATERIALIZATION_LANE_PRIORITY and not fast_own_clock_station_revision
         else frozenset()
     )
-    try:
-        current_global_scope = _current_global_auction_scope_families(
-            rotated_raw_snapshot,
-            trade_conn=trade_conn,
-        )
-    except TypeError as exc:
-        if "trade_conn" not in str(exc):
-            raise
-        current_global_scope = _current_global_auction_scope_families(
-            rotated_raw_snapshot
-        )
-    try:
-        never_priced_scope = _never_priced_enqueued_seed_families(
-            forecast_db,
-            forecast_conn=forecast_conn,
-        )
-    except TypeError as exc:
-        if "forecast_conn" not in str(exc):
-            raise
-        never_priced_scope = _never_priced_enqueued_seed_families(forecast_db)
+    if fast_own_clock_station_revision:
+        current_global_scope = frozenset()
+        never_priced_scope = frozenset()
+    else:
+        try:
+            current_global_scope = _current_global_auction_scope_families(
+                rotated_raw_snapshot,
+                trade_conn=trade_conn,
+            )
+        except TypeError as exc:
+            if "trade_conn" not in str(exc):
+                raise
+            current_global_scope = _current_global_auction_scope_families(
+                rotated_raw_snapshot
+            )
+        try:
+            never_priced_scope = _never_priced_enqueued_seed_families(
+                forecast_db,
+                forecast_conn=forecast_conn,
+            )
+        except TypeError as exc:
+            if "forecast_conn" not in str(exc):
+                raise
+            never_priced_scope = _never_priced_enqueued_seed_families(forecast_db)
     current_priority_scope = (
         current_money_risk | current_global_scope | never_priced_scope
     )
-    if lane == MATERIALIZATION_LANE_BACKGROUND:
+    if fast_own_clock_station_revision:
+        prioritized_raw_snapshot = rotated_raw_snapshot
+    elif lane == MATERIALIZATION_LANE_BACKGROUND:
         prioritized_raw_snapshot = _deprioritize_current_money_risk_seed_files(
             rotated_raw_snapshot,
             current_priority_scope,
@@ -4577,7 +4812,7 @@ def _prepare_seed_requests_with_connection(
             rotated_raw_snapshot,
             current_priority_scope,
         )
-    if lane == MATERIALIZATION_LANE_PRIORITY:
+    if lane == MATERIALIZATION_LANE_PRIORITY and not fast_own_clock_station_revision:
         prioritized_raw_snapshot = _deprioritize_recently_waiting_ensemble_seeds(
             prioritized_raw_snapshot,
         )
@@ -4589,11 +4824,15 @@ def _prepare_seed_requests_with_connection(
         actionable_limit * _DAY0_ENQUEUE_OWNERSHIP_INSPECTION_MULTIPLIER,
         _DAY0_ENQUEUE_OWNERSHIP_MIN_INSPECTIONS,
     )
-    raw_window = _bounded_seed_inspection_window(
-        prioritized_raw_snapshot,
-        current_priority_scope=current_priority_scope,
-        inspection_cap=inspection_cap,
-        lane=lane,
+    raw_window = (
+        prioritized_raw_snapshot[:inspection_cap]
+        if fast_own_clock_station_revision
+        else _bounded_seed_inspection_window(
+            prioritized_raw_snapshot,
+            current_priority_scope=current_priority_scope,
+            inspection_cap=inspection_cap,
+            lane=lane,
+        )
     )
     (
         coalesced_window,
@@ -4611,15 +4850,18 @@ def _prepare_seed_requests_with_connection(
         reasons.append(
             "REPLACEMENT_LIVE_MATERIALIZATION_SEED_SUPERSEDED_BY_NEWER_DUPLICATE"
         )
-    priority, priority_names = _priority_map_with_names(
-        forecast_db,
-        coalesced_window,
-        seed_payloads,
-        current_money_risk=current_money_risk,
-        current_global_scope=current_global_scope,
-        forecast_conn=forecast_conn,
-        trade_conn=trade_conn,
-    )
+    if fast_own_clock_station_revision:
+        priority, priority_names = {}, {path.name for path in coalesced_window}
+    else:
+        priority, priority_names = _priority_map_with_names(
+            forecast_db,
+            coalesced_window,
+            seed_payloads,
+            current_money_risk=current_money_risk,
+            current_global_scope=current_global_scope,
+            forecast_conn=forecast_conn,
+            trade_conn=trade_conn,
+        )
     # Background excludes this scope above, so every first-price seed must
     # acquire priority ownership before the lane filter.
     priority_names.update(
@@ -4627,21 +4869,26 @@ def _prepare_seed_requests_with_connection(
         for path in coalesced_window
         if _request_family_scope(seed_payloads.get(path)) in never_priced_scope
     )
-    seeds = tuple(
-        sorted(
-            (
-                path
-                for path in coalesced_window
-                if _lane_matches(
-                    path=path,
-                    priority_names=priority_names,
-                    lane=lane,
-                )
-            ),
-            key=lambda path: _cycle_advance_file_sort_key(path, priority),
+    if fast_own_clock_station_revision:
+        # ``coalesced_window`` preserves the exact held-first/newest ordering
+        # above; generic filename sorting would erase that family-scoped proof.
+        seeds = tuple(coalesced_window)
+    else:
+        seeds = tuple(
+            sorted(
+                (
+                    path
+                    for path in coalesced_window
+                    if _lane_matches(
+                        path=path,
+                        priority_names=priority_names,
+                        lane=lane,
+                    )
+                ),
+                key=lambda path: _cycle_advance_file_sort_key(path, priority),
+            )
         )
-    )
-    if lane == MATERIALIZATION_LANE_PRIORITY:
+    if lane == MATERIALIZATION_LANE_PRIORITY and not fast_own_clock_station_revision:
         seeds = _interleave_current_priority_seed_files(
             seeds,
             seed_payloads,
@@ -4916,8 +5163,12 @@ def _prepare_seed_requests_with_connection(
             )
             failed.append(str(moved))
             actionable_count += 1
-    if raw_window and not _write_day0_enqueue_ownership_cursor(
+    if (
+        not fast_own_clock_station_revision
+        and raw_window
+        and not _write_day0_enqueue_ownership_cursor(
         cursor_path, raw_window[-1].name
+        )
     ):
         reasons.append("REPLACEMENT_MATERIALIZATION_DAY0_ENQUEUE_CURSOR_WRITE_FAILED")
     if indeterminate_count:

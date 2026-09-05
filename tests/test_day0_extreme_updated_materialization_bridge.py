@@ -1,6 +1,6 @@
 # Created: 2026-07-19
-# Last reused/audited: 2026-09-02
-# Lifecycle: created=2026-07-19; last_reviewed=2026-09-02; last_reused=2026-09-02
+# Last reused/audited: 2026-09-04
+# Lifecycle: created=2026-07-19; last_reviewed=2026-09-04; last_reused=2026-09-04
 # Purpose: Prove Day0 reseed ownership and single-writer materialization ordering.
 # Reuse: Run after changing Day0 enqueue, replacement queue claims, or writer concurrency.
 # Authority basis: operator directive 2026-07-19 (Day0 is a zero-sum race against the market
@@ -2981,21 +2981,226 @@ def test_priority_job_bridges_own_clock_seed_before_existing_request(
         "_replacement_forecast_live_materialization_queue_config",
         lambda: cfg,
     )
-    calls: list[int] = []
-
-    def run_lane(_cfg, *, lane, seed_limit):
-        calls.append(seed_limit)
-        assert lane == "priority"
-        return {"status": "PROCESSED", "seed_limit": seed_limit}
-
     monkeypatch.setattr(
-        forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
+        forecast_live_daemon,
+        "_replacement_forecast_station_revision_fast_lane",
+        lambda _cfg: {"status": "PROCESSED", "seed_processed_count": 1},
     )
 
     receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
 
-    assert calls == [3]
-    assert receipt == {"status": "PROCESSED", "seed_limit": 3}
+    assert receipt == {"status": "PROCESSED", "seed_processed_count": 1}
+
+
+def test_station_revision_fast_path_avoids_broad_queue_priority_reads(
+    monkeypatch, tmp_path
+) -> None:
+    """One HKO revision writes its request despite 10k unrelated seed debt."""
+
+    seed_dir = tmp_path / "seeds"
+    request_dir = tmp_path / "requests"
+    seed_dir.mkdir()
+    request_dir.mkdir()
+    for index in range(10_000):
+        (seed_dir / f"ordinary-{index:05d}.json").write_text("{}", encoding="utf-8")
+    station_seed = (
+        seed_dir
+        / "Hong_Kong.2026-09-05.high.20260905T043825Z.station-input-revision.enqueue.json"
+    )
+    station_seed.write_text(
+        json.dumps(
+            {
+                "city": "Hong Kong",
+                "target_date": "2026-09-05",
+                "temperature_metric": "high",
+                "computed_at": "2026-09-05T04:38:25+00:00",
+                "source_cycle_time": "2026-09-05T00:00:00+00:00",
+                "baseline_source_run_id": "baseline:0",
+                "openmeteo_source_run_id": "openmeteo:0",
+                "openmeteo_payload_json": "payload.json",
+                "precision_metadata_json": "precision.json",
+                "bins": [{"bin_id": "31C"}],
+                "upgrade_trigger": "day0_observation_advanced",
+                "day0_observed_extreme_source": "hko_hourly_accumulator",
+                "day0_observed_extreme_observation_time": "2026-09-05T04:30:00+00:00",
+                "day0_observed_extreme_c": 31.0,
+                "day0_observed_extreme_unit": "C",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "validate_materialization_seed",
+        lambda _seed: None,
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_seed_source_cycle_boundary",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_seed_already_covered",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_current_money_risk_scopes_for_exact_seeds",
+        lambda *_args, **_kwargs: frozenset(),
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "build_replacement_forecast_materialization_request",
+        lambda seed, **_kwargs: SimpleNamespace(
+            ok=True,
+            status="READY",
+            reason_codes=("REPLACEMENT_MATERIALIZATION_REQUEST_READY",),
+            request={
+                "city": seed["city"],
+                "target_date": seed["target_date"],
+                "temperature_metric": seed["temperature_metric"],
+                "source_cycle_time": seed["source_cycle_time"],
+            },
+        ),
+    )
+    for name in (
+        "_current_money_risk_families",
+        "_current_global_auction_scope_families",
+        "_never_priced_enqueued_seed_families",
+    ):
+        monkeypatch.setattr(
+            materialization_queue,
+            name,
+            lambda *_args, _name=name, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"fast path read {_name}")
+            ),
+        )
+
+    started = time.monotonic()
+    report = materialization_queue.process_own_clock_station_revision_fast_path(
+        request_dir=request_dir,
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=tmp_path / "seed_failed",
+        forecast_db=None,
+    )
+
+    assert time.monotonic() - started < 2.0
+    assert report.status == "PROCESSED"
+    assert report.seed_processed_count == 1
+    assert (request_dir / station_seed.name).is_file()
+    assert station_seed.name not in {path.name for path in seed_dir.glob("*.json")}
+    next_tick = materialization_queue.process_own_clock_station_revision_fast_path(
+        request_dir=request_dir,
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=tmp_path / "seed_failed",
+        forecast_db=None,
+    )
+    assert next_tick.status == "NO_SEEDS"
+
+
+def test_station_revision_fast_path_prefers_exact_chain_confirmed_held_family(
+    monkeypatch, tmp_path
+) -> None:
+    """An older held HKO revision is transported before a newer unheld sibling."""
+
+    seed_dir = tmp_path / "seeds"
+    request_dir = tmp_path / "requests"
+    seed_dir.mkdir()
+    request_dir.mkdir()
+
+    def seed(path: Path, *, city: str, observed_at: str) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "city": city,
+                    "target_date": "2026-09-05",
+                    "temperature_metric": "high",
+                    "computed_at": observed_at,
+                    "source_cycle_time": "2026-09-05T00:00:00+00:00",
+                    "baseline_source_run_id": "baseline:0",
+                    "openmeteo_source_run_id": "openmeteo:0",
+                    "openmeteo_payload_json": "payload.json",
+                    "precision_metadata_json": "precision.json",
+                    "bins": [{"bin_id": "31C"}],
+                    "upgrade_trigger": "day0_observation_advanced",
+                    "day0_observed_extreme_source": "hko_hourly_accumulator",
+                    "day0_observed_extreme_observation_time": observed_at,
+                    "day0_observed_extreme_c": 31.0,
+                    "day0_observed_extreme_unit": "C",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    held = seed_dir / "Taipei.held.station-input-revision.enqueue.json"
+    unheld = seed_dir / "Hong_Kong.new.station-input-revision.enqueue.json"
+    seed(held, city="Taipei", observed_at="2026-09-05T04:20:00+00:00")
+    seed(unheld, city="Hong Kong", observed_at="2026-09-05T04:30:00+00:00")
+    trade_conn = sqlite3.connect(":memory:")
+    trade_conn.execute(
+        """
+        CREATE TABLE position_current (
+            city TEXT, target_date TEXT, temperature_metric TEXT, phase TEXT,
+            chain_state TEXT, chain_shares REAL, chain_cost_basis_usd REAL
+        )
+        """
+    )
+    from src.contracts.position_truth import CURRENT_MONEY_RISK_CHAIN_STATES
+
+    trade_conn.execute(
+        "INSERT INTO position_current VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "Taipei",
+            "2026-09-05",
+            "high",
+            "day0_window",
+            next(iter(CURRENT_MONEY_RISK_CHAIN_STATES)),
+            1.0,
+            1.0,
+        ),
+    )
+    monkeypatch.setattr(materialization_queue, "validate_materialization_seed", lambda _seed: None)
+    monkeypatch.setattr(materialization_queue, "_seed_source_cycle_boundary", lambda **_kwargs: None)
+    monkeypatch.setattr(materialization_queue, "_seed_already_covered", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        materialization_queue,
+        "build_replacement_forecast_materialization_request",
+        lambda raw, **_kwargs: SimpleNamespace(
+            ok=True,
+            status="READY",
+            reason_codes=("READY",),
+            request={
+                "city": raw["city"],
+                "target_date": raw["target_date"],
+                "temperature_metric": raw["temperature_metric"],
+                "source_cycle_time": raw["source_cycle_time"],
+            },
+        ),
+    )
+    try:
+        processed, failed, _reasons = materialization_queue._prepare_seed_requests_with_connection(
+            seed_dir=seed_dir,
+            seed_processed_dir=tmp_path / "seed_processed",
+            seed_failed_dir=tmp_path / "seed_failed",
+            request_dir=request_dir,
+            forecast_db=None,
+            forecast_conn=None,
+            trade_conn=trade_conn,
+            limit=1,
+            lane=materialization_queue.MATERIALIZATION_LANE_PRIORITY,
+            seed_files=(held, unheld),
+            fast_own_clock_station_revision=True,
+        )
+    finally:
+        trade_conn.close()
+
+    assert len(processed) == 1
+    assert not failed
+    assert (request_dir / held.name).is_file()
+    assert unheld.is_file()
 
 
 def test_priority_job_bridges_seeds_after_request_lane_is_empty(
