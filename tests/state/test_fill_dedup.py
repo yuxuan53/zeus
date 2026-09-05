@@ -97,6 +97,136 @@ def _append(
     conn.commit()
 
 
+def _seed_exit_command(
+    conn: sqlite3.Connection,
+    *,
+    command_id: str,
+    position_id: str,
+    venue_order_id: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO venue_commands (
+            command_id, snapshot_id, envelope_id, position_id, decision_id,
+            idempotency_key, intent_kind, market_id, token_id, side, size,
+            price, venue_order_id, state, created_at, updated_at
+        ) VALUES (?, 'snap', 'env', ?, 'dec', ?, 'EXIT', 'mkt', 'tok',
+                  'SELL', 48.22, 0.18, ?, 'EXPIRED', ?, ?)
+        """,
+        (
+            command_id,
+            position_id,
+            f"idem-{command_id}",
+            venue_order_id,
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+
+
+def test_terminal_hkg_exit_scope_keeps_unrelated_history_out_of_deadline(
+    conn,
+):
+    """A bounded terminal EXIT lookup must survive a tight VM-opcode budget."""
+
+    from src.state.fill_dedup import economic_exit_fills_for_position
+
+    target_position = "32d6009c-007"
+    target_command = "b3ac5741cdd54511"
+    target_order = "ord-hkg-terminal"
+    _seed_exit_command(
+        conn,
+        command_id=target_command,
+        position_id=target_position,
+        venue_order_id=target_order,
+    )
+
+    # Populate enough unrelated history that an unscoped canonical window would
+    # hit this deadline, while the target command remains only two revisions.
+    for index in range(512):
+        command_id = f"unrelated-command-{index}"
+        order_id = f"unrelated-order-{index}"
+        _seed_exit_command(
+            conn,
+            command_id=command_id,
+            position_id="unrelated-position",
+            venue_order_id=order_id,
+        )
+        _append(
+            conn,
+            trade_id=f"unrelated-trade-{index}",
+            command_id=command_id,
+            filled_size="1",
+            fill_price="0.20",
+            tx_hash=f"0x-unrelated-{index}",
+            fee_paid_micro=1,
+            venue_order_id=order_id,
+        )
+    for state in ("MATCHED", "CONFIRMED"):
+        append_trade_fact(
+            conn,
+            trade_id="hkg-trade",
+            venue_order_id=target_order,
+            command_id=target_command,
+            state=state,
+            filled_size="5",
+            fill_price="0.18",
+            source="REST",
+            observed_at=NOW,
+            raw_payload_hash=hashlib.sha256(state.encode()).hexdigest(),
+            tx_hash="0xhkg-terminal",
+        )
+    conn.commit()
+
+    class _RecordingConnection:
+        def __init__(self, delegate: sqlite3.Connection) -> None:
+            self.delegate = delegate
+            self.lookup_sql = ""
+            self.lookup_params: tuple[object, ...] = ()
+
+        def execute(self, sql: str, params=()):
+            if "canonical_trade_fact AS" in sql:
+                self.lookup_sql = sql
+                self.lookup_params = tuple(params)
+            return self.delegate.execute(sql, params)
+
+    traced = _RecordingConnection(conn)
+    progress_calls = 0
+
+    def _deadline_progress() -> int:
+        nonlocal progress_calls
+        progress_calls += 1
+        return int(progress_calls > 20)
+
+    conn.set_progress_handler(_deadline_progress, 100)
+    try:
+        fills = economic_exit_fills_for_position(
+            traced,
+            target_position,
+            venue_order_id=target_order,
+        )
+    finally:
+        conn.set_progress_handler(None, 0)
+
+    assert [(fill.command_id, fill.trade_id, fill.quantity, fill.unit_price) for fill in fills] == [
+        (target_command, "hkg-trade", Decimal("5"), Decimal("0.18"))
+    ]
+    assert progress_calls <= 20
+
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN " + traced.lookup_sql,
+        traced.lookup_params,
+    ).fetchall()
+    details = [str(row[3]) for row in plan]
+    assert details.count(
+        "SEARCH fact USING INDEX idx_trade_facts_command (command_id=?)"
+    ) >= 2
+    assert not any(
+        detail.startswith("SCAN fact USING INDEX idx_trade_facts_command")
+        for detail in details
+    )
+
+
 class TestAggregateChildExactlyOnce:
     """One real fill observed as a tx-hash aggregate AND an exact child row."""
 

@@ -448,14 +448,39 @@ def economic_exit_fills_for_position(
     if not position_id:
         return []
     order_clause = ""
-    params: list[object] = [position_id]
+    scope_params: list[object] = [position_id]
     if venue_order_id:
         order_clause = "AND cmd.venue_order_id = ?"
-        params.append(venue_order_id)
+        scope_params.append(venue_order_id)
     try:
+        # Resolve the narrow command identity before ranking trade-fact revisions.
+        # The canonical window must never rank unrelated history: the alias
+        # exclusion CTE evaluates the canonical CTE more than once, so an outer
+        # position/order predicate would still repeat a full venue_trade_facts
+        # scan for every lookup.
+        command_rows = conn.execute(
+            f"""
+            SELECT command_id
+              FROM venue_commands cmd
+             WHERE cmd.position_id = ?
+               AND UPPER(COALESCE(cmd.intent_kind, '')) = 'EXIT'
+               AND COALESCE(cmd.venue_order_id, '') <> ''
+               {order_clause}
+            ORDER BY cmd.command_id
+            """,
+            tuple(scope_params),
+        ).fetchall()
+        command_ids = [str(row[0] or "") for row in command_rows if str(row[0] or "")]
+        if not command_ids:
+            return []
+        command_placeholders = ", ".join("?" for _ in command_ids)
+        source_clause_sql = f"WHERE fact.command_id IN ({command_placeholders})"
+        params: list[object] = [*command_ids, position_id]
+        if venue_order_id:
+            params.append(venue_order_id)
         rows = conn.execute(
             f"""
-            WITH {canonical_trade_fact_cte()},
+            WITH {canonical_trade_fact_cte(source_clause_sql=source_clause_sql)},
                  {economic_trade_fact_cte()}
             SELECT fact.command_id, fact.trade_id, fact.venue_order_id,
                    fact.filled_size, fact.fill_price, fact.raw_payload_json,
