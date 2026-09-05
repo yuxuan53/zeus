@@ -8513,6 +8513,37 @@ def test_monitor_cadence_restart_evidence_records_recovery_obligation_when_main_
     assert result.evidence["position_current_updated_at_is_not_monitor_cadence"] is True
 
 
+def test_monitor_cadence_restart_uses_three_cycle_inclusive_age_contract(
+    monkeypatch, tmp_path
+):
+    """Preflight and deploy handoff must share the 360s fresh upper bound."""
+    trade_db = tmp_path / "zeus_trades.db"
+    conn = sqlite3.connect(trade_db)
+    conn.execute("CREATE TABLE position_current (position_id TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(preflight, "TRADE_DB", trade_db)
+    observed: dict[str, object] = {}
+
+    def _collect(_conn, **kwargs):
+        observed.update(kwargs)
+        return {
+            "open_position_count": 0,
+            "fresh_position_count": 0,
+            "stale_or_missing_position_count": 0,
+            "future_monitor_event_count": 0,
+            "non_monitor_chain_risk_position_count": 0,
+        }
+
+    monkeypatch.setattr(preflight, "collect_monitor_cadence_evidence", _collect)
+
+    result = preflight._monitor_cadence_restart_evidence_check([])
+
+    assert result.ok is True
+    assert observed["max_age_seconds"] == 360.0
+    assert preflight.MONITOR_CADENCE_RESTART_MAX_AGE_SECONDS == 360.0
+
+
 def test_monitor_cadence_restart_evidence_blocks_running_stale_main(
     monkeypatch, tmp_path
 ):
