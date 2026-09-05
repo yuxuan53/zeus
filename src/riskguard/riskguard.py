@@ -50,7 +50,7 @@ from src.contracts.global_auction_receipt import (
 from src.data.replacement_forecast_cycle_policy import (
     CURRENT_EVIDENCE_SEMANTICS_REVISION,
     LIVE_CURRENT_EVIDENCE_SEMANTICS_REVISIONS,
-    STALE_ENSEMBLE_ABSOLUTE_DISAGREEMENT_SEMANTICS_REVISION,
+    STALE_ENSEMBLE_ABSOLUTE_DISAGREEMENT_SEMANTICS_REVISION,  # noqa: F401 - compatibility export
     _current_evidence_shape,
     current_evidence_shape_semantics_mismatch,
 )
@@ -85,15 +85,22 @@ from src.state.portfolio import (
     PortfolioState,
     Position,
     has_verified_trade_fill,
-    load_portfolio,
+    load_portfolio,  # noqa: F401 - compatibility patch seam used by direct tests
+)
+from src.state.portfolio_loader_policy import choose_portfolio_truth_source
+from src.state.strategy_tracker import load_tracker
+from src.contracts.freshness_registry import FreshnessLevel, registry as _freshness_registry
+from src.state.write_coordinator import (
+    DBIdentity,
+    WriteLeaseTimeout,
+    WritePriority,
+    bounded_sqlite_write,
+    default_runtime_write_coordinator,
 )
 
 RISKGUARD_SETTLEMENT_LIMIT = 50
 RISKGUARD_BRIER_SCAN_LIMIT = 200
 RISKGUARD_REALIZED_TELEMETRY_WINDOW = timedelta(days=7)
-from src.state.portfolio_loader_policy import choose_portfolio_truth_source
-from src.state.strategy_tracker import load_tracker
-from src.contracts.freshness_registry import FreshnessLevel, registry as _freshness_registry
 
 logger = logging.getLogger(__name__)
 # Stuck non-GREEN visibility (2026-08-24 reversal plan item 5b): the
@@ -149,6 +156,15 @@ _POWER_RUNWAY_RED_MINUTES_DEFAULT = 15.0
 _POWER_PERCENT_YELLOW_DEFAULT = 20
 _POWER_PERCENT_ORANGE_DEFAULT = 10
 _POWER_PERCENT_RED_DEFAULT = 5
+
+# RiskGuard's strategy-gate and health rows are auxiliary bookkeeping. They
+# must yield to money-path writers, but they still need one bounded transaction
+# so a partial refresh cannot be observed as a successful tick. SCOPE: only
+# this tick's risk_actions / strategy_health refresh. DRAIN: the next 60-second
+# tick retries after the coordinator's bounded lease/SQLite contention window.
+# RESET: a successful BEGIN -> DML -> COMMIT clears the skipped status.
+RISKGUARD_TRADE_WRITE_LEASE_DEADLINE_MS = 250
+RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS = 500
 
 
 def _pmset_battery_status() -> str:
@@ -5094,6 +5110,43 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+class _RiskGuardAuxiliaryWriteCapture:
+    """Read through a connection while capturing only auxiliary DML.
+
+    ``refresh_strategy_health`` owns a substantial read/compute pass in
+    ``src.state.db``. Running it while a TRADE writer lease is held would turn
+    that lease into a long scan. This narrow proxy keeps all reads on the
+    already-open tick connection and records the two allowed table mutations
+    for replay inside the bounded transaction below.
+    """
+
+    _DML_PREFIXES = ("DELETE", "INSERT", "REPLACE", "UPDATE")
+    _ALLOWED_TABLES = ("RISK_ACTIONS", "STRATEGY_HEALTH")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.writes: list[tuple[str, object]] = []
+
+    @property
+    def in_transaction(self) -> bool:
+        return bool(self._conn.in_transaction)
+
+    def execute(self, sql: str, parameters=()):
+        normalized = str(sql).strip().upper()
+        if normalized.startswith(self._DML_PREFIXES):
+            if not any(table in normalized for table in self._ALLOWED_TABLES):
+                raise RuntimeError(
+                    "RiskGuard auxiliary refresh attempted DML outside "
+                    "risk_actions / strategy_health"
+                )
+            self.writes.append((sql, parameters))
+            return None
+        return self._conn.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
 def _sync_riskguard_strategy_gate_actions(
     conn: sqlite3.Connection,
     recommended_strategy_gate_reasons: dict[str, list[str]],
@@ -5347,41 +5400,70 @@ def _refresh_riskguard_auxiliary_bookkeeping(
     that the bookkeeping was skipped this cycle (the LEVEL is unaffected).
     """
     try:
+        # Run the potentially long read/compute work without a writer lease.
+        # The proxy captures only the two permitted table mutations; it never
+        # mutates the canonical connection during this preflight pass.
+        capture = _RiskGuardAuxiliaryWriteCapture(zeus_conn)
         durable_action_status = _sync_riskguard_strategy_gate_actions(
-            zeus_conn,
+            capture,
             recommended_strategy_gate_reasons,
             probability_semantics_scopes=recommended_strategy_gate_scopes,
             issued_at=now,
         )
         strategy_health_refresh = refresh_strategy_health(
-            zeus_conn,
+            capture,
             as_of=now,
             position_view=position_view,
         )
+
+        # The unified lease covers only one short auxiliary write transaction;
+        # there is no legacy db_writer_lock layered on top of it.
+        with default_runtime_write_coordinator().lease(
+            (DBIdentity.TRADE,),
+            owner="riskguard_tick_persist",
+            write_class="live",
+            priority=WritePriority.BACKGROUND_RECOVERY,
+            deadline_ms=RISKGUARD_TRADE_WRITE_LEASE_DEADLINE_MS,
+            max_hold_ms=RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
+        ) as lease:
+            with bounded_sqlite_write(
+                zeus_conn,
+                lease,
+                max_hold_ms=RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
+            ):
+                zeus_conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for sql, parameters in capture.writes:
+                        zeus_conn.execute(sql, parameters)
+                    zeus_conn.commit()
+                except BaseException:
+                    if zeus_conn.in_transaction:
+                        zeus_conn.rollback()
+                    raise
+        # Read-after-write confirmation is intentionally outside the writer lease.
         strategy_health_snapshot = query_strategy_health_snapshot(
             zeus_conn,
             now=now,
         )
         return durable_action_status, strategy_health_refresh, strategy_health_snapshot
-    except sqlite3.OperationalError as exc:
-        if not _is_sqlite_database_locked(exc):
+    except (WriteLeaseTimeout, sqlite3.OperationalError) as exc:
+        if isinstance(exc, sqlite3.OperationalError) and not _is_sqlite_database_locked(exc):
             # A genuine bookkeeping fault (e.g. schema corruption) must NOT be
-            # masked as a lock — propagate so the top-level handler surfaces it.
+            # masked as contention — propagate so the top-level handler surfaces it.
             raise
-        # The bookkeeping write lost the WAL write lock to a concurrent writer.
-        # Roll back the (locked/partial) zeus_conn write txn so it cannot poison
-        # the tick's final zeus_conn.commit(); the risk LEVEL is computed from the
-        # reads we ALREADY have, so we still write a fresh full risk_state row.
+        # A coordinator or SQLite writer contention means the auxiliary refresh
+        # could not complete. The risk LEVEL is computed from the metric reads
+        # already gathered by _tick_once, so preserve that fail-closed level and
+        # retry the bookkeeping on the next bounded tick.
         try:
-            zeus_conn.rollback()
-        except Exception:  # noqa: BLE001 — best-effort; rollback of a stub/locked conn
+            if zeus_conn.in_transaction:
+                zeus_conn.rollback()
+        except Exception:  # noqa: BLE001 — best-effort rollback after contention
             pass
         logger.warning(
-            "RiskGuard auxiliary bookkeeping (risk_actions / strategy_health) lost the "
-            "zeus_trades write lock to a concurrent writer (database is locked); SKIPPING "
-            "the bookkeeping refresh this cycle and proceeding with the level computed from "
-            "the metric reads. The risk LEVEL is NOT degraded by a bookkeeping write lock. "
-            "error=%s",
+            "RiskGuard auxiliary bookkeeping (risk_actions / strategy_health) "
+            "deferred by the bounded TRADE writer lease; SKIPPING this cycle and "
+            "proceeding with the level computed from metric reads. error=%s",
             exc,
         )
         skipped = {

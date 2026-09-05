@@ -25,10 +25,64 @@ LEVEL — computed entirely from the metric READS already gathered — must NOT 
 Only a genuine truth-READ failure may degrade (fail-closed, preserved elsewhere).
 """
 import sqlite3
+import time
+from contextlib import contextmanager
 
 import pytest
 
 from src.riskguard import riskguard
+
+
+class _RecordingLease:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.acquired_at = time.monotonic()
+
+    def record_stage(self, _stage: str) -> None:
+        pass
+
+
+class _RecordingCoordinator:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.lease_kwargs: dict[str, object] | None = None
+        self.lease_token = _RecordingLease(events)
+
+    @contextmanager
+    def lease(self, _dbs, **kwargs):
+        self.lease_kwargs = kwargs
+        self.events.append("lease_enter")
+        try:
+            yield self.lease_token
+        finally:
+            self.events.append("lease_exit")
+
+
+class _ContendedCoordinator:
+    def lease(self, _dbs, **_kwargs):
+        raise riskguard.WriteLeaseTimeout("test unified TRADE lease contention")
+
+
+class _RecordingConnection(sqlite3.Connection):
+    def __init__(self, *args, events: list[str], **kwargs):
+        self._events = events
+        super().__init__(*args, **kwargs)
+
+    def execute(self, sql, parameters=()):
+        normalized = str(sql).strip().upper()
+        if normalized.startswith("BEGIN"):
+            self._events.append("begin")
+        elif normalized.startswith("INSERT"):
+            self._events.append("dml")
+        return super().execute(sql, parameters)
+
+    def commit(self):
+        self._events.append("commit")
+        return super().commit()
+
+    def rollback(self):
+        self._events.append("rollback")
+        return super().rollback()
 
 
 def _wal_db_with_risk_actions(db_path) -> None:
@@ -178,5 +232,117 @@ def test_non_lock_operationalerror_in_auxiliary_write_propagates(tmp_path):
         # It must be a NON-lock error (proves the discriminator did not classify it
         # as a lock and swallow it).
         assert not riskguard._is_sqlite_database_locked(excinfo.value)
+    finally:
+        conn.close()
+
+
+def test_auxiliary_refresh_uses_one_bounded_trade_transaction(monkeypatch):
+    """The lease must cover exactly the short two-table transaction.
+
+    The metric reads and the read-after-write health snapshot are outside the
+    lease. This recording fake is deliberately independent of the coordinator
+    implementation so a future refactor cannot silently move BEGIN/DML/COMMIT
+    back onto an uncoordinated connection or hold the lease across the snapshot.
+    """
+    events: list[str] = []
+    coordinator = _RecordingCoordinator(events)
+    conn = sqlite3.connect(":memory:", factory=lambda *args, **kwargs: _RecordingConnection(*args, events=events, **kwargs))
+    try:
+        conn.execute("CREATE TABLE risk_actions (name TEXT)")
+        conn.execute("CREATE TABLE strategy_health (name TEXT)")
+        conn.commit()
+        events.clear()
+        lease_active = [False]
+
+        @contextmanager
+        def recording_lease(_dbs, **kwargs):
+            coordinator.lease_kwargs = kwargs
+            events.append("lease_enter")
+            lease_active[0] = True
+            try:
+                yield coordinator.lease_token
+            finally:
+                lease_active[0] = False
+                events.append("lease_exit")
+
+        coordinator.lease = recording_lease
+        monkeypatch.setattr(riskguard, "default_runtime_write_coordinator", lambda: coordinator)
+        monkeypatch.setattr(
+            riskguard,
+            "_sync_riskguard_strategy_gate_actions",
+            lambda write_conn, *_args, **_kwargs: (
+                events.append(f"sync:{write_conn.in_transaction}"),
+                write_conn.execute("INSERT INTO risk_actions VALUES ('gate')"),
+                {"status": "emitted", "emitted_count": 1, "expired_count": 0},
+            )[-1],
+        )
+        monkeypatch.setattr(
+            riskguard,
+            "refresh_strategy_health",
+            lambda write_conn, **_kwargs: (
+                events.append(f"health:{write_conn.in_transaction}"),
+                write_conn.execute("INSERT INTO strategy_health VALUES ('health')"),
+                {"status": "refreshed", "rows_written": 1},
+            )[-1],
+        )
+        monkeypatch.setattr(
+            riskguard,
+            "query_strategy_health_snapshot",
+            lambda *_args, **_kwargs: (
+                events.append(f"snapshot_under_lease:{lease_active[0]}"),
+                {"status": "fresh", "by_strategy": {}, "stale_strategy_keys": []},
+            )[-1],
+        )
+
+        durable, refresh, snapshot = riskguard._refresh_riskguard_auxiliary_bookkeeping(
+            conn,
+            recommended_strategy_gate_reasons={},
+            now="2026-09-05T00:00:00+00:00",
+        )
+
+        assert durable["status"] == "emitted"
+        assert refresh["status"] == "refreshed"
+        assert snapshot["status"] == "fresh"
+        assert events == [
+            "sync:False",
+            "health:False",
+            "lease_enter",
+            "begin",
+            "dml",
+            "dml",
+            "commit",
+            "lease_exit",
+            "snapshot_under_lease:False",
+        ]
+        assert coordinator.lease_kwargs == {
+            "owner": "riskguard_tick_persist",
+            "write_class": "live",
+            "priority": riskguard.WritePriority.BACKGROUND_RECOVERY,
+            "deadline_ms": riskguard.RISKGUARD_TRADE_WRITE_LEASE_DEADLINE_MS,
+            "max_hold_ms": riskguard.RISKGUARD_TRADE_WRITE_LEASE_MAX_HOLD_MS,
+        }
+    finally:
+        conn.close()
+
+
+def test_unified_trade_lease_contention_skips_without_begin_or_partial_rows(monkeypatch):
+    """A contended unified lease must preserve the computed level's inputs."""
+    events: list[str] = []
+    conn = sqlite3.connect(":memory:", factory=lambda *args, **kwargs: _RecordingConnection(*args, events=events, **kwargs))
+    try:
+        coordinator = _ContendedCoordinator()
+        monkeypatch.setattr(riskguard, "default_runtime_write_coordinator", lambda: coordinator)
+
+        durable, refresh, snapshot = riskguard._refresh_riskguard_auxiliary_bookkeeping(
+            conn,
+            recommended_strategy_gate_reasons={"center_buy": ["brier_degraded"]},
+            now="2026-09-05T00:00:00+00:00",
+        )
+
+        assert durable["status"] == "skipped_dependency_lock"
+        assert refresh["status"] == "skipped_dependency_lock"
+        assert snapshot["status"] == "skipped_dependency_lock"
+        assert "begin" not in events
+        assert conn.in_transaction is False
     finally:
         conn.close()
