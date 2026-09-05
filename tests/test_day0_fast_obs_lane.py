@@ -373,6 +373,31 @@ def test_fast_station_residual_likelihood_bounds_city_history_before_filtering(
                     "",
                 )
             )
+    # Valid ISO offsets can place exact in-window instants on the adjacent
+    # lexical date.  These are the regression edges the index guard must not
+    # discard before julianday applies the causal window.
+    lower_boundary = (cutoff - timedelta(days=7) + timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=-13))
+    )
+    upper_boundary = (cutoff - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=13))
+    )
+    assert lower_boundary.date() < (cutoff - timedelta(days=7)).date()
+    assert upper_boundary.date() > cutoff.date()
+    for published in (lower_boundary, upper_boundary):
+        for channel in ("wu_icao_history", FAST_OBS_SOURCE_ID):
+            recent_rows.append(
+                (
+                    city,
+                    station.lower(),
+                    channel,
+                    published.isoformat(),
+                    23.0,
+                    "C",
+                    (published + timedelta(minutes=1)).isoformat(),
+                    "",
+                )
+            )
     conn.executemany(
         "INSERT INTO observation_prints "
         "(city,station_id,source_channel,publish_ts_utc,value_native,unit,fetched_at_utc,raw_report) "
@@ -423,7 +448,7 @@ def test_fast_station_residual_likelihood_bounds_city_history_before_filtering(
         conn.set_progress_handler(None, 0)
 
     assert likelihood is not None
-    assert likelihood.matched_pairs == 20
+    assert likelihood.matched_pairs == 22
     residual_query = next(
         statement
         for statement in traced
@@ -436,6 +461,54 @@ def test_fast_station_residual_likelihood_bounds_city_history_before_filtering(
         and "publish_ts_utc>? AND publish_ts_utc<?" in str(row[-1])
         for row in plan
     )
+    window_start = cutoff - timedelta(days=7)
+    exact_rows = conn.execute(
+        """
+        SELECT source_channel, publish_ts_utc, value_native, fetched_at_utc
+          FROM observation_prints
+         WHERE city = ?
+           AND upper(station_id) = ?
+           AND source_channel IN ('wu_icao_history', ?)
+           AND julianday(publish_ts_utc) >= julianday(?)
+           AND julianday(publish_ts_utc) < julianday(?)
+           AND julianday(fetched_at_utc) < julianday(?)
+         ORDER BY publish_ts_utc, id
+        """,
+        (
+            city,
+            station,
+            FAST_OBS_SOURCE_ID,
+            window_start.isoformat(),
+            cutoff.isoformat(),
+            cutoff.isoformat(),
+        ),
+    ).fetchall()
+    bounded_exact_rows = conn.execute(
+        """
+        SELECT source_channel, publish_ts_utc, value_native, fetched_at_utc
+          FROM observation_prints
+         WHERE city = ?
+           AND publish_ts_utc >= ?
+           AND publish_ts_utc < ?
+           AND upper(station_id) = ?
+           AND source_channel IN ('wu_icao_history', ?)
+           AND julianday(publish_ts_utc) >= julianday(?)
+           AND julianday(publish_ts_utc) < julianday(?)
+           AND julianday(fetched_at_utc) < julianday(?)
+         ORDER BY publish_ts_utc, id
+        """,
+        (
+            city,
+            (window_start - timedelta(days=1)).date().isoformat(),
+            (cutoff + timedelta(days=2)).date().isoformat(),
+            station,
+            FAST_OBS_SOURCE_ID,
+            window_start.isoformat(),
+            cutoff.isoformat(),
+            cutoff.isoformat(),
+        ),
+    ).fetchall()
+    assert bounded_exact_rows == exact_rows
     # 12k same-city, out-of-window rows must stay outside the VM scan.  A
     # city-only read regresses into a ledger scan and crosses this bound.
     assert progress_calls < 40

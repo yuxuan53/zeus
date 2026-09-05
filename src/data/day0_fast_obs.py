@@ -489,10 +489,13 @@ def build_fast_station_residual_likelihood(
     # accept every timestamp spelling SQLite previously accepted.  These UTC
     # calendar-day bounds are only a sargable superset that lets the existing
     # (city, publish_ts_utc) index avoid scanning a city's whole print ledger.
-    # The upper bound is the following UTC day, so a valid row at either edge
-    # cannot be excluded by this prefilter.
-    index_window_start = window_start.date().isoformat()
-    index_window_end = (training_cutoff + timedelta(days=1)).date().isoformat()
+    # datetime.fromisoformat accepts UTC offsets strictly inside +/-24 hours:
+    # that can render an in-window instant under the prior (lower) local date,
+    # or a pre-cutoff instant under the following (upper) local date. Widen by
+    # one full lower day and keep two full days beyond the cutoff as the
+    # exclusive upper guard; the exact julianday predicates still decide truth.
+    index_window_start = (window_start - timedelta(days=1)).date().isoformat()
+    index_window_end = (training_cutoff + timedelta(days=2)).date().isoformat()
     table = "world.observation_prints"
     try:
         conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
