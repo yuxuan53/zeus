@@ -1,6 +1,6 @@
 # Created: 2026-04-27
-# Last reused/audited: 2026-09-01
-# Lifecycle: created=2026-04-27; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused/audited: 2026-09-04
+# Lifecycle: created=2026-04-27; last_reviewed=2026-09-04; last_reused=2026-09-04
 # Authority basis: docs/operations/current/finite_evidence_probability_symmetry/PLAN.md
 # Purpose: Lock R3 M4 cancel/replace exit mutex, typed cancel outcomes, replacement gates, and CTF preflight.
 # Reuse: Run when exit_safety, executor exit submit, exit_lifecycle cancel retry, venue command transitions, or collateral sell preflight changes.
@@ -7878,6 +7878,243 @@ def test_live_exit_consumes_exact_submit_fill_without_second_venue_poll(
     ).fetchone()
     assert projection["phase"] == "economically_closed"
     assert projection["shares"] == pytest.approx(12.0)
+
+
+def test_live_exit_releases_terminal_fak_partial_before_second_venue_poll(
+    conn,
+    monkeypatch,
+):
+    from src.execution import exit_lifecycle
+    from src.state.portfolio import ExitContext, PortfolioState, Position
+    from src.state.venue_command_repo import (
+        append_event,
+        append_order_fact,
+        append_trade_fact,
+    )
+
+    position = Position(
+        trade_id="pos-terminal-fak-partial",
+        market_id="condition-terminal-fak-partial",
+        condition_id="condition-terminal-fak-partial",
+        city="Hong Kong",
+        cluster="asia",
+        target_date="2026-09-04",
+        bin_label="26C",
+        direction="buy_no",
+        token_id=YES_TOKEN,
+        no_token_id=NO_TOKEN,
+        entry_price=0.35,
+        size_usd=16.8,
+        shares=48.0,
+        cost_basis_usd=16.8,
+        chain_shares=48.0,
+        chain_cost_basis_usd=16.8,
+        chain_state="synced",
+        strategy_key="day0_nowcast_entry",
+        state="pending_exit",
+        exit_state="exit_intent",
+        env="test",
+    )
+    position.chain_seen_at = _NOW.isoformat()
+    portfolio = PortfolioState(positions=[position])
+    conn.execute(
+        """
+        INSERT INTO position_current (
+            position_id, phase, market_id, city, target_date, bin_label,
+            direction, size_usd, shares, cost_basis_usd, entry_price,
+            strategy_key, chain_state, token_id, no_token_id, condition_id,
+            updated_at, temperature_metric, chain_shares,
+            chain_cost_basis_usd, chain_seen_at
+        ) VALUES (?, 'pending_exit', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  'synced', ?, ?, ?, ?, 'low', ?, ?, ?)
+        """,
+        (
+            position.trade_id,
+            position.market_id,
+            position.city,
+            position.target_date,
+            position.bin_label,
+            position.direction,
+            position.size_usd,
+            position.shares,
+            position.cost_basis_usd,
+            position.entry_price,
+            position.strategy_key,
+            position.token_id,
+            position.no_token_id,
+            position.condition_id,
+            datetime.now(timezone.utc).isoformat(),
+            position.chain_shares,
+            position.chain_cost_basis_usd,
+            position.chain_seen_at,
+        ),
+    )
+    order_id = "ord-terminal-fak-partial"
+    command_id = "cmd-terminal-fak-partial"
+    _seed_exit_intent_event(
+        conn,
+        position_id=position.trade_id,
+        shares=48.0,
+        close_position=True,
+        reason="FLASH_CRASH_PANIC",
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        exit_lifecycle,
+        "_latest_or_capture_exit_snapshot_context",
+        lambda *_args, **_kwargs: {
+            "executable_snapshot_id": "snap-terminal-fak-partial",
+            "executable_snapshot_min_tick_size": "0.01",
+            "executable_snapshot_min_order_size": "5",
+            "executable_snapshot_neg_risk": False,
+            "executable_snapshot_orderbook_top_bid": "0.18",
+        },
+    )
+
+    def terminal_partial_submit(**_kwargs):
+        _insert_exit_command(
+            conn,
+            command_id=command_id,
+            position_id=position.trade_id,
+            token_id=NO_TOKEN,
+            size=48.0,
+            price=0.18,
+            venue_order_id=order_id,
+            order_type="FAK",
+            post_only=False,
+        )
+        _ack_exit(conn, command_id=command_id, venue_order_id=order_id)
+        append_order_fact(
+            conn,
+            venue_order_id=order_id,
+            command_id=command_id,
+            state="PARTIALLY_MATCHED",
+            remaining_size="0",
+            matched_size="5",
+            source="REST",
+            observed_at=_NOW.isoformat(),
+            raw_payload_hash="a" * 64,
+            raw_payload_json={"proof_class": "terminal_partial_order_fact"},
+        )
+        append_trade_fact(
+            conn,
+            trade_id="trade-terminal-fak-partial",
+            venue_order_id=order_id,
+            command_id=command_id,
+            state="MATCHED",
+            filled_size="5",
+            fill_price="0.18",
+            source="REST",
+            observed_at=_NOW.isoformat(),
+            raw_payload_hash="b" * 64,
+            raw_payload_json={"source": "place_exit_order_matched_submit"},
+            tx_hash="0xterminalfakpartial",
+        )
+        append_event(
+            conn,
+            command_id=command_id,
+            event_type="PARTIAL_FILL_OBSERVED",
+            occurred_at=_NOW.isoformat(),
+            payload={
+                "reason": "terminal_partial_order_fact_corrected",
+                "proof_class": "terminal_partial_order_fact",
+                "command_id": command_id,
+                "venue_order_id": order_id,
+                "requested_size": "48",
+                "filled_size": "5",
+                "fill_price": "0.18",
+                "remaining_size": "0",
+                "required_predicates": {
+                    "terminal_order_remainder_zero": True,
+                    "canonical_trade_facts_match_terminal_order_fact": True,
+                    "cumulative_fill_below_requested_size": True,
+                },
+            },
+        )
+        conn.commit()
+        return exit_lifecycle.OrderResult(
+            trade_id=position.trade_id,
+            status="partial",
+            reason="sell order partially filled",
+            order_id=order_id,
+            external_order_id=order_id,
+            shares=48.0,
+            command_state="PARTIAL",
+            command_id=command_id,
+            submitted_order_type="FAK",
+        )
+
+    monkeypatch.setattr(exit_lifecycle, "place_sell_order", terminal_partial_submit)
+
+    class NoSecondPoll:
+        def get_order_status(self, seen_order_id):
+            raise AssertionError(
+                f"terminal FAK partial must release without a second poll: {seen_order_id}"
+            )
+
+    context = ExitContext(
+        exit_reason="FLASH_CRASH_PANIC",
+        current_market_price=0.18,
+        current_market_price_is_fresh=True,
+        best_bid=0.18,
+    )
+    result = exit_lifecycle._execute_live_exit(
+        portfolio,
+        position,
+        context,
+        exit_lifecycle.ExitIntent(
+            trade_id=position.trade_id,
+            reason="FLASH_CRASH_PANIC",
+            token_id=NO_TOKEN,
+            shares=48.0,
+            current_market_price=0.18,
+            best_bid=0.18,
+            close_position=True,
+        ),
+        NoSecondPoll(),
+        conn=conn,
+        execution_evidence=None,
+        is_red_force_exit=False,
+        exit_intent_already_recorded=True,
+    )
+
+    assert result == (
+        "position_reduced: 5 shares; terminal FAK residual ready for redecision"
+    )
+    assert position.state == "holding"
+    assert position.exit_state == ""
+    assert position.shares == pytest.approx(43.0)
+    assert position.cost_basis_usd == pytest.approx(15.05)
+    # Canonical fill economics reduce the local exposure immediately; the
+    # independently observed chain projection is not locally fabricated.
+    assert position.chain_shares == pytest.approx(48.0)
+    assert position.chain_cost_basis_usd == pytest.approx(16.8)
+    assert conn.in_transaction is False
+    events = conn.execute(
+        """
+        SELECT event_type, caused_by
+          FROM position_events
+         WHERE position_id = ?
+         ORDER BY sequence_no DESC
+         LIMIT 2
+        """,
+        (position.trade_id,),
+    ).fetchall()
+    assert [(row["event_type"], row["caused_by"]) for row in reversed(events)] == [
+        ("MONITOR_REFRESHED", "partial_exit_fill"),
+        ("EXIT_RETRY_RELEASED", "capital_reduction_filled"),
+    ]
+    binding_sequence = conn.execute(
+        "SELECT sequence_no FROM position_events WHERE position_id = ? "
+        "AND event_type = 'EXIT_ORDER_POSTED' AND command_id = ?",
+        (position.trade_id, command_id),
+    ).fetchone()[0]
+    assert exit_lifecycle._capital_reduction_released_global_sell_command(
+        conn,
+        position,
+        command_id=command_id,
+        binding_sequence=binding_sequence,
+    )
 
 
 def test_live_exit_uses_expired_snapshot_identity_when_static_topology_lacks_no_token(

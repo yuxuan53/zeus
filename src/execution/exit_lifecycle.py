@@ -1605,25 +1605,31 @@ def _capital_reduction_released_global_sell_command(
     try:
         command = conn.execute(
             """
-            SELECT venue_order_id
+            SELECT venue_order_id, state
               FROM venue_commands
              WHERE command_id = ?
                AND position_id = ?
                AND intent_kind = 'EXIT'
                AND side = 'SELL'
-               AND state = 'FILLED'
+               AND state IN ('FILLED', 'PARTIAL')
              LIMIT 1
             """,
             (command_id, position_id),
         ).fetchone()
         venue_order_id = str(command[0] or "").strip() if command is not None else ""
+        command_state = str(command[1] or "").upper() if command is not None else ""
+        if command_state == "PARTIAL":
+            from src.execution.exit_safety import _terminal_partial_command_proven
+
+            if not _terminal_partial_command_proven(conn, command_id):
+                return False
         if not venue_order_id or not _is_exact_held_sell_command(
             conn,
             position_id=position_id,
             command_id=command_id,
             held_token_id=held_token_id,
             venue_order_id=venue_order_id,
-            expected_state="FILLED",
+            expected_state=command_state,
         ):
             return False
         row = conn.execute(
@@ -1682,6 +1688,126 @@ def _capital_reduction_released_global_sell_command(
         and effective_shares > 0
         and abs(effective_shares - remaining_shares) <= share_tolerance
     )
+
+
+def _terminal_fak_partial_submit_fill(
+    conn: sqlite3.Connection | None,
+    position: Position,
+    sell_result: OrderResult,
+) -> tuple[Decimal, Decimal] | None:
+    """Return exact terminal FAK partial economics from the durable ACK.
+
+    A FAK's unfilled remainder is dead when submit returns.  Treating that
+    terminal order as an in-flight GTC strands the still-held shares behind the
+    old command until a later recovery poll.  The command repository already
+    validates the terminal-partial order/trade proof; this seam binds that proof
+    back to the exact held position before lifecycle releases the residual.
+    """
+
+    command_id = str(getattr(sell_result, "command_id", "") or "").strip()
+    order_id = str(
+        getattr(sell_result, "external_order_id", "")
+        or getattr(sell_result, "order_id", "")
+        or ""
+    ).strip()
+    submitted_order_type = str(
+        getattr(sell_result, "submitted_order_type", "") or ""
+    ).upper()
+    if (
+        conn is None
+        or str(getattr(sell_result, "status", "") or "").lower() != "partial"
+        or str(getattr(sell_result, "command_state", "") or "").upper()
+        != "PARTIAL"
+        or submitted_order_type != "FAK"
+        or not command_id
+        or not order_id
+    ):
+        return None
+    from src.execution.exit_safety import _terminal_partial_command_proven
+
+    if not _terminal_partial_command_proven(conn, command_id):
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT command.size, command.position_id, command.token_id,
+                   command.venue_order_id, event.payload_json
+              FROM venue_commands AS command
+              JOIN venue_command_events AS event
+                ON event.event_id = command.last_event_id
+             WHERE command.command_id = ?
+               AND command.intent_kind = 'EXIT'
+               AND command.side = 'SELL'
+               AND command.state = 'PARTIAL'
+               AND event.event_type = 'PARTIAL_FILL_OBSERVED'
+             LIMIT 1
+            """,
+            (command_id,),
+        ).fetchone()
+        payload = json.loads(str(row[4] or "{}")) if row is not None else {}
+        requested = Decimal(str(row[0])) if row is not None else Decimal("NaN")
+        filled = Decimal(str(payload.get("filled_size")))
+        fill_price = Decimal(str(payload.get("fill_price")))
+        effective_shares = Decimal(str(position.effective_exposure().shares))
+        trade_rows = conn.execute(
+            """
+            SELECT filled_size, fill_price, state, source
+              FROM venue_trade_facts
+             WHERE command_id = ? AND venue_order_id = ?
+            """,
+            (command_id, order_id),
+        ).fetchall()
+    except (
+        AttributeError,
+        InvalidOperation,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+    raw_direction = getattr(position, "direction", "")
+    direction = str(getattr(raw_direction, "value", raw_direction) or "").lower()
+    held_token_id = str(
+        getattr(position, "no_token_id", "")
+        if direction == "buy_no"
+        else getattr(position, "token_id", "")
+    ).strip()
+    tolerance = Decimal("0.000001")
+    matching_trade = False
+    for trade_row in trade_rows:
+        try:
+            trade_size = Decimal(str(trade_row[0]))
+            trade_price = Decimal(str(trade_row[1]))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if (
+            trade_size == filled
+            and trade_price == fill_price
+            and str(trade_row[2] or "").upper() in {"MATCHED", "CONFIRMED"}
+            and str(trade_row[3] or "").upper() in {"REST", "WS_USER"}
+        ):
+            matching_trade = True
+            break
+    if (
+        row is None
+        or str(row[1] or "") != str(getattr(position, "trade_id", "") or "")
+        or str(row[2] or "") != held_token_id
+        or str(row[3] or "").lower() != order_id.lower()
+        or not all(
+            value.is_finite()
+            for value in (requested, filled, fill_price, effective_shares)
+        )
+        or requested <= 0
+        or filled <= 0
+        or filled >= requested
+        or effective_shares + tolerance < filled
+        or fill_price <= 0
+        or fill_price > 1
+        or not matching_trade
+    ):
+        return None
+    return filled, fill_price
 
 
 def _canonical_global_sell_command_ownership(
@@ -8571,6 +8697,32 @@ def _execute_live_exit(
                     "semantic_event": "EXIT_ORDER_POSTED",
                     "sell_result": _serialize_sell_result(sell_result),
                 },
+            )
+
+        terminal_fak_partial = _terminal_fak_partial_submit_fill(
+            conn,
+            position,
+            sell_result,
+        )
+        if terminal_fak_partial is not None:
+            confirmed_shares, confirmed_price = terminal_fak_partial
+            reduced = _complete_intentional_position_reduction(
+                position,
+                intended_shares=Decimal(str(exit_intent.shares)),
+                confirmed_filled_shares=confirmed_shares,
+                fill_price=confirmed_price,
+                order_id=order_id,
+                status="PARTIAL,TERMINAL_FAK",
+                conn=conn,
+            )
+            if conn is not None:
+                # The venue side effect and terminal remainder are already
+                # durable.  Commit the reduction/release before the caller can
+                # publish or execute a replacement SELL.
+                conn.commit()
+            return (
+                "position_reduced: "
+                f"{reduced} shares; terminal FAK residual ready for redecision"
             )
 
         # The executor may already have persisted exact full-fill truth from
