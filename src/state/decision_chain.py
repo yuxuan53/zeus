@@ -26,8 +26,8 @@ LEGACY_SETTLEMENT_CONTRACT_VERSION = "decision_log.settlement.v1"
 #
 # Piggybacked in the SAME transaction as every decision_log INSERT (both
 # store_artifact and store_settlement_records below): after inserting a row
-# of a given mode, scans at most _INLINE_EXPIRE_SCAN_LIMIT expired candidates
-# and deletes up to _INLINE_EXPIRE_LIMIT rows of that SAME mode. The canonical
+# of a given mode, deletes up to _INLINE_EXPIRE_LIMIT expired rows of that SAME
+# mode, walking idx_decision_log_mode so no other mode's pages are read. The canonical
 # DB cursor is stored in zeus_meta in that same transaction, so later writes
 # continue the bounded backward walk. No commit here -- matches the existing
 # "caller owns the commit" contract. scripts/migrations/
@@ -50,7 +50,6 @@ _MODE_RETENTION_DAYS: dict[str, int] = {
 }
 _DEFAULT_MODE_RETENTION_DAYS = 30
 _INLINE_EXPIRE_LIMIT = 50
-_INLINE_EXPIRE_SCAN_LIMIT = 500
 _INLINE_EXPIRE_CURSOR_PREFIX = "decision_log.inline_expire_cursor.v1:"
 
 # Tier0 preregistered selection-lift study anchor (PR #510): a
@@ -73,24 +72,52 @@ TIER0_EXCEPT_CLAUSE = """
 
 
 def _inline_expire_decision_log(conn, mode: str, *, exclude_id: "int | None" = None) -> None:
-    """Scan a fixed expired page and delete matching rows of ``mode``.
+    """Delete one bounded chunk of expired ``mode`` rows inside the caller's write.
 
-    The canonical trade DB's ``zeus_meta`` cursor makes sparse modes progress
-    across calls without an unbounded index walk. ``exclude_id`` protects the
-    row just inserted by this caller. Never raises: retention failure must not
-    block a legitimate decision artifact write.
+    The walk runs on ``idx_decision_log_mode`` (mode, rowid): it never touches a
+    table page of another mode and never reads ``timestamp`` from a record
+    (that column sits behind the multi-page ``artifact_json`` overflow chain).
+    The walk starts at the rowid of the newest row below the cutoff, found on
+    the timestamp index (rowid order is insertion order, which matches
+    timestamp order for live writes); the DELETE re-checks the timestamp so a
+    fresh row can never be removed. The ``zeus_meta`` cursor
+    continues the walk across calls; ``exclude_id`` protects the row just
+    inserted by this caller. Never raises: retention failure must not block a
+    legitimate decision artifact write.
     """
     try:
+        has_mode_index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_decision_log_mode'"
+        ).fetchone() is not None
+        if not has_mode_index:
+            # A trade DB that predates the index keeps its rows until the
+            # schema bootstrap creates it. The timestamp-only walk it replaces
+            # read one cold table page per row of every mode inside a
+            # money-path write transaction (2026-09-05: 3-19 s per artifact).
+            return
         keep_days = _MODE_RETENTION_DAYS.get(mode, _DEFAULT_MODE_RETENTION_DAYS)
         # A day-stable cutoff prevents the cursor from resetting on every call.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime(
             "%Y-%m-%dT00:00:00"
         )
+        boundary_row = conn.execute(
+            """
+            SELECT id
+            FROM decision_log INDEXED BY idx_decision_log_ts
+            WHERE timestamp < ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (cutoff,),
+        ).fetchone()
+        if boundary_row is None:
+            return
+        scan_below = int(boundary_row[0]) + 1
         has_meta = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='zeus_meta'"
         ).fetchone() is not None
         cursor_key = f"{_INLINE_EXPIRE_CURSOR_PREFIX}{mode}"
-        scan_cursor: tuple[str, int] | None = None
         if has_meta:
             cursor_row = conn.execute(
                 "SELECT value FROM zeus_meta WHERE key = ?", (cursor_key,)
@@ -98,35 +125,21 @@ def _inline_expire_decision_log(conn, mode: str, *, exclude_id: "int | None" = N
             if cursor_row is not None:
                 try:
                     cursor_value = json.loads(str(cursor_row[0]))
-                    cursor_timestamp = cursor_value.get("timestamp")
                     cursor_id = cursor_value.get("id")
-                    if (
-                        cursor_value.get("cutoff") == cutoff
-                        and isinstance(cursor_timestamp, str)
-                        and isinstance(cursor_id, int)
-                    ):
-                        scan_cursor = (cursor_timestamp, cursor_id)
+                    if cursor_value.get("cutoff") == cutoff and isinstance(cursor_id, int):
+                        scan_below = min(scan_below, cursor_id)
                 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-                    scan_cursor = None
+                    pass
 
-        cursor_clause = ""
-        scan_params: list[object] = [cutoff]
-        if scan_cursor is not None:
-            cursor_clause = (
-                "AND (timestamp < ? OR (timestamp = ? AND id < ?))"
-            )
-            scan_params.extend((scan_cursor[0], scan_cursor[0], scan_cursor[1]))
-        scan_params.append(_INLINE_EXPIRE_SCAN_LIMIT)
         candidates = conn.execute(
-            f"""
-            SELECT id, timestamp, mode
-            FROM decision_log INDEXED BY idx_decision_log_ts
-            WHERE timestamp < ?
-            {cursor_clause}
-            ORDER BY timestamp DESC, id DESC
+            """
+            SELECT id
+            FROM decision_log INDEXED BY idx_decision_log_mode
+            WHERE mode = ? AND id < ?
+            ORDER BY id DESC
             LIMIT ?
             """,
-            tuple(scan_params),
+            (mode, scan_below, _INLINE_EXPIRE_LIMIT),
         ).fetchall()
 
         except_clause = ""
@@ -140,30 +153,28 @@ def _inline_expire_decision_log(conn, mode: str, *, exclude_id: "int | None" = N
         candidate_ids = [
             int(row[0])
             for row in candidates
-            if row[2] == mode and (exclude_id is None or int(row[0]) != exclude_id)
-        ][:_INLINE_EXPIRE_LIMIT]
+            if exclude_id is None or int(row[0]) != exclude_id
+        ]
         if candidate_ids:
             placeholders = ",".join("?" for _ in candidate_ids)
+            # The timestamp predicate keeps a fresh row safe when a backfill
+            # inserted an older-dated row above it; it costs nothing extra for
+            # the rows actually deleted, whose pages are touched anyway.
             conn.execute(
                 f"""
                 DELETE FROM decision_log
-                WHERE id IN ({placeholders}) AND mode = ?
+                WHERE id IN ({placeholders}) AND mode = ? AND timestamp < ?
                 {except_clause}
                 """,
-                (*candidate_ids, mode),
+                (*candidate_ids, mode, cutoff),
             )
 
         if has_meta:
-            if len(candidates) == _INLINE_EXPIRE_SCAN_LIMIT:
-                last = candidates[-1]
-                cursor_value = {
-                    "cutoff": cutoff,
-                    "timestamp": str(last[1]),
-                    "id": int(last[0]),
-                }
+            if len(candidates) == _INLINE_EXPIRE_LIMIT:
+                cursor_value = {"cutoff": cutoff, "id": int(candidates[-1][0])}
             else:
-                # End reached. Wrap so matches skipped by the 50-row delete
-                # cap are reconsidered on the next artifact write.
+                # End reached. Wrap so rows the tier0 anchor kept, and rows
+                # that became expired since, are reconsidered next call.
                 cursor_value = {"cutoff": cutoff}
             conn.execute(
                 """

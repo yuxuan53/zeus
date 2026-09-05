@@ -58,6 +58,7 @@ def _decision_log_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute(DECISION_LOG_DDL)
     conn.execute("CREATE INDEX idx_decision_log_ts ON decision_log(timestamp)")
+    conn.execute("CREATE INDEX idx_decision_log_mode ON decision_log(mode)")
     return conn
 
 
@@ -134,7 +135,7 @@ def test_expire_is_limit_bounded() -> None:
     assert _count(conn, "exit_monitor") == 20
 
 
-def test_expire_forces_timestamp_index_in_money_path_transaction() -> None:
+def test_expire_reads_no_row_of_another_mode_in_money_path_transaction() -> None:
     conn = _decision_log_conn()
     old = _iso(10)
     _seed(conn, mode="exit_monitor", ts=old)
@@ -143,15 +144,19 @@ def test_expire_forces_timestamp_index_in_money_path_transaction() -> None:
 
     _inline_expire_decision_log(conn, "exit_monitor")
 
-    assert any(
-        "FROM decision_log INDEXED BY idx_decision_log_ts" in statement
-        for statement in statements
-    )
+    # The age bound comes from the timestamp index and the candidate walk
+    # from the mode index; neither statement can touch a table page of an
+    # unrelated mode while the caller's write transaction is open.
+    assert any("INDEXED BY idx_decision_log_ts" in statement for statement in statements)
+    assert any("INDEXED BY idx_decision_log_mode" in statement for statement in statements)
 
 
 def test_expire_walks_backward_from_cutoff_not_oldest_history() -> None:
     conn = _decision_log_conn()
-    expired = [_iso(8 + offset) for offset in range(_INLINE_EXPIRE_LIMIT + 1)]
+    # Insertion order is chronological, as live writes are (timestamp is the
+    # wall clock at insert; 0 rowid/timestamp inversions over the live table
+    # on 2026-09-05), so the rowid walk descends from the cutoff side.
+    expired = [_iso(58 - offset) for offset in range(_INLINE_EXPIRE_LIMIT + 1)]
     for ts in expired:
         _seed(conn, mode="exit_monitor", ts=ts)
 
@@ -163,10 +168,10 @@ def test_expire_walks_backward_from_cutoff_not_oldest_history() -> None:
     remaining = conn.execute(
         "SELECT timestamp FROM decision_log WHERE mode = 'exit_monitor'"
     ).fetchall()
-    assert remaining == [(expired[-1],)]
+    assert remaining == [(expired[0],)]
 
 
-def test_sparse_mode_scan_is_bounded_and_cursor_reaches_older_target() -> None:
+def test_sparse_mode_target_is_reached_without_walking_other_modes() -> None:
     conn = _decision_log_conn()
     conn.execute(ZEUS_META_DDL)
     target_ts = _iso(20)
@@ -177,19 +182,37 @@ def test_sparse_mode_scan_is_bounded_and_cursor_reaches_older_target() -> None:
 
     _inline_expire_decision_log(conn, "exit_monitor")
 
-    # A fixed scan budget must stop before the sparse target instead of
-    # traversing every unrelated row while the money-path transaction is open.
-    assert _count(conn, "exit_monitor") == 1
-    cursor_row = conn.execute(
-        "SELECT value FROM zeus_meta "
-        "WHERE key = 'decision_log.inline_expire_cursor.v1:exit_monitor'"
-    ).fetchone()
-    assert cursor_row is not None
-
-    # The durable per-mode cursor continues the bounded walk across calls.
-    for _ in range(4):
-        _inline_expire_decision_log(conn, "exit_monitor")
+    # The mode index reaches the sparse target on the first call: unrelated
+    # volume cannot stretch the money-path transaction that carries the walk.
     assert _count(conn, "exit_monitor") == 0
+    assert _count(conn, "other_mode") == 2_000
+
+
+def test_fresh_row_below_a_backfilled_old_row_is_never_deleted() -> None:
+    conn = _decision_log_conn()
+    fresh = _iso(1)
+    _seed(conn, mode="exit_monitor", ts=fresh)  # current row, low rowid
+    _seed(conn, mode="exit_monitor", ts=_iso(30))  # backfill: old date, newer rowid
+
+    _inline_expire_decision_log(conn, "exit_monitor")
+
+    # The walk starts at the backfill's rowid and passes the fresh row; the
+    # DELETE's timestamp check is what keeps it.
+    remaining = conn.execute(
+        "SELECT timestamp FROM decision_log WHERE mode = 'exit_monitor'"
+    ).fetchall()
+    assert remaining == [(fresh,)]
+
+
+def test_expiry_waits_for_mode_index_without_blocking_the_write() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(DECISION_LOG_DDL)
+    conn.execute("CREATE INDEX idx_decision_log_ts ON decision_log(timestamp)")
+    _seed(conn, mode="exit_monitor", ts=_iso(10))
+
+    _inline_expire_decision_log(conn, "exit_monitor")
+
+    assert _count(conn, "exit_monitor") == 1
 
 
 def test_malformed_cursor_resets_without_blocking_expiry() -> None:

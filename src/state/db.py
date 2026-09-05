@@ -6574,6 +6574,11 @@ CREATE TABLE IF NOT EXISTS decision_log (
             timestamp TEXT NOT NULL
         , env TEXT NOT NULL DEFAULT 'live');
 CREATE INDEX IF NOT EXISTS idx_decision_log_ts ON decision_log(timestamp);
+-- Inline retention walk (src/state/decision_chain.py): mode-leading so the
+-- expired-row scan never reads table pages of other modes. Built from the
+-- leaf pages only (mode precedes artifact_json), unlike a (mode, timestamp)
+-- index whose build would walk every overflow chain.
+CREATE INDEX IF NOT EXISTS idx_decision_log_mode ON decision_log(mode);
 CREATE TABLE IF NOT EXISTS exchange_reconcile_findings (
           finding_id TEXT PRIMARY KEY,
           kind TEXT NOT NULL CHECK (kind IN (
