@@ -42383,7 +42383,31 @@ def _day0_process_sigma_native(
         )
 
         base_sigma = float(sigma_instrument(unit).value)
-        obs_age_min = _day0_observation_age_minutes(payload, decision_time)
+        source_clock_sigma_raw = payload.get(
+            "_edli_day0_source_clock_predictive_sigma_native"
+        )
+        current_state_time = payload.get(
+            "_edli_day0_current_temperature_observed_at_utc"
+        )
+        if source_clock_sigma_raw is not None and current_state_time is not None:
+            if decision_time is None:
+                return None
+            observed_at = datetime.fromisoformat(
+                str(current_state_time).replace("Z", "+00:00")
+            )
+            if observed_at.tzinfo is None:
+                return None
+            obs_age_min = max(
+                0.0,
+                (decision_time.astimezone(UTC) - observed_at.astimezone(UTC)).total_seconds()
+                / 60.0,
+            )
+        elif source_clock_sigma_raw is not None:
+            # A materialized carrier without a current-state witness remains
+            # on the same unconditioned source-clock variance closure.
+            obs_age_min = 0.0
+        else:
+            obs_age_min = _day0_observation_age_minutes(payload, decision_time)
         budget_min = staleness_budget_minutes(str(getattr(family, "city", "") or ""))
         margin = stale_extreme_uncertainty_margin(
             unit=unit, obs_age_minutes=obs_age_min, budget_minutes=budget_min
@@ -42391,9 +42415,6 @@ def _day0_process_sigma_native(
         sigma = float(np.sqrt(base_sigma ** 2 + (margin / 2.0) ** 2))
     except Exception:  # noqa: BLE001 - caller turns absence into typed no-trade/log evidence.
         return None
-    source_clock_sigma_raw = payload.get(
-        "_edli_day0_source_clock_predictive_sigma_native"
-    )
     if source_clock_sigma_raw is not None:
         try:
             source_clock_sigma = float(source_clock_sigma_raw)
@@ -42407,12 +42428,16 @@ def _day0_process_sigma_native(
             return None
         if not centers.size or not np.isfinite(centers).all():
             return None
+        from src.data.day0_hourly_vectors import day0_effective_path_sigma_c
+
         path_center_sigma = float(np.std(centers, ddof=0))
-        unresolved_variance = max(
-            source_clock_sigma**2 - path_center_sigma**2,
-            0.0,
+        sigma = day0_effective_path_sigma_c(
+            source_clock_predictive_sigma_c=source_clock_sigma,
+            centers_c=centers,
+            instrument_sigma_c=base_sigma,
+            observation_margin_c=margin,
         )
-        sigma = max(sigma, float(np.sqrt(unresolved_variance)))
+        unresolved_variance = max(source_clock_sigma**2 - path_center_sigma**2, 0.0)
         payload["_edli_day0_remaining_path_center_sigma_native"] = (
             path_center_sigma
         )
@@ -44054,6 +44079,28 @@ def _day0_remaining_p_raw_vector(
         instrument_sigma_native = float(
             sigma_instrument_for_city(city).to(carrier_unit).value
         )
+        identity_inputs = day0_remaining_carrier_identity_inputs(
+            city=str(getattr(city, "name", "")),
+            unit=carrier_unit,
+            decision_time_utc=decision_time.astimezone(UTC).isoformat(),
+            station_id=configured_station,
+            preliminary_survival_identity=likelihood_identity,
+        )
+        current_value = payload.get("_edli_day0_current_temperature_native")
+        current_observed_at = payload.get(
+            "_edli_day0_current_temperature_observed_at_utc"
+        )
+        current_source = payload.get("_edli_day0_current_temperature_source")
+        if (
+            current_value is not None
+            and current_observed_at is not None
+            and current_source is not None
+        ):
+            identity_inputs["current_path_state"] = {
+                "value_native": float(current_value),
+                "observed_at_utc": str(current_observed_at),
+                "source": str(current_source),
+            }
         carrier = build_day0_remaining_probability_carrier(
             future_extremes_c=future_native,
             boundary_scenarios=boundary_scenarios,
@@ -44063,13 +44110,7 @@ def _day0_remaining_p_raw_vector(
             bin_bounds_c=native_bounds,
             n_point=n_mc,
             n_samples=500,
-            identity_inputs=day0_remaining_carrier_identity_inputs(
-                city=str(getattr(city, "name", "")),
-                unit=carrier_unit,
-                decision_time_utc=decision_time.astimezone(UTC).isoformat(),
-                station_id=configured_station,
-                preliminary_survival_identity=likelihood_identity,
-            ),
+            identity_inputs=identity_inputs,
             settlement_semantics=settlement_semantics,
         )
         expected_identity = str(payload["_edli_day0_remaining_content_identity"]).strip()
@@ -44951,7 +44992,7 @@ def _day0_remaining_day_q_enabled() -> bool:
     return True
 
 
-def _latest_day0_current_temperature_native(
+def _legacy_latest_day0_current_temperature_native(
     *,
     world_conn: sqlite3.Connection,
     family,
@@ -45103,7 +45144,31 @@ def _latest_day0_current_temperature_native(
     return None
 
 
-def _remaining_day_extremes_c_with_current_state_evidence(
+def _latest_day0_current_temperature_native(
+    *,
+    world_conn: sqlite3.Connection,
+    family,
+    decision_time: datetime,
+) -> tuple[float, datetime, str] | None:
+    """Compatibility wrapper around the shared Day0 current-state reader."""
+
+    city = runtime_cities_by_name().get(str(family.city))
+    if city is None:
+        return None
+    from src.data.day0_hourly_vectors import read_day0_current_temperature_state
+
+    state = read_day0_current_temperature_state(
+        conn=world_conn,
+        city=city,
+        target_date=str(family.target_date),
+        decision_time=decision_time,
+    )
+    if state is None:
+        return None
+    return state.value_native, state.observed_at, state.source
+
+
+def _legacy_remaining_day_extremes_c_with_current_state_evidence(
     vectors: list[object],
     *,
     target_date: str,
@@ -45183,6 +45248,37 @@ def _remaining_day_extremes_c_with_current_state_evidence(
             model: float(innovation)
             for model, innovation in zip(models, innovation_values, strict=True)
         },
+    )
+
+
+def _remaining_day_extremes_c_with_current_state_evidence(
+    vectors: list[object],
+    *,
+    target_date: str,
+    decision_time: datetime,
+    observation_time: datetime,
+    current_temp_c: float,
+    metric: str,
+) -> tuple[list[float], dict[str, float]]:
+    """Compatibility wrapper around the shared Day0 path transform."""
+
+    from src.data.day0_hourly_vectors import (
+        Day0CurrentTemperatureState,
+        remaining_day_extremes_c_with_current_state,
+    )
+
+    return remaining_day_extremes_c_with_current_state(
+        vectors,
+        target_date=target_date,
+        decision_time=decision_time,
+        metric=metric,
+        current_state=Day0CurrentTemperatureState(
+            value_native=float(current_temp_c),
+            observed_at=observation_time,
+            source="adapter_compat",
+        ),
+        settlement_unit="C",
+        fallback_window_start=observation_time,
     )
 
 
@@ -45346,6 +45442,28 @@ def _rebuild_decision_time_day0_carrier(
             unit=carrier_unit,
         )
     cutoff = decision_time.astimezone(UTC).isoformat()
+    identity_inputs = day0_remaining_carrier_identity_inputs(
+        city=str(family.city),
+        unit=carrier_unit,
+        decision_time_utc=cutoff,
+        station_id=configured_station,
+        preliminary_survival_identity=likelihood_identity,
+    )
+    current_value = payload.get("_edli_day0_current_temperature_native")
+    current_observed_at = payload.get(
+        "_edli_day0_current_temperature_observed_at_utc"
+    )
+    current_source = payload.get("_edli_day0_current_temperature_source")
+    if (
+        current_value is not None
+        and current_observed_at is not None
+        and current_source is not None
+    ):
+        identity_inputs["current_path_state"] = {
+            "value_native": float(current_value),
+            "observed_at_utc": str(current_observed_at),
+            "source": str(current_source),
+        }
     carrier = build_day0_remaining_probability_carrier(
         future_extremes_c=values_native,
         boundary_scenarios=boundary_scenarios,
@@ -45359,13 +45477,7 @@ def _rebuild_decision_time_day0_carrier(
         bin_bounds_c=bounds,
         n_point=ensemble_n_mc(),
         n_samples=500,
-        identity_inputs=day0_remaining_carrier_identity_inputs(
-            city=str(family.city),
-            unit=carrier_unit,
-            decision_time_utc=cutoff,
-            station_id=configured_station,
-            preliminary_survival_identity=likelihood_identity,
-        ),
+        identity_inputs=identity_inputs,
         settlement_semantics=SettlementSemantics.for_city(city),
     )
     payload.update(

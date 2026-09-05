@@ -1331,6 +1331,7 @@ def _day0_noaa_preliminary_carrier(
     from src.data.day0_hourly_vectors import (
         build_day0_remaining_probability_carrier,
         day0_remaining_carrier_identity_inputs,
+        read_day0_current_temperature_state,
     )
     from src.data.day0_observation_reader import (
         same_station_preliminary_report_survival_likelihood,
@@ -1457,6 +1458,25 @@ def _day0_noaa_preliminary_carrier(
     instrument_sigma_native = float(
         sigma_instrument_for_city(city).to(carrier_unit).value
     )
+    computed_at = _to_utc(request.computed_at, field_name="computed_at")
+    current_state = read_day0_current_temperature_state(
+        conn=conn,
+        city=city,
+        target_date=_date_text(request.target_date),
+        decision_time=computed_at,
+    )
+    if current_state is None:
+        raise ValueError(
+            "DAY0_NOAA_PRELIMINARY_CARRIER_CURRENT_TEMPERATURE_STATE_MISSING"
+        )
+    identity_inputs = day0_remaining_carrier_identity_inputs(
+        city=request.city,
+        unit=carrier_unit,
+        decision_time_utc=computed_at.isoformat(),
+        station_id=station,
+        preliminary_survival_identity=str(likelihood["identity_hash"]),
+    )
+    identity_inputs["current_path_state"] = current_state.identity()
     carrier = build_day0_remaining_probability_carrier(
         future_extremes_c=future_members_native,
         boundary_scenarios=native_boundary_scenarios,
@@ -1466,15 +1486,7 @@ def _day0_noaa_preliminary_carrier(
         bin_bounds_c=native_bounds,
         n_point=ensemble_n_mc(),
         n_samples=500,
-        identity_inputs=day0_remaining_carrier_identity_inputs(
-            city=request.city,
-            unit=carrier_unit,
-            decision_time_utc=_to_utc(
-                request.computed_at, field_name="computed_at"
-            ).isoformat(),
-            station_id=station,
-            preliminary_survival_identity=str(likelihood["identity_hash"]),
-        ),
+        identity_inputs=identity_inputs,
         settlement_semantics=SettlementSemantics.for_city(city),
     )
     return carrier, likelihood
@@ -1495,12 +1507,24 @@ def _day0_noaa_future_vector_members(
         DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
         day0_hourly_models_for_city,
         read_freshest_day0_hourly_vectors,
-        remaining_day_extremes_c,
+        read_day0_current_temperature_state,
+        remaining_day_extremes_c_with_current_state,
     )
     city = runtime_cities_by_name().get(request.city)
     if city is None:
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_CITY_MISSING")
     cutoff = _to_utc(request.computed_at, field_name="computed_at")
+    current_state = read_day0_current_temperature_state(
+        conn=conn,
+        city=city,
+        target_date=_date_text(request.target_date),
+        decision_time=cutoff,
+    )
+    if current_state is None:
+        raise ValueError(
+            "DAY0_NOAA_PRELIMINARY_CARRIER_CURRENT_TEMPERATURE_STATE_MISSING"
+        )
+    window_start = current_state.observed_at
     expected = tuple(day0_hourly_models_for_city(city))
     vectors = read_freshest_day0_hourly_vectors(
         city=request.city,
@@ -1509,20 +1533,20 @@ def _day0_noaa_future_vector_members(
         expected_models=expected,
         require_expected=True,
         max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
-        remaining_window_start=observation_time,
+        remaining_window_start=window_start,
         require_complete_remaining_window=True,
         conn=conn,
     )
-    future = tuple(
-        float(value)
-        for value in remaining_day_extremes_c(
-            vectors,
-            target_date=_date_text(request.target_date),
-            now=cutoff,
-            metric=metric,
-            window_start=observation_time,
-        )
+    future_values, _innovations = remaining_day_extremes_c_with_current_state(
+        vectors,
+        target_date=_date_text(request.target_date),
+        decision_time=cutoff,
+        metric=metric,
+        current_state=current_state,
+        settlement_unit=str(getattr(city, "settlement_unit", "") or "").upper(),
+        fallback_window_start=observation_time,
     )
+    future = tuple(float(value) for value in future_values)
     if not future:
         raise ValueError("DAY0_NOAA_PRELIMINARY_CARRIER_VECTOR_MISSING")
     return future, float(np.std(np.asarray(future), ddof=0)), cutoff.isoformat()
@@ -1555,6 +1579,7 @@ def _day0_noaa_carrier_future_members(
         request,
         metric=metric,
     )
+    decision_time = _to_utc(request.computed_at, field_name="computed_at")
     from src.data.station_forecast_adapter import load_station_forecast_config
 
     station_models = {
@@ -1567,6 +1592,14 @@ def _day0_noaa_carrier_future_members(
     )
     def unresolved_path_sigma(values: Sequence[float]) -> float:
         from src.config import runtime_cities_by_name
+        from src.data.day0_hourly_vectors import (
+            day0_effective_path_sigma_c,
+            read_day0_current_temperature_state,
+        )
+        from src.signal.day0_obs_latency import (
+            stale_extreme_uncertainty_margin,
+            staleness_budget_minutes,
+        )
         from src.signal.ensemble_signal import sigma_instrument_for_city
 
         city = runtime_cities_by_name().get(request.city)
@@ -1574,25 +1607,43 @@ def _day0_noaa_carrier_future_members(
             raise ValueError("DAY0_PROVISIONAL_CARRIER_CITY_MISSING")
         total_sigma = float(fusion.predictive_sigma_c)
         instrument_sigma = float(sigma_instrument_for_city(city).to("C").value)
-        center_sigma = float(np.std(np.asarray(values, dtype=float), ddof=0))
+        current_state = read_day0_current_temperature_state(
+            conn=conn,
+            city=city,
+            target_date=_date_text(request.target_date),
+            decision_time=decision_time,
+        )
+        margin = 0.0
+        if current_state is not None:
+            age_minutes = max(
+                0.0,
+                (decision_time - current_state.observed_at).total_seconds() / 60.0,
+            )
+            margin = stale_extreme_uncertainty_margin(
+                unit="C",
+                obs_age_minutes=age_minutes,
+                budget_minutes=staleness_budget_minutes(request.city),
+            )
         if (
             not math.isfinite(total_sigma)
             or total_sigma <= 0.0
             or not math.isfinite(instrument_sigma)
             or instrument_sigma < 0.0
-            or not math.isfinite(center_sigma)
         ):
             raise ValueError("DAY0_PROVISIONAL_CARRIER_VARIANCE_INVALID")
-        unresolved_variance = max(total_sigma**2 - center_sigma**2, 0.0)
-        extra_variance = max(unresolved_variance - instrument_sigma**2, 0.0)
-        return float(math.sqrt(extra_variance))
+        effective_sigma = day0_effective_path_sigma_c(
+            source_clock_predictive_sigma_c=total_sigma,
+            centers_c=values,
+            instrument_sigma_c=instrument_sigma,
+            observation_margin_c=margin,
+        )
+        return float(math.sqrt(max(effective_sigma**2 - instrument_sigma**2, 0.0)))
 
     if not requested:
         return future, unresolved_path_sigma(future), cutoff, ()
     serving = fusion.current_value_serving
     if not isinstance(serving, Mapping):
         raise ValueError("DAY0_STATION_CARRIER_SERVING_IDENTITY_MISSING")
-    decision_time = _to_utc(request.computed_at, field_name="computed_at")
     evidence: list[dict[str, object]] = []
     station_values: list[float] = []
     for raw_model in requested:
@@ -1687,11 +1738,20 @@ def _day0_remaining_vector_witness(
         from src.data.day0_hourly_vectors import (
             DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
             day0_hourly_models_for_city,
+            read_day0_current_temperature_state,
             read_freshest_day0_hourly_vectors,
         )
 
         city = runtime_cities_by_name().get(request.city)
         if city is None:
+            return None
+        current_state = read_day0_current_temperature_state(
+            conn=conn,
+            city=city,
+            target_date=_date_text(request.target_date),
+            decision_time=computed_at_utc,
+        )
+        if current_state is None:
             return None
         expected_models = tuple(
             str(model).strip()
@@ -1707,7 +1767,7 @@ def _day0_remaining_vector_witness(
             expected_models=expected_models,
             require_expected=True,
             max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
-            remaining_window_start=observation_time,
+            remaining_window_start=current_state.observed_at,
             require_complete_remaining_window=True,
             conn=conn,
         )

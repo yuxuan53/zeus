@@ -237,6 +237,27 @@ class Day0HourlyVector:
 
 
 @dataclass(frozen=True)
+class Day0CurrentTemperatureState:
+    """One canonical current-temperature witness for a Day0 path rebuild.
+
+    The running extreme remains settlement/probability-boundary evidence.  This
+    is deliberately separate trajectory evidence: it aligns the already-pinned
+    hourly provider path to the latest same-station current temperature.
+    """
+
+    value_native: float
+    observed_at: datetime
+    source: str
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "value_native": float(self.value_native),
+            "observed_at_utc": self.observed_at.astimezone(UTC).isoformat(),
+            "source": str(self.source),
+        }
+
+
+@dataclass(frozen=True)
 class Day0CausalBundleValidation:
     """Comparison result for one immutable Day0 vector/posterior bundle."""
 
@@ -2100,6 +2121,238 @@ def remaining_day_extremes_c(
             continue
         out.append(max(values) if metric == "high" else min(values))
     return out
+
+
+def read_day0_current_temperature_state(
+    *,
+    conn: sqlite3.Connection,
+    city: Any,
+    target_date: str,
+    decision_time: datetime,
+) -> Day0CurrentTemperatureState | None:
+    """Read the latest causal same-station temperature for a Day0 path.
+
+    The caller supplies the canonical forecasts connection, which may have the
+    world DB attached read-only.  This is intentionally a data-layer read so a
+    producer and a held monitor cannot implement different current-state
+    admission rules for the same vector carrier.
+    """
+
+    if decision_time.tzinfo is None:
+        return None
+    city_name = str(getattr(city, "name", "") or "").strip()
+    timezone_name = str(getattr(city, "timezone", "") or "").strip()
+    source_type = str(getattr(city, "settlement_source_type", "") or "").strip().lower()
+    unit = str(getattr(city, "settlement_unit", "") or "").strip().upper()
+    if not city_name or not timezone_name or unit not in {"C", "F"}:
+        return None
+    station = "HKO" if source_type == "hko" else str(
+        getattr(city, "wu_station", "") or ""
+    ).strip().upper()
+    if not station:
+        return None
+    if source_type == "wu_icao":
+        channels = ("wu_icao_history", "aviationweather_metar")
+    elif source_type == "hko":
+        channels = ("hko_rhrread_spot",)
+    elif source_type == "noaa":
+        channels = (f"ogimet_metar_{station.lower()}", "aviationweather_metar")
+    else:
+        return None
+    try:
+        target = date.fromisoformat(str(target_date)[:10])
+        tz = ZoneInfo(timezone_name)
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return None
+    attached = {str(row[1]) for row in conn.execute("PRAGMA database_list").fetchall()}
+    schema = "world" if "world" in attached else "main"
+    table = "world.observation_prints" if schema == "world" else "observation_prints"
+    if conn.execute(
+        f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = 'observation_prints'"
+    ).fetchone() is None:
+        return None
+    start = datetime.combine(target, datetime_time.min, tzinfo=tz).astimezone(UTC)
+    end = datetime.combine(target + timedelta(days=1), datetime_time.min, tzinfo=tz).astimezone(UTC)
+    placeholders = ",".join("?" for _ in channels)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT publish_ts_utc, value_native, unit, station_id, source_channel,
+                   raw_report, fetched_at_utc
+              FROM {table}
+             WHERE city = ?
+               AND source_channel IN ({placeholders})
+               AND publish_ts_utc >= ? AND publish_ts_utc < ?
+               AND publish_ts_utc <= ? AND julianday(fetched_at_utc) <= julianday(?)
+             ORDER BY publish_ts_utc DESC, id DESC
+            """,
+            (
+                city_name,
+                *channels,
+                (start - timedelta(hours=1)).isoformat(),
+                (end + timedelta(hours=1)).isoformat(),
+                decision_time.astimezone(UTC).isoformat(),
+                decision_time.astimezone(UTC).isoformat(),
+            ),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    for publish_raw, value_raw, unit_raw, station_raw, channel_raw, raw_report, fetched_raw in rows:
+        channel = str(channel_raw or "").strip().lower()
+        station_raw = str(station_raw or "").strip().upper()
+        if station_raw != station and not station_raw.startswith(f"{station}:"):
+            continue
+        try:
+            published = datetime.fromisoformat(str(publish_raw).replace("Z", "+00:00"))
+            fetched = datetime.fromisoformat(str(fetched_raw).replace("Z", "+00:00"))
+            value = float(value_raw)
+        except (TypeError, ValueError):
+            continue
+        if published.tzinfo is None or fetched.tzinfo is None or fetched.astimezone(UTC) > decision_time.astimezone(UTC):
+            continue
+        observation_time = published
+        if channel == "aviationweather_metar":
+            from src.data.day0_fast_obs import (
+                _T_GROUP_RE,
+                metar_observation_time_from_raw,
+                metar_t_group_temperature_c,
+            )
+
+            observation_time = metar_observation_time_from_raw(
+                str(raw_report or ""), published_at=published
+            )
+            if observation_time is None:
+                continue
+            if unit == "F":
+                if not _T_GROUP_RE.search(str(raw_report or "")):
+                    continue
+                precise_c = metar_t_group_temperature_c(str(raw_report or ""))
+                if precise_c is None:
+                    continue
+                value = precise_c * 9.0 / 5.0 + 32.0
+        elif str(unit_raw or "").strip().upper() != unit:
+            continue
+        if observation_time.astimezone(tz).date() != target or not math.isfinite(value):
+            continue
+        return Day0CurrentTemperatureState(
+            value_native=value,
+            observed_at=observation_time.astimezone(UTC),
+            source=str(channel_raw),
+        )
+    return None
+
+
+def remaining_day_extremes_c_with_current_state(
+    vectors: list[Day0HourlyVector],
+    *,
+    target_date: str,
+    decision_time: datetime,
+    metric: str,
+    current_state: Day0CurrentTemperatureState | None,
+    settlement_unit: str,
+    fallback_window_start: datetime,
+) -> tuple[list[float], dict[str, float]]:
+    """Apply the sole Day0 current-state transform, or the shared no-state path."""
+
+    if current_state is None:
+        return (
+            remaining_day_extremes_c(
+                vectors,
+                target_date=target_date,
+                now=decision_time,
+                metric=metric,
+                window_start=fallback_window_start,
+            ),
+            {},
+        )
+    if metric not in {"high", "low"} or settlement_unit not in {"C", "F"}:
+        raise ValueError("DAY0_CURRENT_STATE_INPUT_INVALID")
+    from src.config import day0_current_state_innovation_e_fold_hours
+    from src.signal.day0_window import condition_day0_hourly_members_on_current_state
+
+    observed_utc = current_state.observed_at.astimezone(UTC)
+    if observed_utc > decision_time.astimezone(UTC):
+        return [], {}
+    aligned = align_day0_hourly_vectors_on_common_causal_grid(
+        vectors, target_date=target_date, window_start=observed_utc
+    )
+    if aligned is None:
+        return [], {}
+    causal_grid, aligned_rows = aligned
+    current_c = (
+        float(current_state.value_native)
+        if settlement_unit == "C"
+        else (float(current_state.value_native) - 32.0) * 5.0 / 9.0
+    )
+    conditioned = condition_day0_hourly_members_on_current_state(
+        np.asarray([list(row) for row in aligned_rows], dtype=float),
+        [instant.isoformat() for instant in causal_grid],
+        observation_time=observed_utc,
+        current_temp=current_c,
+        e_fold_hours=day0_current_state_innovation_e_fold_hours(),
+    )
+    if conditioned is None:
+        return [], {}
+    conditioned_members, innovation_values = conditioned
+    remaining_indices = [
+        index for index, instant in enumerate(causal_grid) if instant > observed_utc
+    ]
+    if not remaining_indices:
+        target = date.fromisoformat(str(target_date)[:10])
+        try:
+            timezone_obj = ZoneInfo(str(vectors[0].timezone_name))
+        except (IndexError, ZoneInfoNotFoundError):
+            return [], {}
+        day_end = datetime.combine(
+            target + timedelta(days=1),
+            datetime_time.min,
+            tzinfo=timezone_obj,
+        ).astimezone(UTC)
+        if (
+            causal_grid[0] != causal_grid[-1]
+            or not timedelta(0) < day_end - observed_utc <= timedelta(hours=1)
+            or not timedelta(0) <= observed_utc - causal_grid[0] <= timedelta(hours=1)
+        ):
+            return [], {}
+        remaining_indices = [0]
+    remaining = conditioned_members[:, remaining_indices]
+    values = remaining.min(axis=1) if metric == "low" else remaining.max(axis=1)
+    return (
+        [float(value) for value in values.tolist()],
+        {
+            str(vector.model): float(innovation)
+            for vector, innovation in zip(vectors, innovation_values, strict=True)
+        },
+    )
+
+
+def day0_effective_path_sigma_c(
+    *,
+    source_clock_predictive_sigma_c: float,
+    centers_c: Iterable[float],
+    instrument_sigma_c: float,
+    observation_margin_c: float = 0.0,
+) -> float:
+    """One variance closure for producer and held Day0 carriers."""
+
+    centers = np.asarray(tuple(float(value) for value in centers_c), dtype=float)
+    total = float(source_clock_predictive_sigma_c)
+    instrument = float(instrument_sigma_c)
+    margin = float(observation_margin_c)
+    if (
+        not centers.size
+        or not np.isfinite(centers).all()
+        or not math.isfinite(total)
+        or total <= 0.0
+        or not math.isfinite(instrument)
+        or instrument < 0.0
+        or not math.isfinite(margin)
+        or margin < 0.0
+    ):
+        raise ValueError("DAY0_CURRENT_PATH_SIGMA_INVALID")
+    residual = math.sqrt(max(total**2 - float(np.std(centers, ddof=0)) ** 2, 0.0))
+    baseline = math.hypot(instrument, margin / 2.0)
+    return max(baseline, residual)
 
 
 # ---------------------------------------------------------------------------

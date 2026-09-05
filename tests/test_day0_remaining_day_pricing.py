@@ -43,15 +43,18 @@ from src.contracts.execution_price import ExecutionPrice as EP
 from src.contracts.settlement_semantics import SettlementSemantics
 from src.data.day0_hourly_vectors import (
     build_day0_causal_evidence_bundle,
+    Day0CurrentTemperatureState,
     Day0HourlyVector,
     align_day0_hourly_vectors_on_common_causal_grid,
     build_day0_remaining_probability_carrier,
+    day0_effective_path_sigma_c,
     day0_remaining_carrier_identity_inputs,
     fetch_day0_hourly_vectors,
     parse_openmeteo_hourly_payload,
     persist_day0_hourly_vectors,
     read_freshest_day0_hourly_vectors,
     remaining_day_extremes_c,
+    remaining_day_extremes_c_with_current_state,
     select_ready_day0_hourly_vectors,
     validate_day0_causal_evidence_bundle,
 )
@@ -249,6 +252,144 @@ def test_remaining_carrier_decision_clock_is_provenance_not_probability_content(
     assert later["q"] == first["q"]
     assert later["samples"] == first["samples"]
     assert changed_source["content_identity"] != first["content_identity"]
+
+
+@pytest.mark.parametrize("metric", ["high", "low"])
+def test_current_state_transform_keeps_materialized_and_held_carriers_identical(
+    metric: str,
+) -> None:
+    """One witness must determine both future centers and carrier identity."""
+    import src.engine.event_reactor_adapter as era
+
+    times = tuple(f"2026-06-10T{hour:02d}:00" for hour in range(24))
+    vectors = [
+        Day0HourlyVector(
+            model=model,
+            city="Paris",
+            target_date="2026-06-10",
+            timezone_name="Europe/Paris",
+            captured_at="2026-06-10T14:25:00+00:00",
+            times=times,
+            temps_c=tuple(base + hour * 0.1 for hour in range(24)),
+        )
+        for model, base in (("ecmwf_ifs", 20.0), ("icon_global", 20.5))
+    ]
+    state = Day0CurrentTemperatureState(
+        value_native=23.0,
+        observed_at=datetime(2026, 6, 10, 14, 20, tzinfo=UTC),
+        source="aviationweather_metar",
+    )
+    producer_values, _ = remaining_day_extremes_c_with_current_state(
+        vectors,
+        target_date="2026-06-10",
+        decision_time=datetime(2026, 6, 10, 14, 25, tzinfo=UTC),
+        metric=metric,
+        current_state=state,
+        settlement_unit="C",
+        fallback_window_start=datetime(2026, 6, 10, 13, 0, tzinfo=UTC),
+    )
+    held_values, _ = era._remaining_day_extremes_c_with_current_state_evidence(
+        vectors,
+        target_date="2026-06-10",
+        decision_time=datetime(2026, 6, 10, 14, 25, tzinfo=UTC),
+        observation_time=state.observed_at,
+        current_temp_c=state.value_native,
+        metric=metric,
+    )
+    assert held_values == pytest.approx(producer_values)
+
+    from src.signal.forecast_uncertainty import sigma_instrument
+
+    instrument_sigma = float(sigma_instrument("C").value)
+    effective_sigma = day0_effective_path_sigma_c(
+        source_clock_predictive_sigma_c=1.2,
+        centers_c=producer_values,
+        instrument_sigma_c=instrument_sigma,
+    )
+    path_sigma = np.sqrt(max(effective_sigma**2 - instrument_sigma**2, 0.0))
+    held_sigma_payload = {
+        "_edli_day0_source_clock_predictive_sigma_native": 1.2,
+        "_edli_day0_current_temperature_observed_at_utc": state.observed_at.isoformat(),
+    }
+    assert era._day0_process_sigma_native(
+        payload=held_sigma_payload,
+        family=SimpleNamespace(city="Paris"),
+        unit="C",
+        decision_time=datetime(2026, 6, 10, 14, 25, tzinfo=UTC),
+        members_native=producer_values,
+    ) == pytest.approx(effective_sigma)
+    identity = day0_remaining_carrier_identity_inputs(
+        city="Paris",
+        unit="C",
+        decision_time_utc="2026-06-10T14:25:00+00:00",
+        station_id="LFPG",
+        preliminary_survival_identity="likelihood-1",
+    )
+    identity["current_path_state"] = state.identity()
+    common = {
+        "future_extremes_c": producer_values,
+        "boundary_scenarios": ((22.0, 0.9), (None, 0.1)),
+        "metric": metric,
+        "path_error_sigma_c": path_sigma,
+        "instrument_sigma_c": instrument_sigma,
+        "bin_bounds_c": [(None, 21), (22, 22), (23, None)],
+        "n_point": 1000,
+        "n_samples": 500,
+        "settlement_semantics": _settlement_semantics("Paris"),
+    }
+    materialized = build_day0_remaining_probability_carrier(
+        **common, identity_inputs=identity
+    )
+    held = build_day0_remaining_probability_carrier(
+        **common, identity_inputs=dict(identity)
+    )
+    assert held["content_identity"] == materialized["content_identity"]
+    assert held["q"] == materialized["q"]
+
+    successor_identity = dict(identity)
+    successor_identity["current_path_state"] = {
+        **state.identity(), "value_native": 23.5
+    }
+    successor = build_day0_remaining_probability_carrier(
+        **common, identity_inputs=successor_identity
+    )
+    assert successor["content_identity"] != materialized["content_identity"]
+
+
+def test_live_day0_current_state_witness_is_required_by_both_consumers() -> None:
+    """Neither producer nor held monitor may claim current Day0 authority blind."""
+    import src.data.replacement_forecast_materializer as materializer
+    import src.engine.event_reactor_adapter as era
+
+    request = SimpleNamespace(
+        city="Paris",
+        target_date="2026-06-10",
+        computed_at="2026-06-10T14:25:00+00:00",
+        day0_observed_extreme_observation_time="2026-06-10T13:00:00+00:00",
+    )
+    conn = sqlite3.connect(":memory:")
+    with pytest.raises(
+        ValueError,
+        match="DAY0_NOAA_PRELIMINARY_CARRIER_CURRENT_TEMPERATURE_STATE_MISSING",
+    ):
+        materializer._day0_noaa_future_vector_members(
+            conn, request, metric="high"
+        )
+    payload = {
+        "metric": "high",
+        "observation_time": "2026-06-10T13:00:00+00:00",
+    }
+    assert era._day0_remaining_day_members(
+        payload=payload,
+        family=SimpleNamespace(city="Paris", target_date="2026-06-10", metric="high"),
+        unit="C",
+        decision_time=datetime(2026, 6, 10, 14, 25, tzinfo=UTC),
+        world_conn=conn,
+    ) is None
+    assert payload["_edli_day0_remaining_unavailable_reason"] == (
+        "current_temperature_state_unavailable"
+    )
+    conn.close()
 
 
 @pytest.mark.parametrize(
