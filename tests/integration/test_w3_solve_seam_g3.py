@@ -20139,6 +20139,70 @@ def test_global_book_metadata_refresh_tracks_unresolved_invalidation():
     ) == {probability.family_key}
 
 
+def test_global_book_malformed_invalidation_timestamp_fails_closed():
+    probability = _current_global_book_probability()
+    conn = _global_book_metadata_conn(probability)
+    conn.execute(
+        "ALTER TABLE executable_market_snapshot_latest ADD COLUMN captured_at TEXT"
+    )
+    conn.execute(
+        "UPDATE executable_market_snapshot_latest "
+        "SET captured_at = '2026-06-13T07:59:00+00:00'"
+    )
+    conn.executescript(
+        """
+        CREATE TABLE executable_market_snapshot_invalidations (
+            invalidation_id TEXT PRIMARY KEY,
+            condition_id TEXT,
+            token_id TEXT,
+            reason TEXT NOT NULL,
+            invalidated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_snapshot_invalidations_condition_time
+            ON executable_market_snapshot_invalidations (
+                condition_id, invalidated_at DESC
+            );
+        CREATE INDEX idx_snapshot_invalidations_token_time
+            ON executable_market_snapshot_invalidations (
+                token_id, invalidated_at DESC
+            );
+        """
+    )
+    binding = probability.bindings[0]
+    conn.execute(
+        """
+        INSERT INTO executable_market_snapshot_invalidations VALUES (
+            'malformed-clock', ?, ?, 'tick_size_change',
+            '2026-00-bad', '2026-06-13T08:00:00+00:00'
+        )
+        """,
+        (binding.condition_id, binding.yes_token_id),
+    )
+    checked_at = _dt.datetime(2026, 6, 13, 8, 0, tzinfo=_dt.timezone.utc)
+
+    snapshot_rows = universe._global_book_snapshot_rows(
+        conn,
+        condition_ids=(binding.condition_id,),
+        checked_at_utc=checked_at,
+    )
+    latest_rows = universe._global_book_latest_invalidation_rows(
+        conn,
+        condition_ids=(binding.condition_id,),
+        checked_at_utc=checked_at,
+    )
+
+    assert snapshot_rows
+    assert latest_rows
+    assert all(row["snapshot_invalidated"] for row in snapshot_rows)
+    assert all(row["snapshot_invalidated"] for row in latest_rows)
+    assert era._global_book_metadata_refresh_family_keys(
+        conn,
+        {probability.family_key: probability},
+        checked_at=checked_at,
+    ) == {probability.family_key}
+
+
 def test_global_book_metadata_refresh_hwm_survives_adapter_rebuild_scope(
     monkeypatch,
     tmp_path,

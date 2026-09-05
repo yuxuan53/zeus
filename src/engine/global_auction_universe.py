@@ -606,6 +606,8 @@ def _global_book_snapshot_rows(
             rows.append(item)
     condition_invalidated_at: dict[str, datetime] = {}
     token_invalidated_at: dict[str, datetime] = {}
+    invalid_condition_ids: set[str] = set()
+    invalid_token_ids: set[str] = set()
     if checked_at_utc is not None and _table_exists(
         trade_conn,
         "executable_market_snapshot_invalidations",
@@ -626,7 +628,6 @@ def _global_book_snapshot_rows(
             [("condition_id", value) for value in clean]
             + [("token_id", value) for value in tokens]
         )
-        checked_at_text = checked_at_utc.astimezone(timezone.utc).isoformat()
         for offset in range(0, len(selectors), 400):
             tranche = selectors[offset : offset + 400]
             condition_ids = tuple(
@@ -649,14 +650,11 @@ def _global_book_snapshot_rows(
                     "token_id IN (" + ",".join("?" for _ in token_ids) + ")"
                 )
                 parameters.extend(token_ids)
-            parameters.append(checked_at_text)
             invalidation_rows = trade_conn.execute(
                 f"""
-                SELECT condition_id, token_id, MAX(invalidated_at)
+                SELECT condition_id, token_id, invalidated_at
                   FROM executable_market_snapshot_invalidations
                  WHERE ({' OR '.join(predicates)})
-                   AND invalidated_at <= ?
-                 GROUP BY condition_id, token_id
                 """,
                 parameters,
             )
@@ -666,9 +664,17 @@ def _global_book_snapshot_rows(
                         str(raw_invalidated_at).replace("Z", "+00:00")
                     ).astimezone(timezone.utc)
                 except (TypeError, ValueError):
-                    continue
+                    invalidated_at = None
                 condition_id = str(raw_condition or "").strip()
                 token_id = str(raw_token or "").strip()
+                if invalidated_at is None:
+                    if condition_id:
+                        invalid_condition_ids.add(condition_id)
+                    if token_id:
+                        invalid_token_ids.add(token_id)
+                    continue
+                if invalidated_at > checked_at_utc:
+                    continue
                 if condition_id:
                     condition_invalidated_at[condition_id] = max(
                         invalidated_at,
@@ -701,8 +707,16 @@ def _global_book_snapshot_rows(
             token_invalidated_at.get(str(row.get("yes_token_id") or "")),
             token_invalidated_at.get(str(row.get("no_token_id") or "")),
         )
-        row["snapshot_invalidated"] = any(
-            value is not None and value >= captured_at for value in invalidated_at
+        row["snapshot_invalidated"] = bool(
+            str(row.get("condition_id") or "") in invalid_condition_ids
+            or str(row.get("selected_outcome_token_id") or "")
+            in invalid_token_ids
+            or str(row.get("yes_token_id") or "") in invalid_token_ids
+            or str(row.get("no_token_id") or "") in invalid_token_ids
+            or any(
+                value is not None and value >= captured_at
+                for value in invalidated_at
+            )
         )
     return rows
 
@@ -748,6 +762,8 @@ def _global_book_latest_invalidation_rows(
 
     condition_invalidated_at: dict[str, datetime] = {}
     token_invalidated_at: dict[str, datetime] = {}
+    invalid_condition_ids: set[str] = set()
+    invalid_token_ids: set[str] = set()
     if _table_exists(trade_conn, "executable_market_snapshot_invalidations"):
         tokens = tuple(
             dict.fromkeys(
@@ -765,7 +781,6 @@ def _global_book_latest_invalidation_rows(
             [("condition_id", value) for value in clean]
             + [("token_id", value) for value in tokens]
         )
-        checked_at_text = checked_at_utc.astimezone(timezone.utc).isoformat()
         for offset in range(0, len(selectors), 400):
             tranche = selectors[offset : offset + 400]
             condition_ids = tuple(
@@ -788,14 +803,11 @@ def _global_book_latest_invalidation_rows(
                     "token_id IN (" + ",".join("?" for _ in token_ids) + ")"
                 )
                 parameters.extend(token_ids)
-            parameters.append(checked_at_text)
             invalidation_rows = trade_conn.execute(
                 f"""
-                SELECT condition_id, token_id, MAX(invalidated_at)
+                SELECT condition_id, token_id, invalidated_at
                   FROM executable_market_snapshot_invalidations
                  WHERE ({' OR '.join(predicates)})
-                   AND invalidated_at <= ?
-                 GROUP BY condition_id, token_id
                 """,
                 parameters,
             )
@@ -805,9 +817,17 @@ def _global_book_latest_invalidation_rows(
                         str(raw_invalidated_at).replace("Z", "+00:00")
                     ).astimezone(timezone.utc)
                 except (TypeError, ValueError):
-                    continue
+                    invalidated_at = None
                 condition_id = str(raw_condition or "").strip()
                 token_id = str(raw_token or "").strip()
+                if invalidated_at is None:
+                    if condition_id:
+                        invalid_condition_ids.add(condition_id)
+                    if token_id:
+                        invalid_token_ids.add(token_id)
+                    continue
+                if invalidated_at > checked_at_utc:
+                    continue
                 if condition_id:
                     condition_invalidated_at[condition_id] = max(
                         invalidated_at,
@@ -826,28 +846,32 @@ def _global_book_latest_invalidation_rows(
                     )
 
     for row in rows:
-            try:
-                captured_at = datetime.fromisoformat(
-                    str(row.get("captured_at") or "").replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
-            except (TypeError, ValueError):
-                row["snapshot_invalidated"] = False
-            else:
-                identities = (
-                    condition_invalidated_at.get(
-                        str(row.get("condition_id") or "")
-                    ),
-                    token_invalidated_at.get(
-                        str(row.get("selected_outcome_token_id") or "")
-                    ),
-                    token_invalidated_at.get(str(row.get("yes_token_id") or "")),
-                    token_invalidated_at.get(str(row.get("no_token_id") or "")),
-                )
-                row["snapshot_invalidated"] = any(
-                    invalidated_at is not None
-                    and invalidated_at >= captured_at
-                    for invalidated_at in identities
-                )
+        try:
+            captured_at = datetime.fromisoformat(
+                str(row.get("captured_at") or "").replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            row["snapshot_invalidated"] = False
+            continue
+        identities = (
+            condition_invalidated_at.get(str(row.get("condition_id") or "")),
+            token_invalidated_at.get(
+                str(row.get("selected_outcome_token_id") or "")
+            ),
+            token_invalidated_at.get(str(row.get("yes_token_id") or "")),
+            token_invalidated_at.get(str(row.get("no_token_id") or "")),
+        )
+        row["snapshot_invalidated"] = bool(
+            str(row.get("condition_id") or "") in invalid_condition_ids
+            or str(row.get("selected_outcome_token_id") or "")
+            in invalid_token_ids
+            or str(row.get("yes_token_id") or "") in invalid_token_ids
+            or str(row.get("no_token_id") or "") in invalid_token_ids
+            or any(
+                invalidated_at is not None and invalidated_at >= captured_at
+                for invalidated_at in identities
+            )
+        )
     return rows
 
 

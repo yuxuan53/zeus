@@ -2024,7 +2024,6 @@ def _global_book_metadata_refresh_family_keys(
         [("condition_id", value) for value in families_by_condition]
         + [("token_id", value) for value in families_by_token]
     )
-    checked_at_text = checked_at.astimezone(timezone.utc).isoformat()
     for offset in range(0, len(selectors), 400):
         tranche = selectors[offset : offset + 400]
         condition_ids = tuple(
@@ -2043,13 +2042,11 @@ def _global_book_metadata_refresh_family_keys(
                 "token_id IN (" + ",".join("?" for _ in token_ids) + ")"
             )
             parameters.extend(token_ids)
-        parameters.append(checked_at_text)
         rows = trade_conn.execute(
             f"""
             SELECT condition_id, token_id, invalidated_at
               FROM executable_market_snapshot_invalidations
              WHERE ({' OR '.join(predicates)})
-               AND invalidated_at <= ?
             """,
             parameters,
         )
@@ -2063,6 +2060,8 @@ def _global_book_metadata_refresh_family_keys(
                 invalidated_at = invalidated_at.astimezone(timezone.utc)
             except (TypeError, ValueError):
                 invalidated_at = None
+            if invalidated_at is not None and invalidated_at > checked_at:
+                continue
             affected = set(
                 families_by_condition.get(str(raw_condition or "").strip(), ())
             )
