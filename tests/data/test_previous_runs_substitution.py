@@ -4539,6 +4539,16 @@ def test_own_clock_station_revision_enters_priority_without_becoming_held(
     assert priority[station.name][0] == -9.0
     assert gridded.name not in priority_names
 
+    request_payload = {
+        **common,
+        "city": "Hong Kong",
+        "target_date": "2026-09-04",
+        "temperature_metric": "low",
+        "upgrade_trigger": "day0_observation_advanced",
+        "day0_observed_extreme_source": "hko_hourly_accumulator",
+    }
+    assert queue_mod._is_own_clock_station_input_revision(request_payload)
+
     backlog = tuple(tmp_path / f"ordinary-{index:03d}.json" for index in range(80))
     ordered = queue_mod._prioritize_own_clock_station_revision_files(
         (*backlog, gridded, station)

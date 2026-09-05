@@ -1911,11 +1911,19 @@ def _is_own_clock_station_input_revision(
     """Return whether fresh station evidence should use the one-second q lane."""
 
     sources = payload.get("input_revision_sources")
-    if not isinstance(sources, (list, tuple)):
-        return False
+    revision_sources = (
+        sources if isinstance(sources, (list, tuple)) else ()
+    )
+    day0_source = str(
+        payload.get("day0_observed_extreme_source") or ""
+    ).strip()
     return any(
         str(source).strip().startswith(("hko_", "cwa_"))
-        for source in sources
+        for source in revision_sources
+    ) or (
+        str(payload.get("upgrade_trigger") or "").strip()
+        == "day0_observation_advanced"
+        and day0_source.startswith(("hko_", "cwa_"))
     )
 
 
