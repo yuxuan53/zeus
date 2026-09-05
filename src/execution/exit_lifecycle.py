@@ -14138,7 +14138,7 @@ def _held_monitor_preparation_cutoff(
     *,
     reserve_primary_redecision: bool = True,
 ) -> float:
-    """Cap monitor bootstrap so it cannot consume the first complete q read."""
+    """Let prerequisites finish while preserving one complete q-read tranche."""
 
     outer_deadline = float(monitor_deadline_monotonic)
     now = _time_module.monotonic()
@@ -14151,14 +14151,14 @@ def _held_monitor_preparation_cutoff(
     remaining = outer_deadline - now
     if not math.isfinite(remaining) or remaining <= primary_reserve:
         return now
-    # Bootstrap is prerequisite work, not held-position redecision. Give it at
-    # most one q-read tranche and preserve another complete tranche for the
-    # probability/book path. SCOPE: this monitor attempt's DB/watchdog/load/
-    # allocator preparation only. DRAIN: the recurring monitor retries after
-    # the incumbent DB writer commits. RESET: the next attempt recomputes this
-    # cutoff from its own fresh claim.
-    preparation_budget = min(primary_reserve, remaining - primary_reserve)
-    return min(outer_deadline, now + preparation_budget)
+    # Bootstrap is prerequisite work: repeatedly cancelling a nearly-complete
+    # canonical read at one arbitrary q-width makes no forward progress under
+    # I/O pressure.  Spend any claim slack on that prerequisite while keeping
+    # one full q-read tranche inviolate for the probability/book path. SCOPE:
+    # this monitor attempt's DB/watchdog/load/allocator preparation only.
+    # DRAIN: the same claim completes or the outer deadline interrupts it.
+    # RESET: the next attempt recomputes both clocks from current monotonic time.
+    return outer_deadline - primary_reserve
 
 
 def held_monitor_pre_artifact_reserve_seconds() -> float:

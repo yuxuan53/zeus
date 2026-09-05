@@ -23311,7 +23311,7 @@ def test_monitor_preparation_cutoff_preserves_one_complete_probability_read(
     cutoff = exit_lifecycle._held_monitor_preparation_cutoff(85.0)
 
     assert cutoff == pytest.approx(
-        10.0 + HELD_MONITOR_PRIMARY_BELIEF_READ_MAX_SECONDS
+        85.0 - HELD_MONITOR_PRIMARY_BELIEF_READ_MAX_SECONDS
     )
     assert 85.0 - cutoff >= HELD_MONITOR_PRIMARY_BELIEF_READ_MAX_SECONDS
 
