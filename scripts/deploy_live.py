@@ -2220,9 +2220,10 @@ def _quote_only_monitor_repair_handoff_admission(
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:open_partition_incomplete"
     # Closed-market positions do not acquire a newer executable quote by
-    # waiting. Partition restart blockers by their own monitor clock: a fresh
-    # typed failure can hand off to the pending repair, while each stale failure
-    # must independently prove that no legal SELL exists before stop.
+    # waiting. Partition restart blockers by their own monitor clock for exact
+    # classification, but never treat a fresh failure as CLOB authority: every
+    # non-settlement restart blocker must independently prove that no legal SELL
+    # exists before stop.
     stale_failed_set = restart_ids & stale_timestamp_set
     fresh_failed_set = restart_ids - stale_timestamp_set
     stale_settlement_set = settlement_set & stale_timestamp_set
@@ -2259,15 +2260,15 @@ def _quote_only_monitor_repair_handoff_admission(
     no_exit_snapshot_ids = (
         _current_quote_only_repair_snapshot_ids(
             trade_db,
-            position_ids=tuple(stale_failed_set),
+            position_ids=tuple(restart_ids),
             require_no_executable_exit=True,
         )
-        if stale_failed_set
+        if restart_ids
         else ()
     )
     missing_no_exit_ids = tuple(
         position_id
-        for position_id in stale_failed_set
+        for position_id in restart_ids
         if position_id not in no_exit_snapshot_ids
     )
     if missing_no_exit_ids:
@@ -2280,7 +2281,7 @@ def _quote_only_monitor_repair_handoff_admission(
                 ))
             )
         )
-    if set(no_exit_snapshot_ids) != stale_failed_set:
+    if set(no_exit_snapshot_ids) != restart_ids:
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:executable_exit_unprotected"
     quote_sidecar = _held_quote_sidecar_current_evidence()
     if quote_sidecar.get("current") is not True:
@@ -2296,7 +2297,7 @@ def _quote_only_monitor_repair_handoff_admission(
         f"quote_only_positions={len(quote_ids)} exact_held_books=current "
         f"fresh_failed_positions={len(fresh_failed_set)} "
         f"stale_failed_positions={len(stale_failed_set)} "
-        f"no_executable_exit_positions={len(stale_failed_set)} "
+        f"no_executable_exit_positions={len(restart_ids)} "
         f"settlement_recoverable_positions={len(settlement_ids)} "
         "durable_entries_pause=true nonterminal_commands=0 "
         "restart_permission_only=true",
