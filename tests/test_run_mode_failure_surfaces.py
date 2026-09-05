@@ -9856,6 +9856,7 @@ def test_targeted_monitor_absorbs_every_canonically_overdue_family(
     import src.main as main_module
 
     captured = {}
+    bounded_claims = []
 
     class ReactorGate:
         def acquire(self, *, timeout: float) -> bool:
@@ -9875,6 +9876,12 @@ def test_targeted_monitor_absorbs_every_canonically_overdue_family(
         ),
     )
     monkeypatch.setattr(main_module, "_edli_reactor_active_lock", ReactorGate())
+    monkeypatch.setattr(
+        main_module,
+        "_held_position_monitor_claim_budget_seconds",
+        lambda *, periodic_full_book: bounded_claims.append(periodic_full_book)
+        or 29.0,
+    )
 
     def run(**kwargs) -> bool:
         captured.update(kwargs)
@@ -9901,6 +9908,7 @@ def test_targeted_monitor_absorbs_every_canonically_overdue_family(
             ("Moscow", "2026-08-12", "high"),
         }
     )
+    assert bounded_claims == [True]
 
 
 def test_targeted_monitor_preempts_only_for_new_canonical_cadence_debt(
