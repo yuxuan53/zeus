@@ -5453,6 +5453,171 @@ def test_deploy_live_pre_stop_handoff_classifies_current_all_no_action_failures(
     assert handoff["fresh_failed_monitor_timestamp_stale_position_ids"] == ()
 
 
+@pytest.mark.parametrize(
+    ("held_bid", "expected_ok"),
+    (("0.0", True), ("0.05", False), ("UNKNOWN", False)),
+)
+def test_deploy_live_decision_unavailable_deadline_handoff_requires_no_sell(
+    monkeypatch, tmp_path, held_bid, expected_ok
+):
+    """Fresh q/book plus deadline failure is safe only with exact no-SELL proof."""
+    dl = _load(
+        f"deploy_live_restart_decision_deadline_{held_bid}",
+        "deploy_live.py",
+    )
+    trade_db = tmp_path / "zeus_trades.db"
+    conn = sqlite3.connect(trade_db)
+    conn.executescript(
+        """
+        CREATE TABLE position_current (
+            position_id TEXT PRIMARY KEY,
+            condition_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            no_token_id TEXT NOT NULL
+        );
+        CREATE TABLE executable_market_snapshot_latest (
+            condition_id TEXT NOT NULL,
+            selected_outcome_token_id TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            closed INTEGER NOT NULL,
+            accepting_orders INTEGER,
+            orderbook_top_bid TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            freshness_deadline TEXT NOT NULL,
+            tradeability_status_json TEXT NOT NULL
+        );
+        INSERT INTO position_current VALUES (
+            'pos-deadline', 'condition-deadline', 'buy_yes',
+            'held-token', 'no-token'
+        );
+        """
+    )
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO executable_market_snapshot_latest VALUES (?, ?, 1, 0, 1, ?, ?, ?, ?)",
+        (
+            "condition-deadline",
+            "held-token",
+            held_bid,
+            now.isoformat(),
+            (now + timedelta(minutes=3)).isoformat(),
+            json.dumps({"executable_allowed": True}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    occurred_at = now.isoformat()
+    evidence = {
+        "open_position_count": 1,
+        "monitored_position_ids": ["pos-deadline"],
+        "fresh_position_count": 0,
+        "stale_or_missing_position_count": 1,
+        "stale_or_missing_positions": [
+            {
+                "position_id": "pos-deadline",
+                "issue": "monitor_exit_decision_unavailable",
+                "last_monitor_refreshed_at": occurred_at,
+            }
+        ],
+        "blocking_stale_position_count": 1,
+        "blocking_stale_positions": [
+            {
+                "position_id": "pos-deadline",
+                "issue": "monitor_exit_decision_unavailable",
+                "last_monitor_refreshed_at": occurred_at,
+            }
+        ],
+        "quote_only_stale_position_count": 0,
+        "quote_only_stale_positions": [],
+        "probability_only_stale_position_count": 0,
+        "probability_only_stale_positions": [],
+        "settlement_recoverable_position_count": 0,
+        "settlement_recoverable_positions": [],
+        "future_monitor_event_count": 0,
+        "non_monitor_chain_risk_position_count": 0,
+    }
+    monkeypatch.setattr(
+        dl,
+        "collect_monitor_cadence_evidence",
+        lambda *_args, **_kwargs: evidence,
+    )
+    monkeypatch.setattr(
+        dl,
+        "_current_quote_only_repair_live_book_ids",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_held_quote_sidecar_current_evidence",
+        lambda: {"current": True, "age_seconds": 1.0},
+    )
+
+    handoff = dl._pre_stop_monitor_handoff_evidence(trade_db)
+    ok, detail = dl._quote_only_monitor_repair_handoff_admission(
+        trade_db=trade_db,
+        obligations={
+            "open_position_count": 1,
+            "nonterminal_command_count": 0,
+            "all_open_position_ids": ("pos-deadline",),
+        },
+        pause_state={"entries_paused": True},
+        handoff=handoff,
+        repair_pending={"pending": True},
+    )
+
+    assert handoff["fresh_failed_monitor_no_action_position_ids"] == (
+        "pos-deadline",
+    )
+    assert ok is expected_ok
+    if expected_ok:
+        assert "fresh_failed_positions=1" in detail
+        assert "no_executable_exit_positions=1" in detail
+    else:
+        assert detail.endswith("executable_exit_unprotected")
+
+
+def test_deploy_live_available_monitor_decision_is_not_no_action_handoff(
+    monkeypatch, tmp_path
+):
+    """An available HOLD/SELL event cannot enter the repair-only partition."""
+    dl = _load("deploy_live_restart_available_decision", "deploy_live.py")
+    trade_db = tmp_path / "zeus_trades.db"
+    sqlite3.connect(trade_db).close()
+    position = {
+        "position_id": "pos-decided",
+        "last_monitor_refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    evidence = {
+        "open_position_count": 1,
+        "monitored_position_ids": ["pos-decided"],
+        "fresh_position_count": 0,
+        "blocking_stale_position_count": 1,
+        "blocking_stale_positions": [position],
+        "quote_only_stale_position_count": 0,
+        "quote_only_stale_positions": [],
+        "probability_only_stale_position_count": 0,
+        "probability_only_stale_positions": [],
+        "settlement_recoverable_position_count": 0,
+        "settlement_recoverable_positions": [],
+        "future_monitor_event_count": 0,
+        "non_monitor_chain_risk_position_count": 0,
+    }
+    monkeypatch.setattr(
+        dl,
+        "collect_monitor_cadence_evidence",
+        lambda *_args, **_kwargs: evidence,
+    )
+
+    handoff = dl._pre_stop_monitor_handoff_evidence(trade_db)
+
+    assert handoff["restart_blocking_position_ids"] == ("pos-decided",)
+    assert handoff["fresh_failed_monitor_no_action_position_ids"] == ()
+    assert handoff["fresh_failed_monitor_other_classified_position_ids"] == (
+        "pos-decided",
+    )
+
+
 def test_deploy_live_monitor_handoff_age_boundary_is_fresh_then_stale():
     """The exact upper boundary is fresh; only older evidence is stuck."""
     dl = _load("deploy_live_monitor_handoff_age_boundary", "deploy_live.py")

@@ -193,16 +193,6 @@ LIVE_MONITOR_CADENCE_CONTRACT_SECONDS = (
 # monitor pass.  Only that total-stall shape may recover by stopping it.
 LIVE_STUCK_MONITOR_RECOVERY_STALE_SECONDS = LIVE_MONITOR_CADENCE_CONTRACT_SECONDS
 LIVE_HELD_QUOTE_SIDECAR_MAX_AGE_SECONDS = 180.0
-FRESH_FAILED_MONITOR_NO_ACTION_ISSUES = frozenset(
-    {
-        # A current MONITOR_REFRESHED attempt explicitly found neither
-        # probability nor held-side CLOB authority. It is not actionable, and
-        # cannot stand in for a current price/probability handoff.
-        "monitor_probability_and_clob_stale",
-    }
-)
-
-
 def _monitor_handoff_age_is_stale(*, now: datetime, occurred_at: datetime) -> bool:
     """Classify the exclusive stale side of the monitor handoff boundary.
 
@@ -1319,7 +1309,11 @@ def _pre_stop_monitor_handoff_evidence(trade_db: Path) -> dict[str, object]:
     fresh_failed_restart_positions = [
         item
         for item in restart_blocking_positions
-        if str(item.get("issue") or "") in FRESH_FAILED_MONITOR_NO_ACTION_ISSUES
+        # ``monitor_*`` issues are emitted only when the latest monitor event
+        # lacks current redecision authority. A decision-available HOLD/SELL
+        # has no issue and must not enter this repair-only partition. Exact
+        # current no-SELL proof is still required by restart admission.
+        if str(item.get("issue") or "").startswith("monitor_")
     ]
     # ``collect_monitor_cadence_evidence`` gives this category only to the
     # canonical closed-market hold shape or an exact backoff-exhausted dust
