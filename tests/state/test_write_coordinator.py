@@ -715,3 +715,126 @@ def test_multi_db_transaction_is_rejected_instead_of_faked(tmp_path: Path) -> No
             owner="bad-cross-db",
         ):
             raise AssertionError("multi-DB independent transaction must not open")
+
+
+def test_owner_telemetry_is_visible_during_acquire_and_cleared_on_release(
+    tmp_path: Path,
+) -> None:
+    coordinator = WriteCoordinator(_db_paths(tmp_path), telemetry_capacity=4)
+
+    with coordinator.lease(
+        (DBIdentity.TRADE,),
+        owner="owner-visible",
+        priority=WritePriority.MONITOR,
+        deadline_ms=500,
+        max_hold_ms=250,
+    ):
+        active = coordinator.current_owner_snapshot()
+        assert len(active) == 1
+        row = active[0]
+        assert row.owner == "owner-visible"
+        assert row.active is True
+        assert row.event == "acquire"
+        assert row.db_set == ("trade",)
+        assert row.db_paths == (str(_db_paths(tmp_path)[DBIdentity.TRADE].resolve()),)
+        assert row.pid == os.getpid()
+        assert row.tid == getattr(threading, "get_native_id", threading.get_ident)()
+        assert row.acquired_monotonic is not None
+        assert row.acquired_wall_time is not None
+        assert row.priority == WritePriority.MONITOR.value
+        assert row.deadline_ms == 500
+        assert row.max_hold_ms == 250
+        assert coordinator.telemetry_snapshot()[0] == row
+
+    assert coordinator.current_owner_snapshot() == ()
+    history = coordinator.telemetry_history_snapshot()
+    assert len(history) == 1
+    released = history[0]
+    assert released.active is False
+    assert released.event == "release"
+    assert released.released_monotonic is not None
+    assert released.released_wall_time is not None
+    assert released.duration_ms >= released.wait_ms
+    assert released.stage == "release"
+
+
+def test_owner_telemetry_records_contention_stage_and_current_holder(
+    tmp_path: Path,
+) -> None:
+    coordinator = WriteCoordinator(_db_paths(tmp_path), telemetry_capacity=4)
+    entered = threading.Event()
+
+    with coordinator.lease((DBIdentity.TRADE,), owner="holder"):
+        def _waiter() -> None:
+            with pytest.raises(WriteLeaseTimeout):
+                with coordinator.lease(
+                    (DBIdentity.TRADE,),
+                    owner="contender",
+                    deadline_ms=40,
+                ):
+                    entered.set()
+
+        waiter = threading.Thread(target=_waiter)
+        waiter.start()
+        waiter.join(timeout=1.0)
+        assert not waiter.is_alive()
+        assert not entered.is_set()
+        current = coordinator.current_owner_snapshot()
+        assert current and current[0].owner == "holder"
+
+    contender = [
+        row
+        for row in coordinator.telemetry_history_snapshot()
+        if row.owner == "contender"
+    ][0]
+    assert contender.event == "error"
+    assert contender.error == "WriteLeaseTimeout"
+    assert contender.stage in {"process_lock", "file_flock", "turnstile", "publication"}
+    assert contender.duration_ms > 0.0
+
+
+def test_busy_snapshot_keeps_extended_sqlite_classification(tmp_path: Path) -> None:
+    telemetry: list[WriteLeaseTelemetry] = []
+    coordinator = WriteCoordinator(
+        {DBIdentity.TRADE: tmp_path / "busy-snapshot.db"},
+        telemetry_sink=telemetry.append,
+    )
+
+    class BusySnapshot(sqlite3.OperationalError):
+        sqlite_errorcode = sqlite3.SQLITE_BUSY_SNAPSHOT
+        sqlite_errorname = "SQLITE_BUSY_SNAPSHOT"
+
+    class Connection:
+        def execute(self, sql: str):
+            if sql == "PRAGMA busy_timeout":
+                class _Result:
+                    def fetchone(self):
+                        return (30_000,)
+
+                return _Result()
+            if sql.startswith("PRAGMA busy_timeout ="):
+                return []
+            raise BusySnapshot("database is locked")
+
+    conn = Connection()
+    with pytest.raises(WriteLeaseTimeout, match="SQLITE_BUSY_SNAPSHOT"):
+        with coordinator.lease((DBIdentity.TRADE,), owner="busy-snapshot") as lease:
+            lease.record_stage("sqlite_begin")
+            with bounded_sqlite_write(conn, lease, max_hold_ms=100):
+                conn.execute("INSERT")
+
+    row = telemetry[0]
+    assert row.sqlite_errorcode == sqlite3.SQLITE_BUSY_SNAPSHOT
+    assert row.sqlite_errorname == "SQLITE_BUSY_SNAPSHOT"
+    assert row.stage == "sqlite_begin"
+
+
+def test_owner_telemetry_history_is_bounded(tmp_path: Path) -> None:
+    coordinator = WriteCoordinator(_db_paths(tmp_path), telemetry_capacity=2)
+    for index in range(3):
+        with coordinator.lease((DBIdentity.WORLD,), owner=f"bounded-{index}"):
+            pass
+
+    history = coordinator.telemetry_history_snapshot()
+    assert len(history) == 2
+    assert [row.owner for row in history] == ["bounded-1", "bounded-2"]

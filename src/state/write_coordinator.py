@@ -18,6 +18,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping
@@ -105,6 +106,43 @@ class WriteLeaseTelemetry:
     deadline_exceeded: bool
     hold_limit_exceeded: bool
     error: str | None = None
+    # The fields below are deliberately process-local and JSON-friendly.  They
+    # make a lease useful while it is still held; the old sink remains a
+    # completed-lease export for backwards compatibility.
+    event: str = "release"
+    active: bool = False
+    pid: int | None = None
+    tid: int | None = None
+    acquired_monotonic: float | None = None
+    acquired_wall_time: float | None = None
+    released_monotonic: float | None = None
+    released_wall_time: float | None = None
+    duration_ms: float = 0.0
+    stage: str | None = None
+    sqlite_errorcode: int | None = None
+    sqlite_errorname: str | None = None
+
+    @property
+    def sqlite_error_name(self) -> str | None:
+        """Spelling used by some structured-log consumers."""
+
+        return self.sqlite_errorname
+
+    @property
+    def acquire_monotonic(self) -> float | None:
+        return self.acquired_monotonic
+
+    @property
+    def release_monotonic(self) -> float | None:
+        return self.released_monotonic
+
+    @property
+    def acquire_wall_time(self) -> float | None:
+        return self.acquired_wall_time
+
+    @property
+    def release_wall_time(self) -> float | None:
+        return self.released_wall_time
 
 
 @dataclass
@@ -112,6 +150,10 @@ class _LeaseMetrics:
     commit_ms: float = 0.0
     rows_changed: int | None = None
     error: str | None = None
+    stage: str | None = None
+    sqlite_errorcode: int | None = None
+    sqlite_errorname: str | None = None
+    acquired_wall_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +174,22 @@ class WriteLease:
         self._metrics.commit_ms = max(0.0, commit_ms)
         self._metrics.rows_changed = rows_changed
 
+    def record_stage(self, stage: str) -> None:
+        """Expose the current acquisition/SQLite boundary to diagnostics."""
+
+        self._metrics.stage = stage
+
+    def record_sqlite_error(
+        self,
+        exc: BaseException,
+        *,
+        stage: str,
+    ) -> None:
+        self._metrics.stage = stage
+        self._metrics.sqlite_errorcode, self._metrics.sqlite_errorname = (
+            _sqlite_error_details(exc)
+        )
+
 
 def _sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     code = getattr(exc, "sqlite_errorcode", None)
@@ -142,6 +200,23 @@ def _sqlite_busy(exc: sqlite3.OperationalError) -> bool:
         return True
     message = str(exc).lower()
     return "database is locked" in message or "database table is locked" in message
+
+
+def _sqlite_error_details(exc: BaseException) -> tuple[int | None, str | None]:
+    """Return SQLite's extended code/name without collapsing BUSY_SNAPSHOT."""
+
+    code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(code, int):
+        return None, None
+    name = getattr(exc, "sqlite_errorname", None)
+    if not isinstance(name, str) or not name:
+        known_names = {
+            sqlite3.SQLITE_BUSY: "SQLITE_BUSY",
+            sqlite3.SQLITE_BUSY_SNAPSHOT: "SQLITE_BUSY_SNAPSHOT",
+            sqlite3.SQLITE_LOCKED: "SQLITE_LOCKED",
+        }
+        name = known_names.get(code)
+    return code, name
 
 
 @contextlib.contextmanager
@@ -185,9 +260,13 @@ def bounded_sqlite_write(
     try:
         yield
     except sqlite3.OperationalError as exc:
+        stage = lease._metrics.stage or "sqlite"
+        lease.record_sqlite_error(exc, stage=stage)
         if _sqlite_busy(exc):
+            name = lease._metrics.sqlite_errorname or "SQLITE_BUSY"
             raise WriteLeaseTimeout(
-                f"SQLite write deferred within hold budget for owner={lease.owner}"
+                "SQLite write deferred within hold budget "
+                f"for owner={lease.owner} stage={stage} sqlite_errorname={name}"
             ) from exc
         raise
     finally:
@@ -290,9 +369,15 @@ class WriteCoordinator:
         telemetry_sink: Callable[[WriteLeaseTelemetry], None] | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
+        telemetry_ring_size: int = 128,
+        telemetry_capacity: int | None = None,
     ) -> None:
         if not db_paths:
             raise ValueError("WriteCoordinator requires at least one DB path")
+        if telemetry_capacity is not None:
+            telemetry_ring_size = telemetry_capacity
+        if telemetry_ring_size <= 0:
+            raise ValueError("telemetry_ring_size must be positive")
         self._db_paths = {
             _coerce_db_identity(db): _resolve_path(path)
             for db, path in db_paths.items()
@@ -307,6 +392,120 @@ class WriteCoordinator:
         self._pending_monitor_waiters = {
             path: 0 for path in set(self._db_paths.values())
         }
+        self._telemetry_lock = threading.Lock()
+        self._telemetry_ring: deque[WriteLeaseTelemetry] = deque(
+            maxlen=telemetry_ring_size
+        )
+        self._active_telemetry: dict[int, WriteLeaseTelemetry] = {}
+
+    def telemetry_snapshot(self) -> tuple[WriteLeaseTelemetry, ...]:
+        """Return an immutable, read-only view of active rows and history.
+
+        Active rows are returned first so a diagnostic can answer "who owns this
+        DB now?" without polling a sink.  The returned tuple and rows are
+        immutable; this method never touches a DB or performs filesystem I/O.
+        """
+
+        with self._telemetry_lock:
+            return tuple(self._active_telemetry.values()) + tuple(self._telemetry_ring)
+
+    # Explicit aliases keep the accessor discoverable to diagnostics callers
+    # without making callers depend on the private ring implementation.
+    snapshot_telemetry = telemetry_snapshot
+
+    def current_owner_snapshot(self) -> tuple[WriteLeaseTelemetry, ...]:
+        """Return only currently-held lease owner rows."""
+
+        with self._telemetry_lock:
+            return tuple(self._active_telemetry.values())
+
+    def telemetry_history_snapshot(self) -> tuple[WriteLeaseTelemetry, ...]:
+        """Return completed/error rows retained by the bounded ring."""
+
+        with self._telemetry_lock:
+            return tuple(self._telemetry_ring)
+
+    def _record_acquired_telemetry(
+        self,
+        lease: WriteLease,
+        *,
+        acquired_wall_time: float,
+        deadline_ms: int | None,
+        max_hold_ms: int | None,
+    ) -> None:
+        row = WriteLeaseTelemetry(
+            owner=lease.owner,
+            db_set=tuple(db.value for db in lease.db_set),
+            db_paths=tuple(str(path) for path in lease.db_paths),
+            write_class=lease.write_class.value,
+            priority=lease.priority.value,
+            wait_ms=0.0,
+            hold_ms=0.0,
+            commit_ms=0.0,
+            rows_changed=None,
+            deadline_ms=deadline_ms,
+            max_hold_ms=max_hold_ms,
+            deadline_exceeded=False,
+            hold_limit_exceeded=False,
+            event="acquire",
+            active=True,
+            pid=os.getpid(),
+            tid=getattr(threading, "get_native_id", threading.get_ident)(),
+            acquired_monotonic=lease.acquired_at,
+            acquired_wall_time=acquired_wall_time,
+            stage="lease_acquired",
+        )
+        with self._telemetry_lock:
+            self._active_telemetry[id(lease)] = row
+
+    def _record_released_telemetry(
+        self,
+        lease: WriteLease,
+        *,
+        started: float,
+        released_at: float,
+        released_wall_time: float,
+        deadline_ms: int | None,
+        max_hold_ms: int | None,
+        deadline_exceeded: bool,
+    ) -> None:
+        metrics = lease._metrics
+        hold_ms = max(0.0, (released_at - lease.acquired_at) * 1000.0)
+        row = WriteLeaseTelemetry(
+            owner=lease.owner,
+            db_set=tuple(db.value for db in lease.db_set),
+            db_paths=tuple(str(path) for path in lease.db_paths),
+            write_class=lease.write_class.value,
+            priority=lease.priority.value,
+            wait_ms=max(0.0, (lease.acquired_at - started) * 1000.0),
+            hold_ms=hold_ms,
+            commit_ms=metrics.commit_ms,
+            rows_changed=metrics.rows_changed,
+            deadline_ms=deadline_ms,
+            max_hold_ms=max_hold_ms,
+            deadline_exceeded=deadline_exceeded,
+            hold_limit_exceeded=(
+                max_hold_ms is not None and hold_ms > float(max_hold_ms)
+            ),
+            error=metrics.error,
+            event="release" if metrics.error is None else "error",
+            active=False,
+            pid=os.getpid(),
+            tid=getattr(threading, "get_native_id", threading.get_ident)(),
+            acquired_monotonic=lease.acquired_at,
+            acquired_wall_time=metrics.acquired_wall_time,
+            released_monotonic=released_at,
+            released_wall_time=released_wall_time,
+            duration_ms=max(0.0, (released_at - started) * 1000.0),
+            stage=("release" if metrics.error is None else metrics.stage) or "release",
+            sqlite_errorcode=metrics.sqlite_errorcode,
+            sqlite_errorname=metrics.sqlite_errorname,
+        )
+        with self._telemetry_lock:
+            self._active_telemetry.pop(id(lease), None)
+            self._telemetry_ring.append(row)
+        if self._telemetry_sink is not None:
+            self._telemetry_sink(row)
 
     def has_pending_monitor_waiter(
         self,
@@ -425,6 +624,7 @@ class WriteCoordinator:
         acquired: list[_AcquiredGate] = []
         metrics = _LeaseMetrics()
         acquired_at: float | None = None
+        lease: WriteLease | None = None
         timeout_error: WriteLeaseTimeout | None = None
         try:
             monitor_waiting = resolved_priority is WritePriority.MONITOR
@@ -433,6 +633,7 @@ class WriteCoordinator:
                 self._mark_monitor_waiting(ordered, 1)
             try:
                 if monitor_waiting:
+                    metrics.stage = "turnstile"
                     monitor_intent_fds = self._acquire_monitor_intents(
                         ordered,
                         self._db_paths,
@@ -444,6 +645,7 @@ class WriteCoordinator:
                             deadline=deadline,
                             owner=owner,
                             priority=resolved_priority,
+                            metrics=metrics,
                         )
                         break
                     except _MonitorIntentYield:
@@ -476,6 +678,13 @@ class WriteCoordinator:
                 acquired_at=acquired_at,
                 _metrics=metrics,
             )
+            metrics.acquired_wall_time = time.time()
+            self._record_acquired_telemetry(
+                lease,
+                acquired_wall_time=metrics.acquired_wall_time,
+                deadline_ms=deadline_ms,
+                max_hold_ms=max_hold_ms,
+            )
             self._publish_nonmonitor_lease(acquired)
             try:
                 yield lease
@@ -486,11 +695,32 @@ class WriteCoordinator:
             timeout_error = exc
             metrics.error = type(exc).__name__
             raise
+        except BaseException as exc:
+            metrics.error = type(exc).__name__
+            raise
         finally:
             released_at = self._clock()
-            if acquired:
-                self._release_gates(acquired)
-            if self._telemetry_sink is not None:
+            release_error: BaseException | None = None
+            try:
+                if acquired:
+                    self._release_gates(acquired)
+            except BaseException as exc:
+                # Release faults are safety-relevant. Record them, but do not
+                # swallow or turn them into a successful-looking lease row.
+                release_error = exc
+                metrics.error = type(exc).__name__
+                metrics.stage = "release"
+            if lease is not None:
+                self._record_released_telemetry(
+                    lease,
+                    started=started,
+                    released_at=released_at,
+                    released_wall_time=time.time(),
+                    deadline_ms=deadline_ms,
+                    max_hold_ms=max_hold_ms,
+                    deadline_exceeded=timeout_error is not None,
+                )
+            else:
                 self._emit_telemetry(
                     owner=owner,
                     ordered=ordered,
@@ -504,6 +734,8 @@ class WriteCoordinator:
                     metrics=metrics,
                     deadline_exceeded=timeout_error is not None,
                 )
+            if release_error is not None:
+                raise release_error
 
     @contextlib.contextmanager
     def transaction(
@@ -554,11 +786,33 @@ class WriteCoordinator:
                     max_hold_ms=max_hold_ms,
                     clock=self._clock,
                 ) if max_hold_ms is not None else contextlib.nullcontext():
-                    conn.execute(f"BEGIN {tx_mode.value}")
+                    lease.record_stage("sqlite_begin")
+                    try:
+                        conn.execute(f"BEGIN {tx_mode.value}")
+                    except sqlite3.OperationalError as exc:
+                        lease.record_sqlite_error(exc, stage="sqlite_begin")
+                        if _sqlite_busy(exc):
+                            name = lease._metrics.sqlite_errorname or "SQLITE_BUSY"
+                            raise WriteLeaseTimeout(
+                                "SQLite write deferred at BEGIN "
+                                f"for owner={lease.owner} sqlite_errorname={name}"
+                            ) from exc
+                        raise
                     began = True
                     yield WriteTransaction(lease=lease, db=db, connection=conn)
                     commit_started = self._clock()
-                    conn.commit()
+                    lease.record_stage("sqlite_commit")
+                    try:
+                        conn.commit()
+                    except sqlite3.OperationalError as exc:
+                        lease.record_sqlite_error(exc, stage="sqlite_commit")
+                        if _sqlite_busy(exc):
+                            name = lease._metrics.sqlite_errorname or "SQLITE_BUSY"
+                            raise WriteLeaseTimeout(
+                                "SQLite write deferred at COMMIT "
+                                f"for owner={lease.owner} sqlite_errorname={name}"
+                            ) from exc
+                        raise
                     commit_ms = (self._clock() - commit_started) * 1000.0
                     rows_changed = max(0, int(conn.total_changes) - before_changes)
                     lease.record_commit(
@@ -579,6 +833,7 @@ class WriteCoordinator:
         deadline: float | None,
         owner: str,
         priority: WritePriority,
+        metrics: _LeaseMetrics,
     ) -> list[_AcquiredGate]:
         acquired: list[_AcquiredGate] = []
         nonmonitor_reservations: dict[DBIdentity, int] = {}
@@ -591,6 +846,7 @@ class WriteCoordinator:
                         deadline=deadline,
                         owner=owner,
                         priority=priority,
+                        metrics=metrics,
                     )
                 )
             for db in ordered:
@@ -607,6 +863,7 @@ class WriteCoordinator:
                             deadline=deadline,
                             db=db,
                             owner=owner,
+                            metrics=metrics,
                         )
                     elif priority is WritePriority.BACKGROUND_RECOVERY:
                         monitor_waiter_fd = nonmonitor_reservations.pop(db)
@@ -619,6 +876,7 @@ class WriteCoordinator:
                             db=db,
                             owner=owner,
                             blocking=priority is not WritePriority.BACKGROUND_RECOVERY,
+                            metrics=metrics,
                         )
                     if (
                         priority is not WritePriority.MONITOR
@@ -636,6 +894,7 @@ class WriteCoordinator:
                         db=db,
                         owner=owner,
                         blocking=not background,
+                        metrics=metrics,
                     )
                     process_acquired = True
                     file_fd = self._acquire_file_lock(
@@ -644,6 +903,7 @@ class WriteCoordinator:
                         db=db,
                         owner=owner,
                         blocking=not background,
+                        metrics=metrics,
                     )
                     if (
                         priority is not WritePriority.MONITOR
@@ -707,6 +967,7 @@ class WriteCoordinator:
                     f"owner={owner}: monitor intent visible"
                 )
             if priority is not WritePriority.MONITOR:
+                metrics.stage = "publication"
                 publication_fds = self._acquire_nonmonitor_publication_barrier(
                     ordered,
                     owner=owner,
@@ -807,6 +1068,7 @@ class WriteCoordinator:
         deadline: float | None,
         owner: str,
         priority: WritePriority,
+        metrics: _LeaseMetrics,
     ) -> tuple[dict[DBIdentity, int], bool]:
         """Acquire a non-monitor DB set atomically with respect to MONITOR.
 
@@ -850,6 +1112,7 @@ class WriteCoordinator:
                         owner=owner,
                         blocking=False,
                         respect_monitor_intent=advisory_check,
+                        metrics=metrics,
                     )
                 if advisory_check and any(
                     self._monitor_intent_locked(self._db_paths[db])
@@ -887,7 +1150,9 @@ class WriteCoordinator:
         db: DBIdentity,
         owner: str,
         blocking: bool,
+        metrics: _LeaseMetrics,
     ) -> None:
+        metrics.stage = "process_lock"
         if not blocking:
             if not lock.acquire(blocking=False):
                 raise WriteLeaseTimeout(
@@ -911,7 +1176,9 @@ class WriteCoordinator:
         db: DBIdentity,
         owner: str,
         blocking: bool,
+        metrics: _LeaseMetrics,
     ) -> int:
+        metrics.stage = "file_flock"
         lock_path = unified_writer_lock_path(db_path)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -943,7 +1210,9 @@ class WriteCoordinator:
         db: DBIdentity,
         owner: str,
         blocking: bool,
+        metrics: _LeaseMetrics,
     ) -> int:
+        metrics.stage = "turnstile"
         path = writer_turnstile_path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -978,7 +1247,9 @@ class WriteCoordinator:
         deadline: float | None,
         db: DBIdentity,
         owner: str,
+        metrics: _LeaseMetrics,
     ) -> int:
+        metrics.stage = "turnstile"
         path = writer_monitor_waiter_path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -1011,7 +1282,10 @@ class WriteCoordinator:
         owner: str,
         blocking: bool,
         respect_monitor_intent: bool = True,
+        metrics: _LeaseMetrics | None = None,
     ) -> int:
+        if metrics is not None:
+            metrics.stage = "turnstile"
         path = writer_monitor_waiter_path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -1217,8 +1491,23 @@ class WriteCoordinator:
                 max_hold_ms is not None and hold_ms > float(max_hold_ms)
             ),
             error=metrics.error,
+            event="error" if metrics.error is not None else "release",
+            active=False,
+            pid=os.getpid(),
+            tid=getattr(threading, "get_native_id", threading.get_ident)(),
+            acquired_monotonic=acquired_at,
+            acquired_wall_time=metrics.acquired_wall_time,
+            released_monotonic=released_at,
+            released_wall_time=time.time(),
+            duration_ms=max(0.0, (released_at - started) * 1000.0),
+            stage=metrics.stage or "lease_acquire",
+            sqlite_errorcode=metrics.sqlite_errorcode,
+            sqlite_errorname=metrics.sqlite_errorname,
         )
-        self._telemetry_sink(telemetry)
+        with self._telemetry_lock:
+            self._telemetry_ring.append(telemetry)
+        if self._telemetry_sink is not None:
+            self._telemetry_sink(telemetry)
 
 
 def _default_connection_factory(path: Path) -> sqlite3.Connection:
