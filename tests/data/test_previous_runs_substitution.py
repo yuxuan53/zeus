@@ -4536,7 +4536,7 @@ def test_own_clock_station_revision_enters_priority_without_becoming_held(
     )
 
     assert priority_names == {station.name}
-    assert priority[station.name][0] == -0.75
+    assert priority[station.name][0] == -9.0
     assert gridded.name not in priority_names
 
     backlog = tuple(tmp_path / f"ordinary-{index:03d}.json" for index in range(80))
@@ -4553,8 +4553,8 @@ def test_own_clock_station_revision_enters_priority_without_becoming_held(
     assert station in window
 
 
-def test_own_clock_station_revision_preempts_older_capital_queue_tiers(tmp_path):
-    """A new source fact must remain ahead of already-known compute debt."""
+def test_own_clock_station_revision_stays_below_exposed_capital(tmp_path):
+    """New source facts lead generic debt without displacing held capital."""
     import src.data.replacement_forecast_live_materialization_queue as queue_mod
 
     station = tmp_path / "Hong_Kong.2026-09-05.low.station-input-revision.json"
@@ -4569,12 +4569,7 @@ def test_own_clock_station_revision_preempts_older_capital_queue_tiers(tmp_path)
         current_money_risk=frozenset({("Moscow", "2026-09-04", "high")}),
         current_probability_debt=frozenset({("Moscow", "2026-09-04", "high")}),
     )
-    causal_order = queue_mod._prioritize_own_clock_station_revision_files(
-        capital_order
-    )
-
     assert capital_order == (held, station)
-    assert causal_order == (station, held)
 
 
 @pytest.mark.parametrize("unheld_owner", ("global", "never_priced"))

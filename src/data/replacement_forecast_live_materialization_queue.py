@@ -2225,9 +2225,11 @@ def _cycle_advance_seed_priority_map(
             elif capital_protection_retry:
                 priority_tier = -10.0
             elif own_clock_station_revision:
-                # Fresh own-clock evidence is ordinary alpha unless capital is
-                # already exposed; held/global tiers above remain stronger.
-                priority_tier = min(priority_tier, -0.75)
+                # A source-issued station revision is newer causal truth, not
+                # ordinary queued compute. It remains behind exposed-capital
+                # Day0 work/retries above, but precedes generic global and
+                # first-posterior debt so information lead survives backlog.
+                priority_tier = min(priority_tier, -9.0)
             priority[name] = (priority_tier, request_time)
     return priority
 
@@ -4545,18 +4547,15 @@ def _prepare_seed_requests_with_connection(
             current_priority_scope,
         )
     elif lane == MATERIALIZATION_LANE_PRIORITY:
+        prioritized_raw_snapshot = _prioritize_own_clock_station_revision_files(
+            rotated_raw_snapshot
+        )
         prioritized_raw_snapshot = _prioritize_seed_files_by_capital_tier(
-            rotated_raw_snapshot,
+            prioritized_raw_snapshot,
             never_priced_scope=never_priced_scope,
             current_global_scope=current_global_scope,
             current_money_risk=current_money_risk,
             current_probability_debt=current_probability_debt,
-        )
-        # The station publication is the newest causal fact. Keep it ahead of
-        # older compute debt after capital classification so the bounded seed
-        # tranche cannot hide it behind ordinary held/global backlog.
-        prioritized_raw_snapshot = _prioritize_own_clock_station_revision_files(
-            prioritized_raw_snapshot
         )
         prioritized_raw_snapshot = _interleave_current_priority_seed_files_by_name(
             prioritized_raw_snapshot,
