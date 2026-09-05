@@ -2113,14 +2113,15 @@ def _quote_only_monitor_repair_handoff_admission(
     handoff: dict[str, object],
     repair_pending: dict[str, object],
 ) -> tuple[bool, str]:
-    """Admit an exact current-book repair over a loaded monitor defect.
+    """Admit a position-partitioned repair over a loaded monitor defect.
 
-    SCOPE: restart permission while the loaded daemon either misclassifies a
-    freshly fetched low-activity book or cannot complete a monitor result even
-    though an exact current held-token book proves that no legal SELL exists.
-    DRAIN: the replacement runtime loads the pending repair and must pass
+    SCOPE: restart permission while each canonical open position is independently
+    classified as fresh monitor failure, stale monitor failure, typed settlement
+    recovery, current quote-only degradation, or an ordinary fresh/probability
+    handoff. DRAIN: the replacement runtime loads the pending repair and must pass
     post-boot held monitoring. RESET: any command, pause release, identity gap,
-    expired snapshot, in-band held bid, or loaded SHA convergence refuses.
+    untyped settlement, expired snapshot, executable stale-failure bid, or loaded
+    SHA convergence refuses.
     """
 
     if not all(
@@ -2195,6 +2196,7 @@ def _quote_only_monitor_repair_handoff_admission(
         str(position_id).strip()
         for position_id in tuple(handoff.get("restart_blocking_position_ids") or ())
     }
+    restart_id_values = tuple(handoff.get("restart_blocking_position_ids") or ())
     if (
         not (quote_ids or restart_ids)
         or len(probability_ids)
@@ -2205,6 +2207,9 @@ def _quote_only_monitor_repair_handoff_admission(
         or len(probability_set) != len(probability_ids)
         or len(quote_set) != len(quote_ids)
         or len(no_action_set) != len(no_action_ids)
+        or len(restart_id_values)
+        != int(handoff.get("restart_blocking_position_count") or 0)
+        or len(restart_ids) != len(restart_id_values)
         or probability_set & quote_set
         or probability_set & no_action_set
         or quote_set & no_action_set
@@ -2215,25 +2220,22 @@ def _quote_only_monitor_repair_handoff_admission(
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:open_partition_incomplete"
     # Closed-market positions do not acquire a newer executable quote by
-    # waiting.  A stale active position may also hand off only when it is an
-    # exact restart blocker whose current held book independently proves that
-    # no legal SELL exists; the proof is rechecked below before admission.
+    # waiting. Partition restart blockers by their own monitor clock: a fresh
+    # typed failure can hand off to the pending repair, while each stale failure
+    # must independently prove that no legal SELL exists before stop.
+    stale_failed_set = restart_ids & stale_timestamp_set
+    fresh_failed_set = restart_ids - stale_timestamp_set
+    stale_settlement_set = settlement_set & stale_timestamp_set
     if (
         len(settlement_ids)
         != int(handoff.get("settlement_recoverable_position_count") or 0)
         or len(settlement_set) != len(settlement_ids)
         or not settlement_set.issubset(no_action_set)
         or stale_timestamp_set != stale_classified_set
-        or not stale_timestamp_set.issubset(settlement_set | restart_ids)
+        or stale_timestamp_set != stale_failed_set | stale_settlement_set
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:stale_partition_invalid"
-    settlement_ids = {
-        str(position_id).strip()
-        for position_id in tuple(handoff.get("settlement_recoverable_position_ids") or ())
-    }
-    if not restart_ids.issubset(no_action_set) or not settlement_ids.issubset(
-        no_action_set
-    ):
+    if no_action_set != restart_ids | settlement_set:
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:no_action_partition_invalid"
 
     snapshot_ids = _current_quote_only_repair_snapshot_ids(
@@ -2257,15 +2259,15 @@ def _quote_only_monitor_repair_handoff_admission(
     no_exit_snapshot_ids = (
         _current_quote_only_repair_snapshot_ids(
             trade_db,
-            position_ids=tuple(restart_ids),
+            position_ids=tuple(stale_failed_set),
             require_no_executable_exit=True,
         )
-        if restart_ids
+        if stale_failed_set
         else ()
     )
     missing_no_exit_ids = tuple(
         position_id
-        for position_id in restart_ids
+        for position_id in stale_failed_set
         if position_id not in no_exit_snapshot_ids
     )
     if missing_no_exit_ids:
@@ -2278,7 +2280,7 @@ def _quote_only_monitor_repair_handoff_admission(
                 ))
             )
         )
-    if set(no_exit_snapshot_ids) != restart_ids:
+    if set(no_exit_snapshot_ids) != stale_failed_set:
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:executable_exit_unprotected"
     quote_sidecar = _held_quote_sidecar_current_evidence()
     if quote_sidecar.get("current") is not True:
@@ -2292,7 +2294,9 @@ def _quote_only_monitor_repair_handoff_admission(
         "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_ADMITTED: "
         f"open_positions={open_count} fresh_positions={fresh_count} "
         f"quote_only_positions={len(quote_ids)} exact_held_books=current "
-        f"no_executable_exit_positions={len(restart_ids)} "
+        f"fresh_failed_positions={len(fresh_failed_set)} "
+        f"stale_failed_positions={len(stale_failed_set)} "
+        f"no_executable_exit_positions={len(stale_failed_set)} "
         f"settlement_recoverable_positions={len(settlement_ids)} "
         "durable_entries_pause=true nonterminal_commands=0 "
         "restart_permission_only=true",

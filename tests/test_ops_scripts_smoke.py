@@ -4929,6 +4929,105 @@ def test_deploy_live_stale_monitor_repair_never_abandons_executable_exit(
         assert detail.endswith("executable_exit_unprotected")
 
 
+@pytest.mark.parametrize("unclassified", (False, True))
+def test_deploy_live_loaded_restart_partitions_mixed_monitor_failure_clocks(
+    monkeypatch, tmp_path, unclassified
+):
+    """Each open position must independently satisfy one safe handoff class."""
+    dl = _load(
+        f"deploy_live_restart_mixed_monitor_clocks_{unclassified}",
+        "deploy_live.py",
+    )
+    position_ids = (
+        "pos-fresh-failed",
+        "pos-stale-a",
+        "pos-stale-b",
+        "pos-settlement",
+    )
+    classified_restart_ids = (
+        ("pos-stale-a", "pos-stale-b")
+        if unclassified
+        else ("pos-fresh-failed", "pos-stale-a", "pos-stale-b")
+    )
+    no_action_ids = (*classified_restart_ids, "pos-settlement")
+    stale_ids = ("pos-stale-a", "pos-stale-b", "pos-settlement")
+    handoff = _fresh_failed_monitor_handoff(
+        position_ids,
+        monitored_position_ids=position_ids,
+        fresh_failed_monitor_no_action_position_count=len(no_action_ids),
+        fresh_failed_monitor_no_action_position_ids=no_action_ids,
+        fresh_failed_monitor_timestamp_stale_position_ids=stale_ids,
+        restart_blocking_position_count=len(classified_restart_ids),
+        restart_blocking_position_ids=classified_restart_ids,
+        settlement_recoverable_position_count=1,
+        settlement_recoverable_position_ids=("pos-settlement",),
+        stale_classified_position_ids=stale_ids,
+    )
+    obligations = {
+        "open_position_count": len(position_ids),
+        "nonterminal_command_count": 0,
+        "all_open_position_ids": position_ids,
+        "open_position_ids": position_ids,
+        "nonterminal_command_ids": (),
+    }
+    no_exit_checks = []
+
+    def _snapshot_ids(_trade_db, *, position_ids, require_no_executable_exit=False):
+        if require_no_executable_exit:
+            no_exit_checks.append(set(position_ids))
+            return tuple(position_ids)
+        return ()
+
+    monkeypatch.setattr(dl, "LIVE_REPO", str(tmp_path))
+    monkeypatch.setattr(
+        dl,
+        "_canonical_live_restart_obligations",
+        lambda _db: obligations,
+    )
+    monkeypatch.setattr(
+        dl,
+        "_durable_entries_pause_state",
+        lambda _db: {"entries_paused": True},
+    )
+    monkeypatch.setattr(
+        dl,
+        "_pre_stop_monitor_handoff_evidence",
+        lambda _db: handoff,
+    )
+    monkeypatch.setattr(
+        dl,
+        "_loaded_live_runtime_repair_pending",
+        lambda: {"pending": True, "loaded_sha": "old", "current_head": "new"},
+    )
+    monkeypatch.setattr(dl, "_current_quote_only_repair_snapshot_ids", _snapshot_ids)
+    monkeypatch.setattr(
+        dl,
+        "_current_quote_only_repair_live_book_ids",
+        lambda *_args, **_kwargs: pytest.fail("snapshot proof was complete"),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_held_quote_sidecar_current_evidence",
+        lambda: {"current": True, "age_seconds": 1.0},
+    )
+
+    ok, detail = dl._loaded_live_restart_obligation_gate(
+        [dl.LIVE_TRADING_LABEL],
+        live_was_loaded=True,
+    )
+
+    if unclassified:
+        assert ok is False
+        assert "open_partition_incomplete" in detail
+        assert no_exit_checks == []
+    else:
+        assert ok is True
+        assert "fresh_failed_positions=1" in detail
+        assert "stale_failed_positions=2" in detail
+        assert "settlement_recoverable_positions=1" in detail
+        assert no_exit_checks == [{"pos-stale-a", "pos-stale-b"}]
+
+
 @pytest.mark.parametrize(
     ("bids", "asset_id", "market", "require_no_exit", "expected"),
     (
