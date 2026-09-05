@@ -853,6 +853,30 @@ def test_newer_day0_identity_replaces_visible_drained_owner(tmp_path, monkeypatc
     conn.close()
 
 
+def test_own_clock_cycle_advance_seed_enters_station_priority_lane(tmp_path) -> None:
+    _, hko_seed = cycle_advance._staged_cycle_advance_seed_paths(
+        seed_path=tmp_path,
+        city="Hong Kong",
+        target_date="2026-09-05",
+        metric="high",
+        computed_at=datetime(2026, 9, 5, 2, 30, tzinfo=UTC),
+        seed_name=lambda *_args, **_kwargs: "Hong_Kong.2026-09-05.high.json",
+        day0_observed_extreme_source="hko_hourly_accumulator",
+    )
+    _, metar_seed = cycle_advance._staged_cycle_advance_seed_paths(
+        seed_path=tmp_path,
+        city="London",
+        target_date="2026-09-05",
+        metric="high",
+        computed_at=datetime(2026, 9, 5, 2, 30, tzinfo=UTC),
+        seed_name=lambda *_args, **_kwargs: "London.2026-09-05.high.json",
+        day0_observed_extreme_source="metar_hourly_accumulator",
+    )
+
+    assert ".station-input-revision.enqueue-" in hko_seed.name
+    assert ".station-input-revision." not in metar_seed.name
+
+
 def test_old_day0_writer_cannot_publish_after_identity_cas_replacement(tmp_path) -> None:
     """A late 21C writer cannot expose its seed after the marker moves to 22C."""
     db_path = _prepare_forecast_db(tmp_path)

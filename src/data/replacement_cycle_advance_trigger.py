@@ -378,6 +378,7 @@ def _staged_cycle_advance_seed_paths(
     metric: str,
     computed_at: datetime,
     seed_name,
+    day0_observed_extreme_source: object = None,
 ) -> tuple[Path, Path]:
     """Allocate an owner-unique hidden stage and its queue-visible final path."""
     base_name = seed_name(
@@ -385,7 +386,15 @@ def _staged_cycle_advance_seed_paths(
         computed_at=computed_at,
     )
     base = Path(base_name)
-    owned_name = f"{base.stem}.enqueue-{uuid.uuid4().hex}{base.suffix}"
+    source = str(day0_observed_extreme_source or "").strip()
+    priority_marker = (
+        ".station-input-revision"
+        if source.startswith(("hko_", "cwa_"))
+        else ""
+    )
+    owned_name = (
+        f"{base.stem}{priority_marker}.enqueue-{uuid.uuid4().hex}{base.suffix}"
+    )
     visible = seed_path / owned_name
     return seed_path / _CYCLE_ADVANCE_STAGING_DIR / owned_name, visible
 
@@ -2153,6 +2162,9 @@ def enqueue_cycle_advance_reseeds(
                     metric=metric,
                     computed_at=now,
                     seed_name=_seed_name,
+                    day0_observed_extreme_source=day0_payload.get(
+                        "day0_observed_extreme_source"
+                    ),
                 )
                 seed_file = _build_and_write_advance_seed(
                     conn,
@@ -2562,6 +2574,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         metric=metric,
                         computed_at=now,
                         seed_name=_seed_name,
+                        day0_observed_extreme_source=day0_observed_extreme_source,
                     )
                     seed_file = _build_and_write_advance_seed(
                         conn,
@@ -2712,6 +2725,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         metric=metric,
                         computed_at=now,
                         seed_name=_seed_name,
+                        day0_observed_extreme_source=day0_observed_extreme_source,
                     )
                     seed_file = _build_and_write_advance_seed(
                         conn,
@@ -2824,6 +2838,7 @@ def enqueue_single_family_cycle_advance_reseed(
                 metric=metric,
                 computed_at=now,
                 seed_name=_seed_name,
+                day0_observed_extreme_source=day0_observed_extreme_source,
             )
             seed_file = _build_and_write_advance_seed(
                 conn,
@@ -2947,6 +2962,7 @@ def enqueue_single_family_cycle_advance_reseed(
             metric=metric,
             computed_at=now,
             seed_name=_seed_name,
+            day0_observed_extreme_source=day0_observed_extreme_source,
         )
         seed_file = _build_and_write_advance_seed(
             conn,
