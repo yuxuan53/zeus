@@ -1,5 +1,5 @@
 # Created: 2026-04-23
-# Last reused/audited: 2026-04-30
+# Last reused/audited: 2026-09-05
 # Authority basis: docs/operations/task_2026-04-23_live_harvester_enablement_dr33/plan.md
 #                  + P-D §6.1 (_find_winning_bin fix)
 #                  + P-E canonical authority pattern (INV-14 + provenance_json + SettlementSemantics gate)
@@ -597,6 +597,51 @@ def test_T12b_disputed_truth_does_not_settle_positions_or_train(monkeypatch, tmp
     assert settle_calls == []
     assert result["positions_settled"] == 0
     assert result["pairs_created"] == 0
+
+
+def test_verified_history_is_pruned_before_writer_transaction(monkeypatch):
+    """A rolling Gamma window cannot repeatedly monopolize the live q writer."""
+    from types import SimpleNamespace
+    from src.execution import harvester as hv
+
+    old = {"title": "Highest temperature in London", "slug": "old", "markets": []}
+    new = {"title": "Lowest temperature in London", "slug": "new", "markets": []}
+    identities = {
+        "old": ("London", "2026-09-01", "high"),
+        "new": ("London", "2026-09-02", "low"),
+    }
+
+    class ReadConn:
+        def execute(self, _sql):
+            return self
+
+        def fetchall(self):
+            return [("London", "2026-09-01", "high")]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "src.state.db.get_forecasts_connection_read_only",
+        lambda: ReadConn(),
+    )
+    monkeypatch.setattr(hv, "_settlement_event_key", lambda event: identities[event["slug"]])
+
+    portfolio = SimpleNamespace(positions=[])
+    assert hv._pending_settlement_events([old, new], portfolio) == [new]
+
+    portfolio.positions = [
+        SimpleNamespace(
+            city="London",
+            target_date="2026-09-01",
+            temperature_metric="high",
+            state="economically_closed",
+        )
+    ]
+    assert hv._pending_settlement_events([old, new], portfolio) == [old, new]
+
+    portfolio.positions[0].state = "settled"
+    assert hv._pending_settlement_events([old, new], portfolio) == [new]
 
 
 # ---- S2.5 format-unification structural antibody ----

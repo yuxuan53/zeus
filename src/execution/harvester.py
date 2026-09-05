@@ -1063,7 +1063,26 @@ def run_harvester() -> dict:
         portfolio,
         settled_events,
     )
-    logger.info("Harvester: found %d settled events", len(settled_events))
+    settlements_found = len(settled_events)
+    settled_events = _pending_settlement_events(settled_events, portfolio)
+    logger.info(
+        "Harvester: found %d settled events; %d require canonical work",
+        settlements_found,
+        len(settled_events),
+    )
+
+    if not settled_events:
+        return {
+            "settlements_found": settlements_found,
+            "settlements_pending": 0,
+            "pairs_created": 0,
+            "positions_settled": 0,
+            "legacy_settlement_records_skipped": 0,
+            "dispute_rediscovery": rediscover_disputed_settlements(),
+            "stage2_status": "not_run_no_pending_settlements",
+            "stage2_missing_trade_tables": [],
+            "stage2_missing_shared_tables": [],
+        }
 
     with forecasts_connection_with_trades_flocked(write_class="live") as conn:
         # conn serves as both the former trade_conn and shared_conn.
@@ -1334,13 +1353,99 @@ def run_harvester() -> dict:
     dispute_rediscovery = rediscover_disputed_settlements()
 
     return {
-        "settlements_found": len(settled_events),
+        "settlements_found": settlements_found,
+        "settlements_pending": len(settled_events),
         "pairs_created": total_pairs,
         "positions_settled": positions_settled,
         "legacy_settlement_records_skipped": legacy_settlement_records_skipped,
         "dispute_rediscovery": dispute_rediscovery,
         **stage2_preflight,
     }
+
+
+def _settlement_event_key(event: dict) -> tuple[str, str, str] | None:
+    """Return the canonical family identity without opening a writer transaction."""
+
+    city = _match_city(
+        (event.get("title") or "").lower(),
+        event.get("slug", ""),
+    )
+    target_date = _extract_target_date(event)
+    if city is None or target_date is None:
+        return None
+    metric = infer_temperature_metric(
+        event.get("title", ""),
+        event.get("slug", ""),
+        *[
+            str(market.get("question") or market.get("groupItemTitle") or "")
+            for market in event.get("markets", []) or []
+        ],
+    )
+    return city.name, target_date, str(metric).strip().lower()
+
+
+def _pending_settlement_events(
+    events: list[dict],
+    portfolio: PortfolioState,
+) -> list[dict]:
+    """Keep only new truth or families whose lifecycle still needs settlement.
+
+    Gamma intentionally returns a rolling 30-day window. Replaying that whole
+    window under one ``BEGIN IMMEDIATE`` made a low-alpha settlement scan hold
+    the forecasts writer ahead of current Day0 probability materialization.
+    A VERIFIED settlement row is the durable completion witness. A nonterminal
+    portfolio position overrides it so a stale/incomplete lifecycle projection
+    is still repaired by the normal atomic settlement path.
+    """
+
+    from src.state.db import get_forecasts_connection_read_only
+
+    try:
+        conn = get_forecasts_connection_read_only()
+        try:
+            verified = {
+                (str(row[0]), str(row[1]), str(row[2]).strip().lower())
+                for row in conn.execute(
+                    """
+                    SELECT city, target_date, temperature_metric
+                    FROM settlement_outcomes
+                    WHERE authority = 'VERIFIED'
+                    """
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Harvester settlement completion prefilter unavailable; "
+            "preserving all fetched events: %s",
+            exc,
+        )
+        return events
+
+    pending_position_keys = {
+        (
+            str(getattr(pos, "city", "") or ""),
+            str(getattr(pos, "target_date", "") or ""),
+            str(getattr(pos, "temperature_metric", "high") or "high")
+            .strip()
+            .lower(),
+        )
+        for pos in getattr(portfolio, "positions", []) or []
+        if str(
+            getattr(pos, "state", "")
+            or getattr(pos, "phase", "")
+            or ""
+        ).strip().lower()
+        not in TERMINAL_STATES
+    }
+
+    pending: list[dict] = []
+    for event in events:
+        key = _settlement_event_key(event)
+        if key is None or key not in verified or key in pending_position_keys:
+            pending.append(event)
+    return pending
 
 
 # Bounded per-cycle row budget for rediscover_disputed_settlements — small and fixed so a
