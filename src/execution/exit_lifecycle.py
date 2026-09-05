@@ -9634,6 +9634,9 @@ def _apply_partial_exit_fill(
     fill_price: object,
     order_id: str,
     status: str,
+    projection_open_shares: Decimal | None = None,
+    projection_open_cost_basis_usd: Decimal | None = None,
+    preserve_proven_chain_projection: bool = False,
 ) -> bool:
     """Reduce local open exposure after an observed partial exit fill.
 
@@ -9642,7 +9645,17 @@ def _apply_partial_exit_fill(
     slice in nested_fills for audit/replay.
     """
 
-    open_shares = Decimal(str(position.effective_shares))
+    if (projection_open_shares is None) != (
+        projection_open_cost_basis_usd is None
+    ):
+        raise ValueError("partial EXIT projection overrides must be paired")
+    open_shares = Decimal(
+        str(
+            projection_open_shares
+            if projection_open_shares is not None
+            else position.effective_shares
+        )
+    )
     filled = Decimal(str(filled_shares))
     remaining = Decimal(str(remaining_shares))
     price = Decimal(str(fill_price))
@@ -9658,7 +9671,13 @@ def _apply_partial_exit_fill(
     filled_ratio = filled / open_shares
     remaining_ratio = remaining / open_shares
     original_size = Decimal(str(position.size_usd or 0))
-    original_cost = Decimal(str(position.effective_cost_basis_usd or 0))
+    original_cost = Decimal(
+        str(
+            projection_open_cost_basis_usd
+            if projection_open_cost_basis_usd is not None
+            else position.effective_cost_basis_usd or 0
+        )
+    )
     realized_cost = original_cost * filled_ratio
     realized_pnl = filled * price - realized_cost
     position.nested_fills.append(
@@ -9683,7 +9702,7 @@ def _apply_partial_exit_fill(
     # pre-exit chain aggregate until the next reconcile cycle — exit-sizing code
     # that calls effective_exposure() between cycles would overstate exposure and
     # re-issue exit orders the venue rejects.
-    if position.has_chain_observed_authority:
+    if position.has_chain_observed_authority and not preserve_proven_chain_projection:
         original_chain_shares = Decimal(
             str(getattr(position, "chain_shares", 0) or 0)
         )
@@ -9753,6 +9772,7 @@ def _build_partial_exit_projection_event(
     cumulative_realized_pnl_usd: object | None = None,
     remaining_cost_basis_usd: object | None = None,
     semantic_event: str = "PARTIAL_FILL_OBSERVED",
+    phase_after: str = "pending_exit",
 ) -> tuple[dict, dict]:
     import json as _json
 
@@ -9771,7 +9791,7 @@ def _build_partial_exit_projection_event(
     events, projection = build_monitor_refreshed_canonical_write(
         position,
         sequence_no=sequence_no,
-        phase_after="pending_exit",
+        phase_after=phase_after,
         source_module="src.execution.exit_lifecycle",
     )
     if not events:
@@ -9890,6 +9910,8 @@ def _dual_write_partial_exit_projection_batch(
     previous_next_retry_at: str = "",
     previous_retry_count: int = 0,
     previous_error: str = "",
+    phase_after: str = "pending_exit",
+    force_local_projection: bool = False,
 ) -> bool:
     """Append exact fill events and one final projection in one transaction."""
 
@@ -9922,6 +9944,7 @@ def _dual_write_partial_exit_projection_batch(
             cumulative_realized_pnl_usd=item["cumulative_realized"],
             remaining_cost_basis_usd=item.get("remaining_cost_basis"),
             semantic_event="CAPITAL_REDUCTION_FILLED",
+            phase_after=phase_after,
         )
         events.append(event)
     if released_position is not None:
@@ -9945,6 +9968,19 @@ def _dual_write_partial_exit_projection_batch(
         cumulative_realized_pnl_usd
     )
     append_many_and_project(conn, events, projection)
+    if force_local_projection:
+        # ``CAPITAL_REDUCTION_FILLED`` is represented by a MONITOR_REFRESHED
+        # event payload because the position-event grammar has no separate
+        # partial-exit event type.  Generic monitor projections preserve the
+        # pre-existing local economics, which is correct for ordinary monitor
+        # snapshots but wrong after this exact fill. Re-apply this event's
+        # already-canonical projection through the normal funnel with its
+        # reduction semantic so the proven residual owns local shares/cost.
+        from src.state.projection import upsert_position_current
+
+        reduction_projection = dict(projection)
+        reduction_projection["_canonical_event_type"] = "CAPITAL_REDUCTION_FILLED"
+        upsert_position_current(conn, reduction_projection)
     return True
 
 
@@ -10385,6 +10421,9 @@ def _complete_intentional_position_reduction(
     economic_fills: Sequence[object] | None = None,
     intent_holding_shares: Decimal | None = None,
     release_after_fill: bool = True,
+    projection_open_shares: Decimal | None = None,
+    projection_open_cost_basis_usd: Decimal | None = None,
+    preserve_proven_chain_projection: bool = False,
 ) -> Decimal:
     """Append exact partial economics before publishing the local reduction."""
 
@@ -10407,8 +10446,24 @@ def _complete_intentional_position_reduction(
         raise RuntimeError("reduction finality has an invalid confirmed fill size")
     total_filled = min(intended_shares, total_filled)
     newly_filled = total_filled - already_applied
-    basis_shares = Decimal(str(position.effective_shares))
-    basis_cost = Decimal(str(position.effective_cost_basis_usd))
+    if (projection_open_shares is None) != (
+        projection_open_cost_basis_usd is None
+    ):
+        raise ValueError("reduction projection overrides must be paired")
+    basis_shares = Decimal(
+        str(
+            projection_open_shares
+            if projection_open_shares is not None
+            else position.effective_shares
+        )
+    )
+    basis_cost = Decimal(
+        str(
+            projection_open_cost_basis_usd
+            if projection_open_cost_basis_usd is not None
+            else position.effective_cost_basis_usd
+        )
+    )
     if basis_shares <= Decimal("1e-9") or basis_cost < 0:
         from src.state.fill_dedup import PartialExitEconomicDebtError
 
@@ -10428,7 +10483,7 @@ def _complete_intentional_position_reduction(
     # A canonical MATCHED/CONFIRMED fact must still be reconciled after a
     # status-first receipt already reduced the local position.
     if newly_filled > Decimal("1e-9") or economic_fills:
-        open_shares = Decimal(str(position.effective_shares))
+        open_shares = basis_shares
         intent_holding = (
             Decimal(intent_holding_shares)
             if intent_holding_shares is not None
@@ -10664,6 +10719,9 @@ def _complete_intentional_position_reduction(
         fill_price=fill_price_decimal,
         order_id=order_id,
         status=status,
+        projection_open_shares=projection_open_shares,
+        projection_open_cost_basis_usd=projection_open_cost_basis_usd,
+        preserve_proven_chain_projection=preserve_proven_chain_projection,
     ):
         raise RuntimeError("confirmed reduction could not converge to fill target")
 
@@ -10714,6 +10772,10 @@ def _complete_intentional_position_reduction(
             previous_next_retry_at=previous_next_retry_at,
             previous_retry_count=previous_retry_count,
             previous_error=previous_error,
+            phase_after=(
+                "day0_window" if state_name == "day0_window" else "pending_exit"
+            ),
+            force_local_projection=projection_open_shares is not None,
         )
 
     position.__dict__.clear()

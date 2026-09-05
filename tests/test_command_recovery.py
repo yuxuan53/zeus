@@ -30797,7 +30797,7 @@ class TestRecoveryResolutionTable:
         seed.execute(
             """
             UPDATE position_current
-               SET phase = 'pending_exit', city = 'Hong Kong', target_date = '2026-09-04',
+               SET phase = 'day0_window', city = 'Hong Kong', target_date = '2026-09-04',
                    shares = 48.2258, chain_state = 'synced', chain_shares = 43.2258,
                    chain_cost_basis_usd = 21.6129, cost_basis_usd = 24.1129,
                    entry_price = 0.50, order_status = 'sell_pending_confirmation'
@@ -30860,6 +30860,14 @@ class TestRecoveryResolutionTable:
         summary = command_recovery.reconcile_terminal_exit_residual_projections_priority()
 
         assert summary == {"scanned": 1, "advanced": 1, "stayed": 0, "errors": 0}
+        # The converged terminal receipt is no longer a recovery candidate;
+        # a pass with no projection mutation must never report ``advanced``.
+        assert command_recovery.reconcile_terminal_exit_residual_projections_priority() == {
+            "scanned": 0,
+            "advanced": 0,
+            "stayed": 0,
+            "errors": 0,
+        }
         verified = _conn_factory()
         try:
             current = verified.execute(
@@ -30872,7 +30880,7 @@ class TestRecoveryResolutionTable:
         finally:
             verified.close()
         assert dict(current) == {
-            "phase": "active",
+            "phase": "day0_window",
             "shares": 43.2258,
             "chain_shares": 43.2258,
             "cost_basis_usd": 21.6129,

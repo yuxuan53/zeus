@@ -12760,7 +12760,8 @@ def _repair_terminal_partial_exit_projection(
     if row is None:
         return False
     current = _dict_row(row)
-    if str(current.get("phase") or "") not in {
+    phase_before = str(current.get("phase") or "")
+    if phase_before not in {
         "active",
         "day0_window",
         "pending_exit",
@@ -12909,13 +12910,41 @@ def _repair_terminal_partial_exit_projection(
         economic_fills=fills,
         intent_holding_shares=holding_shares,
         release_after_fill=True,
+        # Chain truth has already proved the post-fill residual.  When the
+        # local projection still names the full holding, its effective view
+        # routes through that chain residual; pass the exact local pre-fill
+        # basis so the reduction writes the missing local projection without
+        # rescaling the chain fact a second time.
+        projection_open_shares=local_shares if local_is_pre_fill else None,
+        projection_open_cost_basis_usd=local_basis if local_is_pre_fill else None,
+        preserve_proven_chain_projection=local_is_pre_fill,
     )
     phase_after = conn.execute(
-        "SELECT phase FROM position_current WHERE position_id = ?",
+        """
+        SELECT phase, shares, cost_basis_usd
+          FROM position_current
+         WHERE position_id = ?
+        """,
         (position_id,),
     ).fetchone()
+    if local_is_pre_fill:
+        projected_shares = _positive_decimal_or_none(
+            phase_after[1] if phase_after is not None else None
+        )
+        projected_basis = _positive_decimal_or_none(
+            phase_after[2] if phase_after is not None else None
+        )
+        if (
+            projected_shares is None
+            or projected_basis is None
+            or abs(projected_shares - expected_remaining) > tolerance
+            or abs(projected_basis - expected_basis) > tolerance
+        ):
+            raise RuntimeError(
+                f"terminal partial EXIT failed to converge local projection for {command_id}"
+            )
     return applied > 0 or (
-        phase_after is not None and str(phase_after[0] or "") != "pending_exit"
+        phase_after is not None and str(phase_after[0] or "") != phase_before
     )
 
 
