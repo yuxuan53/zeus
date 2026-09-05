@@ -1345,8 +1345,14 @@ def _replacement_forecast_priority_materialize_job() -> dict[str, object]:
     cfg = _replacement_forecast_live_materialization_queue_config()
     if _replacement_forecast_own_clock_seed_pending(cfg):
         fast_report = _replacement_forecast_station_revision_fast_lane(cfg)
-        if fast_report.get("status") != "NO_SEEDS":
+        if fast_report.get("status") not in {"NO_SEEDS", "DEFERRED"}:
             return fast_report
+        # A DEFERRED fast lane made no progress: its newest station seed is
+        # waiting on a same-cycle ENS HWM (or the claim read deadline). That
+        # seed stays in its queue; returning here would let one waiting seed
+        # starve every prepared request behind it on every one-second tick
+        # (2026-09-05: HK low 00Z ENS rejected as boundary-ambiguous, 21 held
+        # requests and the whole priority lane silent for two hours).
         # A named station revision is a newly available causal fact, while an
         # existing request (especially a timeout retry) is older compute debt.
         # Publishing the fact's request first preserves information lead; the

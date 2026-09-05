@@ -2992,6 +2992,55 @@ def test_priority_job_bridges_own_clock_seed_before_existing_request(
     assert receipt == {"status": "PROCESSED", "seed_processed_count": 1}
 
 
+def test_priority_job_falls_through_when_station_seed_awaits_ensemble(
+    monkeypatch, tmp_path
+) -> None:
+    """A zero-progress DEFERRED fast lane must not starve prepared requests."""
+    from src.ingest import forecast_live_daemon
+    from src.data import replacement_forecast_production
+
+    cfg = {
+        "request_dir": tmp_path / "requests",
+        "seed_dir": tmp_path / "seeds",
+    }
+    cfg["request_dir"].mkdir()
+    cfg["seed_dir"].mkdir()
+    (cfg["request_dir"] / "Hong_Kong.2026-09-04.high.enqueue.json").write_text("{}")
+    (
+        cfg["seed_dir"]
+        / "Hong_Kong.2026-09-05.low.station-input-revision.enqueue.json"
+    ).write_text("{}")
+    monkeypatch.setattr(
+        replacement_forecast_production,
+        "_replacement_forecast_live_materialization_queue_config",
+        lambda: cfg,
+    )
+    monkeypatch.setattr(
+        forecast_live_daemon,
+        "_replacement_forecast_station_revision_fast_lane",
+        lambda _cfg: {
+            "status": "DEFERRED",
+            "seed_processed_count": 0,
+            "seed_failed_count": 0,
+            "reason_codes": [
+                "REPLACEMENT_MATERIALIZATION_SOURCE_CYCLE_AWAITING_ENSEMBLE_HWM"
+            ],
+        },
+    )
+    calls: list[tuple[str, int]] = []
+
+    def run_lane(_cfg, *, lane, seed_limit):
+        calls.append((lane, seed_limit))
+        return {"status": "PROCESSED", "processed_count": 1}
+
+    monkeypatch.setattr(
+        forecast_live_daemon, "_replacement_forecast_materialize_lane", run_lane
+    )
+    receipt = forecast_live_daemon._replacement_forecast_priority_materialize_job()
+    assert calls == [("priority", 3)]
+    assert receipt == {"status": "PROCESSED", "processed_count": 1}
+
+
 def test_station_revision_fast_path_avoids_broad_queue_priority_reads(
     monkeypatch, tmp_path
 ) -> None:
