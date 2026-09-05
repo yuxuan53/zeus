@@ -46,7 +46,7 @@ import uuid
 from dataclasses import dataclass, replace
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -12783,7 +12783,15 @@ def _repair_terminal_partial_exit_projection(
         if isinstance(intent, Mapping)
         else None
     )
-    if intended_shares != command_size or not isinstance(close_position, bool):
+    if not isinstance(close_position, bool):
+        return False
+    if close_position:
+        if not _full_close_intent_matches_command_size(
+            intended_shares,
+            command_size,
+        ):
+            return False
+    elif intended_shares != command_size:
         return False
 
     fills = [
@@ -12893,6 +12901,29 @@ def _repair_terminal_partial_exit_projection(
     ).fetchone()
     return applied > 0 or (
         phase_after is not None and str(phase_after[0] or "") != "pending_exit"
+    )
+
+
+def _full_close_intent_matches_command_size(
+    intended_shares: Decimal | None,
+    command_size: Decimal,
+) -> bool:
+    """Accept only the venue's conservative cent-share full-close quantization."""
+
+    if (
+        intended_shares is None
+        or not intended_shares.is_finite()
+        or not command_size.is_finite()
+        or intended_shares <= 0
+        or command_size <= 0
+    ):
+        return False
+    share_grid = Decimal("0.01")
+    numeric_tolerance = Decimal("0.000001")
+    floored_intent = intended_shares.quantize(share_grid, rounding=ROUND_FLOOR)
+    return bool(
+        Decimal("0") <= intended_shares - command_size < share_grid
+        and abs(command_size - floored_intent) <= numeric_tolerance
     )
 
 

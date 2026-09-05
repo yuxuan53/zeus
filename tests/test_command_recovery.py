@@ -1,8 +1,8 @@
 # Created: 2026-04-26
-# Lifecycle: created=2026-04-26; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Lifecycle: created=2026-04-26; last_reviewed=2026-09-04; last_reused=2026-09-04
 # Purpose: Lock INV-31 command recovery behavior plus snapshot-gated command inserts.
 # Reuse: Run when command recovery, command journal schema, or executable snapshot gating changes.
-# Last reused/audited: 2026-09-01
+# Last reused/audited: 2026-09-04
 # Authority basis: docs/operations/task_2026-04-26_execution_state_truth_p1_command_bus/implementation_plan.md u00a7P1.S4
 """INV-31 anchor tests: command recovery loop.
 
@@ -30664,6 +30664,117 @@ class TestRecoveryResolutionTable:
             "stayed": 0,
             "errors": 0,
         }
+
+    def test_expired_quantized_full_close_fak_partial_projects_residual(
+        self,
+        conn,
+        mock_client,
+    ):
+        """A full-close FAK may floor to venue share precision, never more."""
+        _insert(conn, command_id="cmd-entry", position_id="pos-001", size=14.84, price=0.50)
+        _advance_to_acked(conn, command_id="cmd-entry", venue_order_id="ord-entry")
+        _seed_pending_entry_projection(conn, command_id="cmd-entry", order_id="ord-entry")
+        conn.execute(
+            """
+            UPDATE position_current
+               SET phase = 'pending_exit',
+                   shares = 14.845,
+                   chain_state = 'synced',
+                   chain_shares = 1.845,
+                   chain_cost_basis_usd = 0.9225,
+                   cost_basis_usd = 7.4225,
+                   entry_price = 0.50,
+                   order_status = 'sell_pending_confirmation'
+             WHERE position_id = 'pos-001'
+            """
+        )
+        _seed_full_exit_intent(
+            conn,
+            position_id="pos-001",
+            shares=14.845,
+            occurred_at="2026-07-28T00:01:00Z",
+        )
+        _insert(
+            conn,
+            command_id="cmd-exit-underfill",
+            position_id="pos-001",
+            intent_kind="EXIT",
+            side="SELL",
+            order_type="FAK",
+            size=14.84,
+            price=0.86,
+            token_id="tok-001",
+            created_at="2026-07-28T00:01:01Z",
+        )
+        _advance_to_acked(
+            conn,
+            command_id="cmd-exit-underfill",
+            venue_order_id="ord-exit-underfill",
+        )
+        _append_trade_fact(
+            conn,
+            command_id="cmd-exit-underfill",
+            order_id="ord-exit-underfill",
+            trade_id="0xunderfill",
+            state="CONFIRMED",
+            filled_size="13",
+            fill_price="0.86",
+            tx_hash="0xunderfill",
+        )
+        conn.execute(
+            """
+            UPDATE venue_commands
+               SET state = 'EXPIRED', updated_at = '2026-07-28T00:03:00Z'
+             WHERE command_id = 'cmd-exit-underfill'
+            """
+        )
+
+        from src.execution.command_recovery import (
+            reconcile_exit_lifecycle_alignment_repairs,
+        )
+
+        assert reconcile_exit_lifecycle_alignment_repairs(conn) == {
+            "scanned": 1,
+            "advanced": 1,
+            "stayed": 0,
+            "errors": 0,
+        }
+        current = conn.execute(
+            """
+            SELECT phase, shares, chain_shares, cost_basis_usd
+              FROM position_current
+             WHERE position_id = 'pos-001'
+            """
+        ).fetchone()
+        assert dict(current) == {
+            "phase": "active",
+            "shares": 1.845,
+            "chain_shares": 1.845,
+            "cost_basis_usd": 0.9225,
+        }
+
+    @pytest.mark.parametrize(
+        ("intended_shares", "command_size", "expected"),
+        (
+            ("48.2258", "48.22", True),
+            ("48.2258", "48.21", False),
+            ("48.2258", "48.23", False),
+        ),
+    )
+    def test_terminal_partial_full_close_accepts_only_floor_grid_command_size(
+        self,
+        intended_shares,
+        command_size,
+        expected,
+    ):
+        from src.execution.command_recovery import (
+            _full_close_intent_matches_command_size,
+        )
+
+        assert _full_close_intent_matches_command_size(
+            Decimal(intended_shares),
+            Decimal(command_size),
+        ) is expected
 
     @pytest.mark.parametrize(
         "conflict",
