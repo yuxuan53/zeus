@@ -201,6 +201,23 @@ FRESH_FAILED_MONITOR_NO_ACTION_ISSUES = frozenset(
         "monitor_probability_and_clob_stale",
     }
 )
+
+
+def _monitor_handoff_age_is_stale(*, now: datetime, occurred_at: datetime) -> bool:
+    """Classify the exclusive stale side of the monitor handoff boundary.
+
+    ``collect_monitor_cadence_evidence`` uses ``age <= max_age`` as fresh and
+    ``age > max_age`` as stale.  Keep the restart-only mirror equally strict:
+    the exact boundary belongs to the fresh upper interval, while only a
+    strictly older event belongs to the stuck lower interval.  This prevents
+    the two restart gates from acquiring different threshold semantics.
+    """
+
+    now_utc = now.astimezone(timezone.utc)
+    occurred_utc = occurred_at.astimezone(timezone.utc)
+    return (
+        now_utc - occurred_utc
+    ).total_seconds() > LIVE_STUCK_MONITOR_RECOVERY_STALE_SECONDS
 LIVE_MONITOR_CADENCE_VERIFY_GRACE_SECONDS = 2 * 60
 LIVE_MONITOR_CADENCE_VERIFY_TIMEOUT_SECONDS = float(
     os.environ.get(
@@ -1396,9 +1413,7 @@ def _pre_stop_monitor_handoff_evidence(trade_db: Path) -> dict[str, object]:
             invalid_monitor_timestamp_ids.append(position_id)
             continue
         occurred_at = parsed.astimezone(timezone.utc)
-        if (
-            now - occurred_at
-        ).total_seconds() > LIVE_STUCK_MONITOR_RECOVERY_STALE_SECONDS:
+        if _monitor_handoff_age_is_stale(now=now, occurred_at=occurred_at):
             stale_classified_ids.append(position_id)
             if position_id in fresh_failed_id_set:
                 stale_fresh_failed_timestamp_ids.append(position_id)
@@ -1426,8 +1441,9 @@ def _pre_stop_monitor_handoff_evidence(trade_db: Path) -> dict[str, object]:
         if parsed.tzinfo is None:
             invalid_monitor_timestamp_ids.append(position_id)
             continue
-        if (now - parsed.astimezone(timezone.utc)).total_seconds() > (
-            LIVE_STUCK_MONITOR_RECOVERY_STALE_SECONDS
+        if _monitor_handoff_age_is_stale(
+            now=now,
+            occurred_at=parsed.astimezone(timezone.utc),
         ):
             stale_classified_ids.append(position_id)
             stale_fresh_failed_timestamp_ids.append(position_id)

@@ -5333,6 +5333,24 @@ def test_deploy_live_pre_stop_handoff_classifies_current_all_no_action_failures(
     assert handoff["fresh_failed_monitor_timestamp_stale_position_ids"] == ()
 
 
+def test_deploy_live_monitor_handoff_age_boundary_is_fresh_then_stale():
+    """The exact upper boundary is fresh; only older evidence is stuck."""
+    dl = _load("deploy_live_monitor_handoff_age_boundary", "deploy_live.py")
+    now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    boundary = now - timedelta(
+        seconds=dl.LIVE_STUCK_MONITOR_RECOVERY_STALE_SECONDS
+    )
+
+    assert dl._monitor_handoff_age_is_stale(now=now, occurred_at=boundary) is False
+    assert (
+        dl._monitor_handoff_age_is_stale(
+            now=now,
+            occurred_at=boundary - timedelta(seconds=1),
+        )
+        is True
+    )
+
+
 def test_deploy_live_pre_stop_handoff_classifies_current_closed_market_no_action(
     monkeypatch, tmp_path
 ):
