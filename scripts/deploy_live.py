@@ -1793,14 +1793,17 @@ def _current_quote_only_repair_snapshot_ids(
     trade_db: Path,
     *,
     position_ids: tuple[str, ...],
+    require_no_executable_exit: bool = False,
     now: datetime | None = None,
 ) -> tuple[str, ...]:
     """Return quote-gap positions with exact current local held-book proof.
 
     A current empty bid side is a complete no-action witness for restart
     permission: there is no executable SELL to abandon during the cutover.
-    It is deliberately not converted into a price and grants no venue
-    authority.
+    When ``require_no_executable_exit`` is true, an in-band held bid refuses:
+    only ABSENT or an out-of-band bid proves that stopping the already-stuck
+    monitor cannot abandon a legal SELL.  The snapshot grants restart
+    permission only; it never grants venue authority.
     """
 
     wanted = tuple(dict.fromkeys(str(value).strip() for value in position_ids))
@@ -1912,6 +1915,11 @@ def _current_quote_only_repair_snapshot_ids(
                     or not 0.0 <= held_bid <= 1.0
                 )
             )
+            or (
+                require_no_executable_exit
+                and not no_executable_bid
+                and 0.05 <= held_bid <= 0.95
+            )
         ):
             continue
         proven.add(position_id)
@@ -1926,13 +1934,14 @@ def _quote_only_monitor_repair_handoff_admission(
     handoff: dict[str, object],
     repair_pending: dict[str, object],
 ) -> tuple[bool, str]:
-    """Admit an exact current-book repair over a loaded quote-age defect only.
+    """Admit an exact current-book repair over a loaded monitor defect.
 
-    SCOPE: restart permission while the loaded daemon misclassifies a freshly
-    fetched low-activity CLOB book by its last-mutation timestamp. DRAIN: the
-    replacement runtime uses fetch receipt time and must pass post-boot held
-    monitoring. RESET: any command, pause release, identity gap, expired exact
-    held-token snapshot, or loaded SHA convergence refuses immediately.
+    SCOPE: restart permission while the loaded daemon either misclassifies a
+    freshly fetched low-activity book or cannot complete a monitor result even
+    though an exact current held-token book proves that no legal SELL exists.
+    DRAIN: the replacement runtime loads the pending repair and must pass
+    post-boot held monitoring. RESET: any command, pause release, identity gap,
+    expired snapshot, in-band held bid, or loaded SHA convergence refuses.
     """
 
     if not all(
@@ -2003,8 +2012,12 @@ def _quote_only_monitor_repair_handoff_admission(
         for position_id in tuple(handoff.get("stale_classified_position_ids") or ())
     }
     fresh_count = int(handoff.get("fresh_position_count") or 0)
+    restart_ids = {
+        str(position_id).strip()
+        for position_id in tuple(handoff.get("restart_blocking_position_ids") or ())
+    }
     if (
-        not quote_ids
+        not (quote_ids or restart_ids)
         or len(probability_ids)
         != int(handoff.get("probability_degraded_position_count") or 0)
         or len(quote_ids) != int(handoff.get("quote_only_stale_position_count") or 0)
@@ -2034,10 +2047,6 @@ def _quote_only_monitor_repair_handoff_admission(
         or not stale_timestamp_set.issubset(settlement_set)
     ):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:stale_partition_invalid"
-    restart_ids = {
-        str(position_id).strip()
-        for position_id in tuple(handoff.get("restart_blocking_position_ids") or ())
-    }
     settlement_ids = {
         str(position_id).strip()
         for position_id in tuple(handoff.get("settlement_recoverable_position_ids") or ())
@@ -2053,6 +2062,17 @@ def _quote_only_monitor_repair_handoff_admission(
     )
     if set(snapshot_ids) != quote_set or len(snapshot_ids) != len(quote_ids):
         return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:exact_held_book_not_current"
+    no_exit_snapshot_ids = (
+        _current_quote_only_repair_snapshot_ids(
+            trade_db,
+            position_ids=tuple(restart_ids),
+            require_no_executable_exit=True,
+        )
+        if restart_ids
+        else ()
+    )
+    if set(no_exit_snapshot_ids) != restart_ids:
+        return False, "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_REFUSED:executable_exit_unprotected"
     quote_sidecar = _held_quote_sidecar_current_evidence()
     if quote_sidecar.get("current") is not True:
         return (
@@ -2065,6 +2085,7 @@ def _quote_only_monitor_repair_handoff_admission(
         "QUOTE_ONLY_MONITOR_REPAIR_HANDOFF_ADMITTED: "
         f"open_positions={open_count} fresh_positions={fresh_count} "
         f"quote_only_positions={len(quote_ids)} exact_held_books=current "
+        f"no_executable_exit_positions={len(restart_ids)} "
         f"settlement_recoverable_positions={len(settlement_ids)} "
         "durable_entries_pause=true nonterminal_commands=0 "
         "restart_permission_only=true",

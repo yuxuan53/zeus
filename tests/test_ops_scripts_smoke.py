@@ -4741,6 +4741,97 @@ def test_deploy_live_quote_only_repair_handoff_requires_exact_current_held_book(
     assert "exact_held_books=current" in detail
 
 
+@pytest.mark.parametrize(
+    ("held_bid", "expected_ok"),
+    (("ABSENT", True), ("0.004", True), ("0.05", False), ("0.95", False)),
+)
+def test_deploy_live_stale_monitor_repair_never_abandons_executable_exit(
+    monkeypatch, tmp_path, held_bid, expected_ok
+):
+    """A stuck active monitor may hand off only when its exact bid cannot SELL."""
+    dl = _load("deploy_live_restart_stale_no_exit", "deploy_live.py")
+    trade_db = tmp_path / "zeus_trades.db"
+    conn = sqlite3.connect(trade_db)
+    conn.executescript(
+        """
+        CREATE TABLE position_current (
+            position_id TEXT PRIMARY KEY,
+            condition_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            no_token_id TEXT NOT NULL
+        );
+        CREATE TABLE executable_market_snapshot_latest (
+            condition_id TEXT NOT NULL,
+            selected_outcome_token_id TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            closed INTEGER NOT NULL,
+            accepting_orders INTEGER,
+            orderbook_top_bid TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            freshness_deadline TEXT NOT NULL,
+            tradeability_status_json TEXT NOT NULL
+        );
+        INSERT INTO position_current VALUES (
+            'pos-stale', 'condition-stale', 'buy_no', 'yes-token', 'no-token'
+        );
+        """
+    )
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO executable_market_snapshot_latest VALUES (?, ?, 1, 0, 1, ?, ?, ?, ?)",
+        (
+            "condition-stale",
+            "no-token",
+            held_bid,
+            now.isoformat(),
+            (now + timedelta(minutes=3)).isoformat(),
+            json.dumps({"executable_allowed": True}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    position_ids = ("pos-fresh", "pos-stale")
+    handoff = _fresh_failed_monitor_handoff(
+        position_ids,
+        monitored_position_ids=position_ids,
+        fresh_position_count=1,
+        quote_only_stale_position_count=0,
+        quote_only_stale_position_ids=(),
+        fresh_failed_monitor_no_action_position_count=1,
+        fresh_failed_monitor_no_action_position_ids=("pos-stale",),
+        fresh_failed_monitor_other_classified_position_ids=(),
+        restart_blocking_position_count=1,
+        restart_blocking_position_ids=("pos-stale",),
+        settlement_recoverable_position_count=0,
+        settlement_recoverable_position_ids=(),
+        stale_classified_position_ids=(),
+    )
+    monkeypatch.setattr(
+        dl,
+        "_held_quote_sidecar_current_evidence",
+        lambda: {"current": True, "age_seconds": 1.0},
+    )
+
+    ok, detail = dl._quote_only_monitor_repair_handoff_admission(
+        trade_db=trade_db,
+        obligations={
+            "open_position_count": len(position_ids),
+            "nonterminal_command_count": 0,
+            "all_open_position_ids": position_ids,
+        },
+        pause_state={"entries_paused": True},
+        handoff=handoff,
+        repair_pending={"pending": True},
+    )
+
+    assert ok is expected_ok
+    if expected_ok:
+        assert "no_executable_exit_positions=1" in detail
+    else:
+        assert detail.endswith("executable_exit_unprotected")
+
+
 def test_deploy_live_quote_only_repair_allows_only_stale_settlement_subset(
     monkeypatch, tmp_path
 ):
