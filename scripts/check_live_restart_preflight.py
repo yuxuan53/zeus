@@ -1650,11 +1650,13 @@ def _restart_relevant_entry_command_index() -> dict[str, list[dict[str, Any]]]:
                 ON pc.position_id = cmd.position_id
             """
         fact_join = ""
+        fact_cte = ""
         fact_select = (
             "NULL AS latest_fact_state, NULL AS latest_fact_matched_size, "
             "NULL AS latest_fact_remaining_size"
         )
         trade_join = ""
+        trade_cte = ""
         trade_select = (
             "NULL AS positive_trade_fact_state, NULL AS positive_trade_filled_size, "
             "NULL AS positive_trade_fill_price, NULL AS positive_trade_observed_at"
@@ -1676,8 +1678,8 @@ def _restart_relevant_entry_command_index() -> dict[str, list[dict[str, Any]]]:
                 "lf.matched_size AS latest_fact_matched_size, "
                 "lf.remaining_size AS latest_fact_remaining_size"
             )
-            fact_join = f"""
-              LEFT JOIN (
+            fact_cte = f""",
+            latest_order_facts AS (
                 SELECT command_id, venue_order_id, state, matched_size, remaining_size
                   FROM (
                     SELECT vof.command_id, vof.venue_order_id, vof.state,
@@ -1687,9 +1689,15 @@ def _restart_relevant_entry_command_index() -> dict[str, list[dict[str, Any]]]:
                                ORDER BY {fact_order_by}
                            ) AS rn
                       FROM venue_order_facts vof
+                      JOIN relevant_commands relevant
+                        ON relevant.command_id = vof.command_id
+                       AND relevant.venue_order_id = vof.venue_order_id
                   )
                  WHERE rn = 1
-              ) lf
+            )
+            """
+            fact_join = """
+              LEFT JOIN latest_order_facts lf
                 ON lf.command_id = cmd.command_id
                AND lf.venue_order_id = cmd.venue_order_id
             """
@@ -1709,38 +1717,47 @@ def _restart_relevant_entry_command_index() -> dict[str, list[dict[str, Any]]]:
                     "lft.fill_price AS positive_trade_fill_price, "
                     "lft.observed_at AS positive_trade_observed_at"
                 )
+                trade_cte = """,
+            latest_trade_facts AS (
+                SELECT command_id, state, filled_size, fill_price, observed_at
+                  FROM (
+                    SELECT tf.command_id, tf.state, tf.filled_size, tf.fill_price, tf.observed_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY tf.command_id
+                               ORDER BY datetime(tf.observed_at) DESC, tf.rowid DESC
+                           ) AS rn
+                      FROM venue_trade_facts tf
+                      JOIN relevant_commands relevant
+                        ON relevant.command_id = tf.command_id
+                     WHERE CAST(COALESCE(tf.filled_size, '0') AS REAL) > 0
+                       AND CAST(COALESCE(tf.fill_price, '0') AS REAL) > 0
+                  )
+                 WHERE rn = 1
+            )
+            """
                 trade_join = """
-                  LEFT JOIN (
-                    SELECT command_id, state, filled_size, fill_price, observed_at
-                      FROM (
-                        SELECT tf.command_id, tf.state, tf.filled_size, tf.fill_price, tf.observed_at,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY tf.command_id
-                                   ORDER BY datetime(tf.observed_at) DESC, tf.rowid DESC
-                               ) AS rn
-                          FROM venue_trade_facts tf
-                         WHERE CAST(COALESCE(tf.filled_size, '0') AS REAL) > 0
-                           AND CAST(COALESCE(tf.fill_price, '0') AS REAL) > 0
-                      )
-                     WHERE rn = 1
-                  ) lft
+                  LEFT JOIN latest_trade_facts lft
                     ON lft.command_id = cmd.command_id
                 """
         rows = conn.execute(
             f"""
+            WITH relevant_commands AS (
+                SELECT *
+                  FROM venue_commands
+                 WHERE UPPER(COALESCE(intent_kind, '')) = 'ENTRY'
+                   AND UPPER(COALESCE(side, '')) = 'BUY'
+                   AND UPPER(COALESCE(state, '')) NOT IN ({terminal_placeholders})
+                   AND COALESCE(venue_order_id, '') != ''
+            ){fact_cte}{trade_cte}
             SELECT cmd.command_id, cmd.position_id, cmd.decision_id, cmd.token_id,
                    cmd.state, cmd.venue_order_id, cmd.created_at, cmd.updated_at,
                    {pc_select},
                    {fact_select},
                    {trade_select}
-              FROM venue_commands cmd
+              FROM relevant_commands cmd
               {pc_join}
               {fact_join}
               {trade_join}
-             WHERE UPPER(COALESCE(cmd.intent_kind, '')) = 'ENTRY'
-               AND UPPER(COALESCE(cmd.side, '')) = 'BUY'
-               AND UPPER(COALESCE(cmd.state, '')) NOT IN ({terminal_placeholders})
-               AND COALESCE(cmd.venue_order_id, '') != ''
              ORDER BY datetime(cmd.updated_at) DESC, cmd.command_id DESC
             """,
             tuple(sorted(TERMINAL_VENUE_COMMAND_STATES)),
@@ -4921,25 +4938,41 @@ def _open_positions(*, positive_chain_only: bool = True) -> list[Any]:
             if positive_chain_only and exposure_terms
             else ""
         )
-        params: list[object] = list(phase_sql_params)
-        params.extend(chain_positive_params)
+        exposure_params: list[object] = []
         if positive_chain_only and exposure_terms:
-            params.extend([_POSITIVE_CHAIN_EXPOSURE_EPS] * len(exposure_terms))
-        return list(
-            conn.execute(
-                f"""
-                SELECT position_id, phase, city, target_date, temperature_metric,
+            exposure_params = [_POSITIVE_CHAIN_EXPOSURE_EPS] * len(exposure_terms)
+        selected_columns = f"""position_id, phase, city, target_date, temperature_metric,
                        bin_label, direction, shares, chain_shares, order_status,
                        exit_reason, exit_retry_count, next_exit_retry_at,
                        last_monitor_prob, last_monitor_prob_is_fresh,
                        last_monitor_market_price, last_monitor_market_price_is_fresh,
                        updated_at,
-                       {", ".join(optional_selects)}
+                       {", ".join(optional_selects)}"""
+        # Keep each branch independently sargable on the existing
+        # (phase, chain_state, chain_shares, token) index.  The previous OR
+        # joined the normal and voided-chain-risk populations and forced a
+        # full scan of the 199GB append-only projection.
+        query_parts = [
+            f"""SELECT {selected_columns}
                   FROM position_current
-                 WHERE ({phase_sql} OR {chain_positive_sql})
-                   {exposure_filter}
-                 ORDER BY CASE phase WHEN 'pending_exit' THEN 0 ELSE 1 END,
-                          city, target_date, bin_label
+                 WHERE {phase_sql}
+                   {exposure_filter}"""
+        ]
+        params: list[object] = [*phase_sql_params, *exposure_params]
+        if chain_positive_sql != "0":
+            query_parts.append(
+                f"""SELECT {selected_columns}
+                      FROM position_current
+                     WHERE {chain_positive_sql}
+                       {exposure_filter}"""
+            )
+            params.extend([*chain_positive_params, *exposure_params])
+        return list(
+            conn.execute(
+                f"""SELECT *
+                      FROM ({" UNION ALL ".join(query_parts)}) candidates
+                     ORDER BY CASE phase WHEN 'pending_exit' THEN 0 ELSE 1 END,
+                              city, target_date, bin_label
                 """
                 ,
                 tuple(params),

@@ -8544,6 +8544,56 @@ def test_monitor_cadence_restart_uses_three_cycle_inclusive_age_contract(
     assert preflight.MONITOR_CADENCE_RESTART_MAX_AGE_SECONDS == 360.0
 
 
+def test_open_positions_preserves_normal_and_voided_chain_risk_scope(
+    monkeypatch, tmp_path
+):
+    """The indexed phase branches retain active and voided-risk semantics."""
+    trade_db = tmp_path / "zeus_trades.db"
+    conn = sqlite3.connect(trade_db)
+    conn.execute(
+        """
+        CREATE TABLE position_current (
+            position_id TEXT PRIMARY KEY, phase TEXT, city TEXT,
+            target_date TEXT, temperature_metric TEXT, bin_label TEXT,
+            direction TEXT, shares REAL, chain_shares REAL,
+            order_status TEXT, exit_reason TEXT, exit_retry_count INTEGER,
+            next_exit_retry_at TEXT, last_monitor_prob REAL,
+            last_monitor_prob_is_fresh INTEGER, last_monitor_market_price REAL,
+            last_monitor_market_price_is_fresh INTEGER, updated_at TEXT,
+            chain_state TEXT, condition_id TEXT, token_id TEXT,
+            no_token_id TEXT, entry_method TEXT, p_posterior REAL,
+            cost_basis_usd REAL, order_id TEXT
+        )
+        """
+    )
+    values = (
+        "active-pos", "active", "A", "2026-09-05", "high", "bin",
+        "buy_yes", 2.0, 2.0, "filled", None, 0, None, 0.5, 1,
+        0.5, 1, "2026-09-05T00:00:00+00:00", "synced", "c-a", "t-a",
+        "n-a", "qkernel_spine", 0.5, 1.0, None,
+    )
+    conn.execute(
+        "INSERT INTO position_current VALUES (" + ",".join("?" * len(values)) + ")",
+        values,
+    )
+    voided = list(values)
+    voided[0] = "voided-pos"
+    voided[1] = "voided"
+    voided[7] = 0.0
+    voided[8] = 1.0
+    conn.execute(
+        "INSERT INTO position_current VALUES (" + ",".join("?" * len(voided)) + ")",
+        voided,
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(preflight, "TRADE_DB", trade_db)
+
+    rows = preflight._open_positions()
+
+    assert [row["position_id"] for row in rows] == ["active-pos", "voided-pos"]
+
+
 def test_monitor_cadence_restart_evidence_blocks_running_stale_main(
     monkeypatch, tmp_path
 ):
