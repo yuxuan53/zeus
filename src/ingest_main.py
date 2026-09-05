@@ -71,6 +71,8 @@ _ORACLE_BRIDGE_LOCK = threading.Lock()
 _ORACLE_SNAPSHOT_LOCK = threading.Lock()
 _DAY0_METAR_EMITTER: Any | None = None
 _DAY0_HKO_POLLER: Any | None = None
+_DAY0_HKO_REPLAY_NEXT_MONOTONIC = 0.0
+_DAY0_HKO_REPLAY_INTERVAL_SECONDS = 30.0
 _DAY0_METAR_COMMIT_LOCK = threading.Lock()
 _DAY0_METAR_PENDING_COMMITS: list[tuple[Any, str, bool, Any | None]] = []
 _DAY0_METAR_RETRY_LOCK = threading.Lock()
@@ -481,6 +483,7 @@ def _bridge_committed_day0_events(
                     city=city,
                     target_date=target_date,
                     metric=metric,
+                    station_source_clock=(source == "day0_hko_source_clock"),
                 )
                 logger.info(
                     "DAY0_SOURCE_MATERIALIZATION_BRIDGE source=%s city=%s "
@@ -2083,6 +2086,92 @@ def _raise_if_all_obs_tick_attempts_failed(job_id: str, results: list[object]) -
     )
 
 
+def _replay_hko_station_day0_events() -> dict[str, object]:
+    """Requeue the latest durable HKO Day0 identities after worker loss/restart.
+
+    SCOPE: Hong Kong's current local date and HKO-authorized Day0 events.
+    DRAIN: the station worker reuses the canonical Day0 reader, enqueue CAS, and
+    seed transport. RESET: the existing marker/visible-seed/request/posterior
+    checks make the replay a no-op once that exact identity is complete.
+    """
+
+    global _DAY0_HKO_REPLAY_NEXT_MONOTONIC
+    now_monotonic = time.monotonic()
+    if now_monotonic < _DAY0_HKO_REPLAY_NEXT_MONOTONIC:
+        return {"status": "HKO_REPLAY_THROTTLED"}
+    _DAY0_HKO_REPLAY_NEXT_MONOTONIC = (
+        now_monotonic + _DAY0_HKO_REPLAY_INTERVAL_SECONDS
+    )
+    from src.data.replacement_cycle_advance_trigger import (
+        enqueue_day0_extreme_updated_materialization_seed,
+        hko_station_day0_identity_complete,
+    )
+    from src.state.db import get_world_connection_read_only
+
+    target_date = datetime.now(ZoneInfo("Asia/Hong_Kong")).date().isoformat()
+    conn = get_world_connection_read_only()
+    try:
+        rows = conn.execute(
+            """
+            WITH ranked AS (
+                SELECT payload_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY json_extract(payload_json, '$.metric')
+                           ORDER BY available_at DESC, created_at DESC, event_id DESC
+                       ) AS rank
+                  FROM opportunity_events
+                 WHERE event_type = 'DAY0_EXTREME_UPDATED'
+                   AND json_extract(payload_json, '$.city') = 'Hong Kong'
+                   AND json_extract(payload_json, '$.target_date') = ?
+                   AND json_extract(payload_json, '$.settlement_source') =
+                       'hko_hourly_accumulator'
+            )
+            SELECT payload_json FROM ranked
+             WHERE rank = 1
+               AND json_extract(payload_json, '$.metric') IN ('high', 'low')
+            """,
+            (target_date,),
+        ).fetchall()
+    finally:
+        conn.close()
+    reports: list[dict[str, object]] = []
+    queued = 0
+    for row in rows:
+        try:
+            payload = json.loads(str(row[0]))
+            metric = str(payload.get("metric") or "").strip().lower()
+            settlement_source = str(payload.get("settlement_source") or "").strip()
+            observation_time = str(payload.get("observation_time") or "").strip()
+            observed_extreme_c = float(payload["raw_value"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            reports.append({"status": "HKO_REPLAY_EVENT_INVALID"})
+            continue
+        if hko_station_day0_identity_complete(
+            city="Hong Kong",
+            target_date=target_date,
+            metric=metric,
+            settlement_source=settlement_source,
+            observation_time=observation_time,
+            observed_extreme_c=observed_extreme_c,
+        ):
+            reports.append({"status": "HKO_REPLAY_COMPLETE", "metric": metric})
+            continue
+        reports.append(
+            enqueue_day0_extreme_updated_materialization_seed(
+                city="Hong Kong",
+                target_date=target_date,
+                metric=metric,
+                station_source_clock=True,
+            )
+        )
+        queued += 1
+    return {
+        "status": "HKO_REPLAY_QUEUED" if queued else "HKO_REPLAY_NOOP",
+        "count": queued,
+        "reports": reports,
+    }
+
+
 @_scheduler_job("ingest_k2_hko_tick")
 def _k2_hko_tick():
     """Poll HKO extrema conditionally and publish changed facts after commit."""
@@ -2105,7 +2194,7 @@ def _k2_hko_tick():
     poller = _day0_hko_poller()
     prefetch = poller.prefetch()
     if prefetch is None:
-        return {"status": "SOURCE_CURRENT"}
+        return _replay_hko_station_day0_events()
 
     snapshot = prefetch.snapshot
     hko_city = runtime_cities_by_name()["Hong Kong"]

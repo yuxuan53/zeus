@@ -73,10 +73,12 @@ _DAY0_CONDITIONING_IDENTITY_COLUMN = "day0_conditioning_identity_json"
 _CYCLE_ADVANCE_STAGING_DIR = ".cycle-advance-staging"
 _DAY0_BRIDGE_STOP = object()
 _DAY0_BRIDGE_CONDITION = threading.Condition()
-_DAY0_BRIDGE_QUEUES: dict[bool, queue.Queue[object]] = {
+_DAY0_BRIDGE_QUEUES: dict[bool | str, queue.Queue[object]] = {
     True: queue.Queue(),
     False: queue.Queue(),
 }
+_DAY0_STATION_LANE = "station"
+_DAY0_BRIDGE_QUEUES[_DAY0_STATION_LANE] = queue.Queue()
 _DAY0_BRIDGE_CLASSIFY_QUEUE: queue.Queue[object] = queue.Queue()
 _DAY0_BRIDGE_THREADS: tuple[threading.Thread, ...] = ()
 _DAY0_BRIDGE_CLOSED = False
@@ -89,9 +91,10 @@ class _Day0BridgePending:
     metric: str
     computed_at: datetime | None
     held_position: bool | None
+    station_source_clock: bool = False
     generation: int = 1
     running: bool = False
-    lane: bool | None = None
+    lane: bool | str | None = None
     enqueued_monotonic: float = 0.0
     failures: int = 0
 
@@ -99,6 +102,7 @@ class _Day0BridgePending:
 _DAY0_BRIDGE_PENDING: dict[tuple[str, str, str], _Day0BridgePending] = {}
 _DAY0_BRIDGE_RETRY_BASE_SECONDS = 0.5
 _DAY0_BRIDGE_RETRY_MAX_SECONDS = 30.0
+_DAY0_STATION_RESEED_DEADLINE_SECONDS = 10.0
 
 
 class _Day0EnqueueOwnerRequestState(Enum):
@@ -2319,6 +2323,7 @@ def enqueue_single_family_cycle_advance_reseed(
     day0_observation_state: str | None = None,
     held_position: bool = False,
     minimum_posterior_computed_at: datetime | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
     """ALWAYS-DECIDABLE invariant — Build 2 (operator law 2026-06-12). Single-family variant of
     ``enqueue_cycle_advance_reseeds``: when the reactor/monitor finds ONE family blocked on a
@@ -2369,6 +2374,16 @@ def enqueue_single_family_cycle_advance_reseed(
         "held_position": bool(held_position),
         "enqueued": False,
     }
+
+    def _require_deadline() -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError("DAY0_STATION_RESEED_DEADLINE_EXCEEDED")
+
+    try:
+        _require_deadline()
+    except TimeoutError:
+        report["status"] = "DAY0_STATION_RESEED_DEADLINE_EXCEEDED"
+        return report
     day0_identity = _day0_conditioning_identity(
         source=day0_observed_extreme_source,
         observation_time=day0_observed_extreme_observation_time,
@@ -2396,9 +2411,18 @@ def enqueue_single_family_cycle_advance_reseed(
         report["status"] = "CYCLE_ADVANCE_METRIC_INVALID"
         return report
 
-    conn = _connect(forecast_db, write_class="live")
+    try:
+        conn = _connect(
+            forecast_db,
+            write_class="live",
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TimeoutError:
+        report["status"] = "DAY0_STATION_RESEED_DEADLINE_EXCEEDED"
+        return report
     conn.row_factory = sqlite3.Row
     try:
+        _require_deadline()
         ensure_replacement_forecast_live_schema(conn)
         expected = expected_replacement_dependency_identity_by_role(metric)
         manifests = _family_manifests_from_db(
@@ -2576,6 +2600,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         seed_name=_seed_name,
                         day0_observed_extreme_source=day0_observed_extreme_source,
                     )
+                    _require_deadline()
                     seed_file = _build_and_write_advance_seed(
                         conn,
                         city=city,
@@ -2612,6 +2637,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         day0_observation_state=day0_observation_state,
                         output_path=staged_seed_file,
                         cycle_advance_enqueue_owner=True,
+                        deadline_monotonic=deadline_monotonic,
                     )
                     if seed_file is None:
                         report["status"] = "CYCLE_ADVANCE_MANIFEST_MISSING"
@@ -2727,6 +2753,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         seed_name=_seed_name,
                         day0_observed_extreme_source=day0_observed_extreme_source,
                     )
+                    _require_deadline()
                     seed_file = _build_and_write_advance_seed(
                         conn,
                         city=city,
@@ -2753,6 +2780,7 @@ def enqueue_single_family_cycle_advance_reseed(
                         upgrade_trigger="held_belief_computed_age_expired",
                         output_path=staged_seed_file,
                         cycle_advance_enqueue_owner=True,
+                        deadline_monotonic=deadline_monotonic,
                     )
                     if seed_file is None:
                         report["status"] = "SAME_CYCLE_RECOMPUTE_MANIFEST_MISSING"
@@ -2840,6 +2868,7 @@ def enqueue_single_family_cycle_advance_reseed(
                 seed_name=_seed_name,
                 day0_observed_extreme_source=day0_observed_extreme_source,
             )
+            _require_deadline()
             seed_file = _build_and_write_advance_seed(
                 conn,
                 city=city,
@@ -2868,6 +2897,7 @@ def enqueue_single_family_cycle_advance_reseed(
                 day0_observation_state=day0_observation_state,
                 output_path=staged_seed_file,
                 cycle_advance_enqueue_owner=True,
+                deadline_monotonic=deadline_monotonic,
             )
             if seed_file is None:
                 report["status"] = "CYCLE_ADVANCE_MANIFEST_MISSING"
@@ -2964,6 +2994,7 @@ def enqueue_single_family_cycle_advance_reseed(
             seed_name=_seed_name,
             day0_observed_extreme_source=day0_observed_extreme_source,
         )
+        _require_deadline()
         seed_file = _build_and_write_advance_seed(
             conn,
             city=city,
@@ -2992,6 +3023,7 @@ def enqueue_single_family_cycle_advance_reseed(
             day0_observation_state=day0_observation_state,
             output_path=staged_seed_file,
             cycle_advance_enqueue_owner=True,
+            deadline_monotonic=deadline_monotonic,
         )
         if seed_file is None:
             report["status"] = "CYCLE_ADVANCE_MANIFEST_MISSING"
@@ -3036,6 +3068,8 @@ def enqueue_single_family_cycle_advance_reseed(
         report["seed_file"] = str(visible_seed_file)
         report["consumed_cycle"] = consumed_cycle_iso
         report["target_cycle"] = target_cycle_iso
+    except TimeoutError:
+        report["status"] = "DAY0_STATION_RESEED_DEADLINE_EXCEEDED"
     except Exception as exc:  # noqa: BLE001 — fail-soft: never raise into the reactor cycle
         _LOG.debug(
             "single-family cycle-advance failed for %s/%s/%s: %s", city, target_date, metric, exc
@@ -3054,6 +3088,7 @@ def _materialize_day0_extreme_updated_seed(
     metric: str,
     computed_at: datetime | None = None,
     held_position: bool | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
     """Bridge a committed DAY0_EXTREME_UPDATED event to an immediate re-materialization seed.
 
@@ -3124,6 +3159,9 @@ def _materialize_day0_extreme_updated_seed(
                 )
             except Exception:  # noqa: BLE001 — priority tagging is best-effort, never fatal
                 held_position = False
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            report["status"] = "DAY0_STATION_RESEED_DEADLINE_EXCEEDED"
+            return report
         inner = enqueue_single_family_cycle_advance_reseed(
             forecast_db=Path(str(forecast_db)),
             seed_dir=Path(str(seed_dir)),
@@ -3133,6 +3171,7 @@ def _materialize_day0_extreme_updated_seed(
             metric=metric,
             computed_at=now,
             held_position=bool(held_position),
+            deadline_monotonic=deadline_monotonic,
             **day0_payload,
         )
         report.update(inner)
@@ -3146,6 +3185,101 @@ def _materialize_day0_extreme_updated_seed(
         report["status"] = "DAY0_EXTREME_BRIDGE_FAILSOFT_SKIPPED"
         report["error"] = str(exc)
         return report
+
+
+def hko_station_day0_identity_complete(
+    *,
+    city: str,
+    target_date: str,
+    metric: str,
+    settlement_source: str,
+    observation_time: str,
+    observed_extreme_c: float,
+    as_of: datetime | None = None,
+) -> bool:
+    """Return whether one durable HKO Day0 identity has crossed a handoff receipt.
+
+    SCOPE: one HKO (city, local-date, high|low, source-observation) identity.
+    DRAIN: a visible seed, its exact request/inflight witness, or a live posterior
+    with the same conditioning identity. RESET: only one of those exact witnesses
+    suppresses replay; absent, malformed, or unreadable evidence returns ``False``
+    so the periodic station lane retries. HKO uses Celsius and has no fast-station
+    override, so its committed event payload is the canonical conditioning tuple.
+    """
+
+    identity = _day0_conditioning_identity(
+        source=settlement_source,
+        observation_time=observation_time,
+        observed_extreme_c=observed_extreme_c,
+        unit="C",
+    )
+    if (
+        identity is None
+        or str(city) != "Hong Kong"
+        or str(metric).strip().lower() not in {"high", "low"}
+    ):
+        return False
+    try:
+        from src.data.replacement_forecast_production import (  # noqa: PLC0415
+            _replacement_forecast_live_materialization_queue_config,
+        )
+
+        forecast_db = _replacement_forecast_live_materialization_queue_config().get(
+            "forecast_db"
+        )
+        if forecast_db is None or not Path(str(forecast_db)).exists():
+            return False
+        conn = sqlite3.connect(
+            f"file:{Path(str(forecast_db))}?mode=ro",
+            uri=True,
+            timeout=0.0,
+        )
+    except (OSError, sqlite3.Error):
+        return False
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT seed_file, target_cycle_time
+              FROM cycle_advance_enqueues
+             WHERE city = ? AND target_date = ? AND metric = ?
+               AND day0_conditioning_identity_json = ?
+             ORDER BY target_cycle_time DESC, enqueued_at DESC
+             LIMIT 1
+            """,
+            (str(city), str(target_date), str(metric).strip().lower(), identity),
+        ).fetchone()
+        if row is None:
+            return False
+        seed_file = str(row["seed_file"] or "")
+        target_cycle_iso = str(row["target_cycle_time"] or "")
+        if not seed_file or not target_cycle_iso:
+            return False
+        if Path(seed_file).is_file():
+            return True
+        request = _day0_enqueue_owner_request_check(
+            city=str(city),
+            target_date=str(target_date),
+            metric=str(metric).strip().lower(),
+            target_cycle_iso=target_cycle_iso,
+            seed_file=seed_file,
+            identity=identity,
+        )
+        if request.state is _Day0EnqueueOwnerRequestState.ACTIVE:
+            return True
+        return _latest_posterior_matches_day0_conditioning(
+            conn,
+            city=str(city),
+            target_date=str(target_date),
+            metric=str(metric).strip().lower(),
+            identity=identity,
+            target_cycle_iso=target_cycle_iso,
+            as_of=as_of or datetime.now(tz=UTC),
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+    finally:
+        conn.close()
 
 
 def _day0_bridge_status_retryable(status: object) -> bool:
@@ -3162,6 +3296,7 @@ def _day0_bridge_status_retryable(status: object) -> bool:
         "DAY0_EXTREME_BRIDGE_NO_OBSERVED_EXTREME",
         "DAY0_EXTREME_BRIDGE_NOT_CONFIGURED",
         "SAME_CYCLE_RECOMPUTE_RETRY_PENDING",
+        "DAY0_STATION_RESEED_DEADLINE_EXCEEDED",
     }
 
 
@@ -3177,8 +3312,8 @@ def _requeue_day0_bridge_pending(
         _DAY0_BRIDGE_CONDITION.notify_all()
 
 
-def _day0_bridge_worker(held_lane: bool) -> None:
-    bridge_queue = _DAY0_BRIDGE_QUEUES[held_lane]
+def _day0_bridge_worker(lane: bool | str) -> None:
+    bridge_queue = _DAY0_BRIDGE_QUEUES[lane]
     while True:
         item = bridge_queue.get()
         try:
@@ -3187,7 +3322,7 @@ def _day0_bridge_worker(held_lane: bool) -> None:
             key = item
             with _DAY0_BRIDGE_CONDITION:
                 pending = _DAY0_BRIDGE_PENDING.get(key)
-                if pending is None or pending.running or pending.lane != held_lane:
+                if pending is None or pending.running or pending.lane != lane:
                     continue
                 pending.running = True
                 generation = pending.generation
@@ -3196,14 +3331,26 @@ def _day0_bridge_worker(held_lane: bool) -> None:
                 queued_at = pending.enqueued_monotonic
             started_at = time.monotonic()
             try:
+                deadline_monotonic = (
+                    started_at + _DAY0_STATION_RESEED_DEADLINE_SECONDS
+                    if lane == _DAY0_STATION_LANE
+                    else None
+                )
                 report = _materialize_day0_extreme_updated_seed(
                     city=pending.city,
                     target_date=pending.target_date,
                     metric=pending.metric,
                     computed_at=computed_at,
                     held_position=held_position,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 status = report.get("status")
+                if (
+                    lane == _DAY0_STATION_LANE
+                    and time.monotonic() - started_at
+                    >= _DAY0_STATION_RESEED_DEADLINE_SECONDS
+                ):
+                    status = "DAY0_STATION_RESEED_DEADLINE_EXCEEDED"
             except Exception as exc:  # noqa: BLE001 - durable event remains retry authority
                 status = f"WORKER_FAILED:{type(exc).__name__}"
                 _LOG.exception(
@@ -3215,11 +3362,11 @@ def _day0_bridge_worker(held_lane: bool) -> None:
             runtime_ms = (time.monotonic() - started_at) * 1000.0
             _LOG.info(
                 "day0 materialization worker city=%s target_date=%s metric=%s "
-                "held_lane=%s status=%s queue_wait_ms=%.1f runtime_ms=%.1f",
+                "lane=%s status=%s queue_wait_ms=%.1f runtime_ms=%.1f",
                 pending.city,
                 pending.target_date,
                 pending.metric,
-                held_lane,
+                lane,
                 status,
                 (started_at - queued_at) * 1000.0,
                 runtime_ms,
@@ -3247,7 +3394,11 @@ def _day0_bridge_worker(held_lane: bool) -> None:
                 elif current is pending:
                     current.running = False
                     current.failures = 0
-                    current.lane = current.held_position is not False
+                    current.lane = (
+                        _DAY0_STATION_LANE
+                        if current.station_source_clock
+                        else current.held_position is not False
+                    )
                     current.enqueued_monotonic = time.monotonic()
                     _DAY0_BRIDGE_QUEUES[current.lane].put_nowait(key)
                 _DAY0_BRIDGE_CONDITION.notify_all()
@@ -3310,11 +3461,15 @@ def _start_day0_bridge_workers_locked() -> None:
     workers = tuple(
         threading.Thread(
             target=_day0_bridge_worker,
-            args=(held_lane,),
-            name=f"day0-materialization-{'held' if held_lane else 'entry'}",
+            args=(lane,),
+            name=f"day0-materialization-{name}",
             daemon=True,
         )
-        for held_lane in (True, False)
+        for lane, name in (
+            (True, "held"),
+            (_DAY0_STATION_LANE, "station"),
+            (False, "entry"),
+        )
     )
     _DAY0_BRIDGE_THREADS = (
         threading.Thread(
@@ -3335,6 +3490,7 @@ def enqueue_day0_extreme_updated_materialization_seed(
     metric: str,
     computed_at: datetime | None = None,
     held_position: bool | None = None,
+    station_source_clock: bool = False,
 ) -> dict[str, object]:
     """Queue Day0 posterior work without running materialization inline."""
 
@@ -3351,7 +3507,12 @@ def enqueue_day0_extreme_updated_materialization_seed(
         if pending is not None:
             pending.generation += 1
             pending.computed_at = computed_at
-            if held_position is True:
+            if station_source_clock:
+                pending.station_source_clock = True
+                if not pending.running and pending.lane != _DAY0_STATION_LANE:
+                    pending.lane = _DAY0_STATION_LANE
+                    _DAY0_BRIDGE_QUEUES[_DAY0_STATION_LANE].put_nowait(key)
+            elif held_position is True:
                 pending.held_position = True
                 if not pending.running and pending.lane is not True:
                     pending.lane = True
@@ -3365,16 +3526,22 @@ def enqueue_day0_extreme_updated_materialization_seed(
                 "city": key[0],
                 "target_date": key[1],
                 "metric": key[2],
-                "held_lane": pending.lane,
+                "held_lane": pending.lane if isinstance(pending.lane, bool) else None,
+                "station_lane": pending.lane == _DAY0_STATION_LANE,
                 "priority_classification_pending": pending.lane is None,
             }
-        lane = bool(held_position) if held_position is not None else None
+        lane: bool | str | None = (
+            _DAY0_STATION_LANE
+            if station_source_clock
+            else bool(held_position) if held_position is not None else None
+        )
         pending = _Day0BridgePending(
             city=key[0],
             target_date=key[1],
             metric=key[2],
             computed_at=computed_at,
             held_position=held_position,
+            station_source_clock=station_source_clock,
             lane=lane,
             enqueued_monotonic=time.monotonic(),
         )
@@ -3389,7 +3556,8 @@ def enqueue_day0_extreme_updated_materialization_seed(
         "city": key[0],
         "target_date": key[1],
         "metric": key[2],
-        "held_lane": lane,
+        "held_lane": lane if isinstance(lane, bool) else None,
+        "station_lane": lane == _DAY0_STATION_LANE,
         "priority_classification_pending": lane is None,
     }
 
@@ -3451,6 +3619,7 @@ def _build_and_write_advance_seed(
     output_path: Path | None = None,
     cycle_advance_enqueue_owner: bool = False,
     required_baseline_source_run_id: str | None = None,
+    deadline_monotonic: float | None = None,
 ) -> Path | None:
     """Build one re-materialization seed for a scope using the existing seed-builder pieces and
     write it into seed_dir. Returns the seed Path, or None when the required manifests/context are
@@ -3459,6 +3628,11 @@ def _build_and_write_advance_seed(
     the LATEST manifest cycle, so the re-materialized posterior advances onto the fresh cycle and the
     materializer's monotone guard admits it (request cycle >= current posterior cycle). Mirrors the
     fusion-upgrade trigger's _build_and_write_upgrade_seed (single seed-build shape)."""
+    def _require_deadline() -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError("DAY0_STATION_RESEED_DEADLINE_EXCEEDED")
+
+    _require_deadline()
     expected = expected_identity(metric)
     from src.config import cities_by_name  # noqa: PLC0415
 
@@ -3478,6 +3652,7 @@ def _build_and_write_advance_seed(
     precision_metadata = manifest_path_value(openmeteo, "precision_metadata_json")
     if not openmeteo_payload or not precision_metadata:
         return None
+    _require_deadline()
     coverage = latest_baseline_coverage(
         conn,
         city=city,
@@ -3486,10 +3661,12 @@ def _build_and_write_advance_seed(
         not_after_source_cycle_time=openmeteo.source_cycle_time,
         as_of_time=computed_at,
     )
+    _require_deadline()
     bins = market_bins(conn, city=city, target_date=target_date, temperature_metric=metric)
     if coverage is None or not bins:
         return None
     openmeteo_base_dir = manifest_base_dir(openmeteo, fallback=raw_dir)
+    _require_deadline()
     seed_result = build_seed(
         city=city,
         target_date=target_date,
@@ -3529,5 +3706,6 @@ def _build_and_write_advance_seed(
         {"city": city, "target_date": target_date, "temperature_metric": metric},
         computed_at=computed_at,
     )
+    _require_deadline()
     write_seed(seed_file, seed_payload)
     return seed_file

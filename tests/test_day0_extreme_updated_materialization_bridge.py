@@ -5039,6 +5039,206 @@ def test_held_bridge_lane_is_not_blocked_by_slow_entry_family(monkeypatch) -> No
     assert cycle_advance._wait_for_day0_materialization_bridge_idle(2.0)
 
 
+def test_station_bridge_lane_is_not_blocked_by_slow_entry_family(monkeypatch) -> None:
+    entry_started = threading.Event()
+    release_entry = threading.Event()
+    station_done = threading.Event()
+
+    def _materialize(**kwargs):
+        if kwargs["city"] == "SlowEntry":
+            entry_started.set()
+            assert release_entry.wait(timeout=2.0)
+        else:
+            station_done.set()
+        return {"status": "TEST_DONE"}
+
+    monkeypatch.setattr(cycle_advance, "_materialize_day0_extreme_updated_seed", _materialize)
+    cycle_advance.enqueue_day0_extreme_updated_materialization_seed(
+        city="SlowEntry", target_date="2026-07-20", metric="low", held_position=False,
+    )
+    assert entry_started.wait(timeout=1.0)
+
+    station = cycle_advance.enqueue_day0_extreme_updated_materialization_seed(
+        city="Hong Kong",
+        target_date="2026-07-20",
+        metric="high",
+        station_source_clock=True,
+    )
+    assert station["station_lane"] is True
+    assert station_done.wait(timeout=0.5)
+
+    release_entry.set()
+    assert cycle_advance._wait_for_day0_materialization_bridge_idle(2.0)
+
+
+def test_station_bridge_coalesces_latest_revision_before_replay(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[datetime] = []
+
+    def _materialize(**kwargs):
+        calls.append(kwargs["computed_at"])
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(timeout=2.0)
+        return {"status": "TEST_DONE"}
+
+    monkeypatch.setattr(cycle_advance, "_materialize_day0_extreme_updated_seed", _materialize)
+    first_at = datetime(2026, 7, 20, 5, 0, tzinfo=UTC)
+    latest_at = datetime(2026, 7, 20, 5, 10, tzinfo=UTC)
+    cycle_advance.enqueue_day0_extreme_updated_materialization_seed(
+        city="Hong Kong", target_date="2026-07-20", metric="high",
+        computed_at=first_at, station_source_clock=True,
+    )
+    assert started.wait(timeout=1.0)
+    coalesced = cycle_advance.enqueue_day0_extreme_updated_materialization_seed(
+        city="Hong Kong", target_date="2026-07-20", metric="high",
+        computed_at=latest_at, station_source_clock=True,
+    )
+    assert coalesced["status"] == "DAY0_EXTREME_BRIDGE_COALESCED"
+    assert coalesced["station_lane"] is True
+    release.set()
+    assert cycle_advance._wait_for_day0_materialization_bridge_idle(2.0)
+    assert calls == [first_at, latest_at]
+
+
+def test_station_bridge_deadline_is_typed_retry(monkeypatch) -> None:
+    calls = []
+
+    def _materialize(**_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.02)
+        return {"status": "TEST_DONE"}
+
+    monkeypatch.setattr(cycle_advance, "_materialize_day0_extreme_updated_seed", _materialize)
+    monkeypatch.setattr(cycle_advance, "_DAY0_STATION_RESEED_DEADLINE_SECONDS", 0.001)
+    monkeypatch.setattr(cycle_advance, "_DAY0_BRIDGE_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(cycle_advance, "_DAY0_BRIDGE_RETRY_MAX_SECONDS", 0.02)
+    cycle_advance.enqueue_day0_extreme_updated_materialization_seed(
+        city="Hong Kong", target_date="2026-07-20", metric="low", station_source_clock=True,
+    )
+    assert cycle_advance._wait_for_day0_materialization_bridge_idle(1.0)
+    assert len(calls) == 2
+
+
+def test_hko_replay_requeues_latest_committed_metrics_to_station_lane(monkeypatch) -> None:
+    from src import ingest_main
+
+    class _WorldRead:
+        def execute(self, *_args, **_kwargs):
+            return type(
+                "_Rows",
+                (),
+                {
+                    "fetchall": lambda self: (
+                        (
+                            json.dumps(
+                                {
+                                    "metric": "high",
+                                    "settlement_source": "hko_hourly_accumulator",
+                                    "observation_time": "2026-07-20T05:00:00+00:00",
+                                    "raw_value": 31.2,
+                                }
+                            ),
+                        ),
+                        (
+                            json.dumps(
+                                {
+                                    "metric": "low",
+                                    "settlement_source": "hko_hourly_accumulator",
+                                    "observation_time": "2026-07-20T05:00:00+00:00",
+                                    "raw_value": 27.0,
+                                }
+                            ),
+                        ),
+                    )
+                },
+            )()
+
+        def close(self):
+            return None
+
+    calls = []
+    monkeypatch.setattr(state_db, "get_world_connection_read_only", _WorldRead)
+    monkeypatch.setattr(
+        cycle_advance,
+        "enqueue_day0_extreme_updated_materialization_seed",
+        lambda **kwargs: calls.append(kwargs) or {"status": "QUEUED"},
+    )
+    monkeypatch.setattr(
+        cycle_advance,
+        "hko_station_day0_identity_complete",
+        lambda **kwargs: kwargs["metric"] == "high",
+    )
+    monkeypatch.setattr(ingest_main, "_DAY0_HKO_REPLAY_NEXT_MONOTONIC", 0.0)
+
+    report = ingest_main._replay_hko_station_day0_events()
+
+    assert report["status"] == "HKO_REPLAY_QUEUED"
+    assert report["count"] == 1
+    assert {call["metric"] for call in calls} == {"low"}
+    assert all(call["station_source_clock"] is True for call in calls)
+
+
+def test_hko_completion_requires_visible_seed_or_later_receipt(tmp_path, monkeypatch) -> None:
+    db_path = _prepare_forecast_db(tmp_path)
+    cfg = _queue_config(tmp_path)
+    monkeypatch.setattr(
+        forecast_production,
+        "_replacement_forecast_live_materialization_queue_config",
+        lambda: cfg,
+    )
+    payload = {
+        "day0_observed_extreme_c": 31.2,
+        "day0_observed_extreme_source": "hko_hourly_accumulator",
+        "day0_observed_extreme_observation_time": "2026-07-20T05:00:00+00:00",
+        "day0_observed_extreme_unit": "C",
+    }
+    seed_file = Path(cfg["seed_dir"]) / "hko.visible.seed.json"
+    seed_file.parent.mkdir()
+    seed_file.write_text("{}", encoding="utf-8")
+    cycle = "2026-07-20T00:00:00+00:00"
+    conn = sqlite3.connect(db_path)
+    assert cycle_advance._record_enqueue(
+        conn,
+        city="Hong Kong",
+        target_date="2026-07-20",
+        metric="high",
+        consumed_cycle_iso="NO_LIVE_POSTERIOR",
+        target_cycle_iso=cycle,
+        held_position=False,
+        seed_file=str(seed_file),
+        reason="DAY0_OBSERVATION_ADVANCED",
+        day0_observed_extreme_observation_time=payload[
+            "day0_observed_extreme_observation_time"
+        ],
+        day0_observed_extreme_source=payload["day0_observed_extreme_source"],
+        day0_observed_extreme_c=payload["day0_observed_extreme_c"],
+        day0_observed_extreme_unit=payload["day0_observed_extreme_unit"],
+    )
+    conn.commit()
+    conn.close()
+
+    assert cycle_advance.hko_station_day0_identity_complete(
+        city="Hong Kong",
+        target_date="2026-07-20",
+        metric="high",
+        settlement_source="hko_hourly_accumulator",
+        observation_time="2026-07-20T05:00:00+00:00",
+        observed_extreme_c=31.2,
+    )
+    seed_file.unlink()
+    assert not cycle_advance.hko_station_day0_identity_complete(
+        city="Hong Kong",
+        target_date="2026-07-20",
+        metric="high",
+        settlement_source="hko_hourly_accumulator",
+        observation_time="2026-07-20T05:00:00+00:00",
+        observed_extreme_c=31.2,
+    )
+
+
 def test_running_entry_is_promoted_to_held_lane_on_coalesced_replay(monkeypatch) -> None:
     first_started = threading.Event()
     release_first = threading.Event()
