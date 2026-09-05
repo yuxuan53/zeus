@@ -20013,7 +20013,7 @@ def test_current_global_book_epoch_batches_snapshot_invalidation_truth():
             ),
             clock=lambda: at,
             max_age=_dt.timedelta(seconds=30),
-        )
+    )
 
     assert len(invalidation_reads) == 1
 
@@ -20061,11 +20061,27 @@ def test_global_book_metadata_refresh_tracks_unresolved_invalidation():
     checked_at = _dt.datetime(2026, 6, 13, 8, 0, tzinfo=_dt.timezone.utc)
     probabilities = {probability.family_key: probability}
 
-    assert era._global_book_metadata_refresh_family_keys(
+    invalidation_reads = []
+    conn.set_trace_callback(
+        lambda sql: (
+            invalidation_reads.append(sql)
+            if "FROM executable_market_snapshot_invalidations" in sql
+            else None
+        )
+    )
+    first_result = era._global_book_metadata_refresh_family_keys(
         conn,
         probabilities,
         checked_at=checked_at,
-    ) == {probability.family_key}
+    )
+    conn.set_trace_callback(None)
+    assert first_result == {probability.family_key}
+    assert len(invalidation_reads) == 2
+    for invalidation_read in invalidation_reads:
+        invalidation_read = invalidation_read.upper()
+        assert "CONDITION_ID IN" in invalidation_read
+        assert "TOKEN_ID IN" in invalidation_read
+        assert "WHERE INVALIDATED_AT <=" not in invalidation_read
     assert era._global_book_metadata_refresh_family_keys(
         conn,
         probabilities,

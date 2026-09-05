@@ -2020,31 +2020,57 @@ def _global_book_metadata_refresh_family_keys(
         if invalidated_at is None or previous is None or invalidated_at > previous:
             invalidated_at_by_family[family_key] = invalidated_at
 
-    for raw_condition, raw_token, raw_invalidated_at in trade_conn.execute(
-        """
-        SELECT condition_id, token_id, invalidated_at
-          FROM executable_market_snapshot_invalidations
-         WHERE invalidated_at <= ?
-        """,
-        (checked_at.astimezone(timezone.utc).isoformat(),),
-    ):
-        try:
-            invalidated_at = datetime.fromisoformat(
-                str(raw_invalidated_at).replace("Z", "+00:00")
+    selectors = tuple(
+        [("condition_id", value) for value in families_by_condition]
+        + [("token_id", value) for value in families_by_token]
+    )
+    checked_at_text = checked_at.astimezone(timezone.utc).isoformat()
+    for offset in range(0, len(selectors), 400):
+        tranche = selectors[offset : offset + 400]
+        condition_ids = tuple(
+            value for column, value in tranche if column == "condition_id"
+        )
+        token_ids = tuple(value for column, value in tranche if column == "token_id")
+        predicates: list[str] = []
+        parameters: list[str] = []
+        if condition_ids:
+            predicates.append(
+                "condition_id IN (" + ",".join("?" for _ in condition_ids) + ")"
             )
-            if invalidated_at.tzinfo is None:
-                invalidated_at = invalidated_at.replace(tzinfo=timezone.utc)
-            invalidated_at = invalidated_at.astimezone(timezone.utc)
-        except (TypeError, ValueError):
-            invalidated_at = None
-        affected = set(
-            families_by_condition.get(str(raw_condition or "").strip(), ())
+            parameters.extend(condition_ids)
+        if token_ids:
+            predicates.append(
+                "token_id IN (" + ",".join("?" for _ in token_ids) + ")"
+            )
+            parameters.extend(token_ids)
+        parameters.append(checked_at_text)
+        rows = trade_conn.execute(
+            f"""
+            SELECT condition_id, token_id, invalidated_at
+              FROM executable_market_snapshot_invalidations
+             WHERE ({' OR '.join(predicates)})
+               AND invalidated_at <= ?
+            """,
+            parameters,
         )
-        affected.update(
-            families_by_token.get(str(raw_token or "").strip(), ())
-        )
-        for family_key in affected:
-            record_invalidation(family_key, invalidated_at)
+        for raw_condition, raw_token, raw_invalidated_at in rows:
+            try:
+                invalidated_at = datetime.fromisoformat(
+                    str(raw_invalidated_at).replace("Z", "+00:00")
+                )
+                if invalidated_at.tzinfo is None:
+                    invalidated_at = invalidated_at.replace(tzinfo=timezone.utc)
+                invalidated_at = invalidated_at.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                invalidated_at = None
+            affected = set(
+                families_by_condition.get(str(raw_condition or "").strip(), ())
+            )
+            affected.update(
+                families_by_token.get(str(raw_token or "").strip(), ())
+            )
+            for family_key in affected:
+                record_invalidation(family_key, invalidated_at)
     candidates = set(invalidated_at_by_family)
     if not candidates:
         return frozenset()

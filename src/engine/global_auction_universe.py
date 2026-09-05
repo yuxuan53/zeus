@@ -684,43 +684,6 @@ def _global_book_latest_invalidation_rows(
     )
     if not clean:
         return []
-    condition_invalidated_at: dict[str, datetime] = {}
-    token_invalidated_at: dict[str, datetime] = {}
-    if _table_exists(trade_conn, "executable_market_snapshot_invalidations"):
-        for raw_condition, raw_token, raw_invalidated_at in trade_conn.execute(
-            """
-            SELECT condition_id, token_id, MAX(invalidated_at)
-              FROM executable_market_snapshot_invalidations
-             WHERE invalidated_at <= ?
-             GROUP BY condition_id, token_id
-            """,
-            (checked_at_utc.astimezone(timezone.utc).isoformat(),),
-        ):
-            try:
-                invalidated_at = datetime.fromisoformat(
-                    str(raw_invalidated_at).replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
-            except (TypeError, ValueError):
-                continue
-            condition_id = str(raw_condition or "").strip()
-            token_id = str(raw_token or "").strip()
-            if condition_id:
-                condition_invalidated_at[condition_id] = max(
-                    invalidated_at,
-                    condition_invalidated_at.get(
-                        condition_id,
-                        datetime.min.replace(tzinfo=timezone.utc),
-                    ),
-                )
-            if token_id:
-                token_invalidated_at[token_id] = max(
-                    invalidated_at,
-                    token_invalidated_at.get(
-                        token_id,
-                        datetime.min.replace(tzinfo=timezone.utc),
-                    ),
-                )
-
     rows: list[dict[str, object]] = []
     for offset in range(0, len(clean), 400):
         chunk = clean[offset : offset + 400]
@@ -739,8 +702,88 @@ def _global_book_latest_invalidation_rows(
             """,
             chunk,
         )
-        for raw in cur.fetchall():
-            row = _row_dict(cur, raw)
+        rows.extend(_row_dict(cur, raw) for raw in cur.fetchall())
+
+    condition_invalidated_at: dict[str, datetime] = {}
+    token_invalidated_at: dict[str, datetime] = {}
+    if _table_exists(trade_conn, "executable_market_snapshot_invalidations"):
+        tokens = tuple(
+            dict.fromkeys(
+                token_id
+                for row in rows
+                for token_id in (
+                    str(row.get("selected_outcome_token_id") or "").strip(),
+                    str(row.get("yes_token_id") or "").strip(),
+                    str(row.get("no_token_id") or "").strip(),
+                )
+                if token_id
+            )
+        )
+        selectors = tuple(
+            [("condition_id", value) for value in clean]
+            + [("token_id", value) for value in tokens]
+        )
+        checked_at_text = checked_at_utc.astimezone(timezone.utc).isoformat()
+        for offset in range(0, len(selectors), 400):
+            tranche = selectors[offset : offset + 400]
+            condition_ids = tuple(
+                value for column, value in tranche if column == "condition_id"
+            )
+            token_ids = tuple(
+                value for column, value in tranche if column == "token_id"
+            )
+            predicates: list[str] = []
+            parameters: list[str] = []
+            if condition_ids:
+                predicates.append(
+                    "condition_id IN ("
+                    + ",".join("?" for _ in condition_ids)
+                    + ")"
+                )
+                parameters.extend(condition_ids)
+            if token_ids:
+                predicates.append(
+                    "token_id IN (" + ",".join("?" for _ in token_ids) + ")"
+                )
+                parameters.extend(token_ids)
+            parameters.append(checked_at_text)
+            invalidation_rows = trade_conn.execute(
+                f"""
+                SELECT condition_id, token_id, MAX(invalidated_at)
+                  FROM executable_market_snapshot_invalidations
+                 WHERE ({' OR '.join(predicates)})
+                   AND invalidated_at <= ?
+                 GROUP BY condition_id, token_id
+                """,
+                parameters,
+            )
+            for raw_condition, raw_token, raw_invalidated_at in invalidation_rows:
+                try:
+                    invalidated_at = datetime.fromisoformat(
+                        str(raw_invalidated_at).replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                condition_id = str(raw_condition or "").strip()
+                token_id = str(raw_token or "").strip()
+                if condition_id:
+                    condition_invalidated_at[condition_id] = max(
+                        invalidated_at,
+                        condition_invalidated_at.get(
+                            condition_id,
+                            datetime.min.replace(tzinfo=timezone.utc),
+                        ),
+                    )
+                if token_id:
+                    token_invalidated_at[token_id] = max(
+                        invalidated_at,
+                        token_invalidated_at.get(
+                            token_id,
+                            datetime.min.replace(tzinfo=timezone.utc),
+                        ),
+                    )
+
+    for row in rows:
             try:
                 captured_at = datetime.fromisoformat(
                     str(row.get("captured_at") or "").replace("Z", "+00:00")
@@ -763,7 +806,6 @@ def _global_book_latest_invalidation_rows(
                     and invalidated_at >= captured_at
                     for invalidated_at in identities
                 )
-            rows.append(row)
     return rows
 
 
