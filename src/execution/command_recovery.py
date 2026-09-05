@@ -154,6 +154,12 @@ _FULL_BACKGROUND_RECOVERY_QUANTUM_ROTATION_SECONDS = 60
 # precision that the canonical projection contract cannot represent.
 _POSITION_PROJECTION_TOLERANCE = Decimal("0.0001")
 _TERMINAL_EXIT_RESIDUAL_PRIORITY_MAX_CANDIDATES = 4
+# A terminal SELL command may floor the requested full close to the venue's
+# cent-share grid.  The canonical projection retains five decimal places, so
+# allow only that observed 5e-6 tail when comparing its pre-fill local mirror
+# to the immutable full-close intent. Token/order/fill/chain identities remain
+# exact predicates below.
+_TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE = Decimal("0.000005")
 _RESTART_ACCOUNT_TRUTH_DEADLINE_ENV = (
     "ZEUS_RESTART_RECOVERY_ACCOUNT_TRUTH_DEADLINE_SECONDS"
 )
@@ -12860,13 +12866,13 @@ def _repair_terminal_partial_exit_projection(
     expected_basis = (
         expected_remaining * entry_price if entry_price is not None else None
     )
-    tolerance = Decimal("0.000001")
+    residual_tolerance = Decimal("0.000001")
     local_is_residual = bool(
         local_shares is not None
         and local_basis is not None
         and expected_basis is not None
-        and abs(local_shares - expected_remaining) <= tolerance
-        and abs(local_basis - expected_basis) <= tolerance
+        and abs(local_shares - expected_remaining) <= residual_tolerance
+        and abs(local_basis - expected_basis) <= residual_tolerance
     )
     pre_fill_basis = (
         holding_shares * entry_price if entry_price is not None else None
@@ -12875,22 +12881,24 @@ def _repair_terminal_partial_exit_projection(
         local_shares is not None
         and local_basis is not None
         and pre_fill_basis is not None
-        and abs(local_shares - holding_shares) <= tolerance
-        and abs(local_basis - pre_fill_basis) <= tolerance
+        and abs(local_shares - holding_shares)
+        <= _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
+        and abs(local_basis - pre_fill_basis)
+        <= _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
     )
     chain_is_residual = bool(
         chain_shares is not None
         and chain_basis is not None
         and expected_basis is not None
-        and abs(chain_shares - expected_remaining) <= tolerance
-        and abs(chain_basis - expected_basis) <= tolerance
+        and abs(chain_shares - expected_remaining) <= residual_tolerance
+        and abs(chain_basis - expected_basis) <= residual_tolerance
     )
     chain_is_pre_fill = bool(
         chain_shares is not None
         and chain_basis is not None
         and pre_fill_basis is not None
-        and abs(chain_shares - holding_shares) <= tolerance
-        and abs(chain_basis - pre_fill_basis) <= tolerance
+        and abs(chain_shares - holding_shares) <= residual_tolerance
+        and abs(chain_basis - pre_fill_basis) <= residual_tolerance
     )
     if chain_is_pre_fill:
         return False
@@ -12912,11 +12920,14 @@ def _repair_terminal_partial_exit_projection(
         release_after_fill=True,
         # Chain truth has already proved the post-fill residual.  When the
         # local projection still names the full holding, its effective view
-        # routes through that chain residual; pass the exact local pre-fill
-        # basis so the reduction writes the missing local projection without
-        # rescaling the chain fact a second time.
-        projection_open_shares=local_shares if local_is_pre_fill else None,
+        # routes through that chain residual. The permitted floor tail is
+        # normalized to the immutable full-close holding; chain residual cost
+        # is then the exact final local basis, never a second chain scaling.
+        projection_open_shares=holding_shares if local_is_pre_fill else None,
         projection_open_cost_basis_usd=local_basis if local_is_pre_fill else None,
+        projection_remaining_cost_basis_usd=(
+            chain_basis if local_is_pre_fill else None
+        ),
         preserve_proven_chain_projection=local_is_pre_fill,
     )
     phase_after = conn.execute(
@@ -12937,8 +12948,8 @@ def _repair_terminal_partial_exit_projection(
         if (
             projected_shares is None
             or projected_basis is None
-            or abs(projected_shares - expected_remaining) > tolerance
-            or abs(projected_basis - expected_basis) > tolerance
+            or abs(projected_shares - chain_shares) > residual_tolerance
+            or abs(projected_basis - chain_basis) > residual_tolerance
         ):
             raise RuntimeError(
                 f"terminal partial EXIT failed to converge local projection for {command_id}"

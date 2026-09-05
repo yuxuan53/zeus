@@ -9636,6 +9636,7 @@ def _apply_partial_exit_fill(
     status: str,
     projection_open_shares: Decimal | None = None,
     projection_open_cost_basis_usd: Decimal | None = None,
+    projection_remaining_cost_basis_usd: Decimal | None = None,
     preserve_proven_chain_projection: bool = False,
 ) -> bool:
     """Reduce local open exposure after an observed partial exit fill.
@@ -9697,6 +9698,11 @@ def _apply_partial_exit_fill(
     position.size_usd = float(original_size * remaining_ratio)
     if position.cost_basis_usd > 0:
         position.cost_basis_usd = float(original_cost * remaining_ratio)
+    if projection_remaining_cost_basis_usd is not None:
+        residual_cost = Decimal(str(projection_remaining_cost_basis_usd))
+        if not residual_cost.is_finite() or residual_cost < 0:
+            return False
+        position.cost_basis_usd = float(residual_cost)
     # F1 (PR1 critic SEV-1): balance-only positions route effective_shares via
     # chain_shares.  Without this block, effective_exposure() returns stale
     # pre-exit chain aggregate until the next reconcile cycle — exit-sizing code
@@ -10423,6 +10429,7 @@ def _complete_intentional_position_reduction(
     release_after_fill: bool = True,
     projection_open_shares: Decimal | None = None,
     projection_open_cost_basis_usd: Decimal | None = None,
+    projection_remaining_cost_basis_usd: Decimal | None = None,
     preserve_proven_chain_projection: bool = False,
 ) -> Decimal:
     """Append exact partial economics before publishing the local reduction."""
@@ -10470,6 +10477,16 @@ def _complete_intentional_position_reduction(
         raise PartialExitEconomicDebtError(
             f"partial EXIT basis missing: position_id={trade_id}"
         )
+    if projection_remaining_cost_basis_usd is not None:
+        projection_remaining_cost_basis_usd = Decimal(
+            str(projection_remaining_cost_basis_usd)
+        )
+        if (
+            not projection_remaining_cost_basis_usd.is_finite()
+            or projection_remaining_cost_basis_usd < 0
+            or projection_remaining_cost_basis_usd > basis_cost
+        ):
+            raise RuntimeError("reduction residual basis is invalid")
     unit_cost = basis_cost / basis_shares
     staged_fill_position = copy.deepcopy(position)
     remaining_shares = basis_shares
@@ -10699,6 +10716,12 @@ def _complete_intentional_position_reduction(
             allocated_cost = quantity * unit_cost
             event_remaining_shares = remaining_shares + remaining_quantity
             remaining_cost_basis = event_remaining_shares * unit_cost
+            if (
+                projection_remaining_cost_basis_usd is not None
+                and remaining_quantity == 0
+            ):
+                allocated_cost = basis_cost - projection_remaining_cost_basis_usd
+                remaining_cost_basis = projection_remaining_cost_basis_usd
             pnl_delta = notional - allocated_cost
             cumulative_realized += pnl_delta
             batch_slices.append(
@@ -10721,6 +10744,7 @@ def _complete_intentional_position_reduction(
         status=status,
         projection_open_shares=projection_open_shares,
         projection_open_cost_basis_usd=projection_open_cost_basis_usd,
+        projection_remaining_cost_basis_usd=projection_remaining_cost_basis_usd,
         preserve_proven_chain_projection=preserve_proven_chain_projection,
     ):
         raise RuntimeError("confirmed reduction could not converge to fill target")

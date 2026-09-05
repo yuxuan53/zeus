@@ -30798,9 +30798,9 @@ class TestRecoveryResolutionTable:
             """
             UPDATE position_current
                SET phase = 'day0_window', city = 'Hong Kong', target_date = '2026-09-04',
-                   shares = 48.2258, chain_state = 'synced', chain_shares = 43.2258,
-                   chain_cost_basis_usd = 21.6129, cost_basis_usd = 24.1129,
-                   entry_price = 0.50, order_status = 'sell_pending_confirmation'
+                   shares = 48.225805, chain_state = 'synced', chain_shares = 43.2258,
+                   chain_cost_basis_usd = 14.9468744999653, cost_basis_usd = 16.675806,
+                   entry_price = 0.34578595422098145, order_status = 'sell_pending_confirmation'
              WHERE position_id = '32d6009c-007'
             """
         )
@@ -30872,7 +30872,8 @@ class TestRecoveryResolutionTable:
         try:
             current = verified.execute(
                 """
-                SELECT phase, shares, chain_shares, cost_basis_usd
+                SELECT phase, shares, chain_shares, cost_basis_usd,
+                       chain_cost_basis_usd
                   FROM position_current
                  WHERE position_id = '32d6009c-007'
                 """
@@ -30883,7 +30884,8 @@ class TestRecoveryResolutionTable:
             "phase": "day0_window",
             "shares": 43.2258,
             "chain_shares": 43.2258,
-            "cost_basis_usd": 21.6129,
+            "cost_basis_usd": 14.9468744999653,
+            "chain_cost_basis_usd": 14.9468744999653,
         }
 
     @pytest.mark.parametrize(
