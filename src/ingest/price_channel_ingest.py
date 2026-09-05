@@ -4973,35 +4973,74 @@ def _edli_refresh_held_position_quote_evidence(
                 if token_id not in canonical_held_token_ids
             ]
             written = 0
+            canonical_backpressure_count = 0
+            canonical_backpressure_reason = None
             if canonical_metadata_tokens:
-                with _held_quote_sqlite_deadline(
-                    conn,
-                    deadline_monotonic=deadline,
-                ):
-                    written = service.seed_rest_books_in_chunks(
-                        token_ids=canonical_metadata_tokens,
-                        received_at=datetime.now(timezone.utc).isoformat(),
-                        write_gate=_edli_price_channel_trade_write_gate(
-                            owner="price_channel_held_quote_refresh",
-                            priority="monitor",
-                            deadline_ms=(
-                                PRICE_CHANNEL_HELD_QUOTE_DB_WRITE_LEASE_DEADLINE_MS
-                            ),
-                            deadline_monotonic=deadline,
-                            on_enter=lambda: _bound_held_quote_sqlite_wait(
-                                conn,
-                                deadline_monotonic=deadline,
-                            ),
-                        ),
-                        commit=_commit_quote_evidence,
-                        logger=logger,
-                        chunk_size=MARKET_CHANNEL_PRIORITY_QUOTE_REFRESH_CHUNK_SIZE_DEFAULT,
+                pending_canonical = list(canonical_metadata_tokens)
+                while pending_canonical and time.monotonic() < deadline:
+                    with _held_quote_sqlite_deadline(
+                        conn,
                         deadline_monotonic=deadline,
-                        past_end_exit_refresh=True,
-                        post_commit_quote_sink=_post_commit_held_quote_actions,
+                    ):
+                        written += service.seed_rest_books_in_chunks(
+                            token_ids=pending_canonical,
+                            received_at=datetime.now(timezone.utc).isoformat(),
+                            write_gate=_edli_price_channel_trade_write_gate(
+                                owner="price_channel_held_quote_refresh",
+                                priority="monitor",
+                                deadline_ms=(
+                                    PRICE_CHANNEL_HELD_QUOTE_DB_WRITE_LEASE_DEADLINE_MS
+                                ),
+                                deadline_monotonic=deadline,
+                                on_enter=lambda: _bound_held_quote_sqlite_wait(
+                                    conn,
+                                    deadline_monotonic=deadline,
+                                ),
+                            ),
+                            commit=_commit_quote_evidence,
+                            logger=logger,
+                            chunk_size=MARKET_CHANNEL_PRIORITY_QUOTE_REFRESH_CHUNK_SIZE_DEFAULT,
+                            deadline_monotonic=deadline,
+                            past_end_exit_refresh=True,
+                            post_commit_quote_sink=_post_commit_held_quote_actions,
+                        )
+                    pending_canonical = [
+                        token_id
+                        for token_id in canonical_metadata_tokens
+                        if token_id not in canonical_rest_refreshed_token_ids
+                    ]
+                    if not pending_canonical:
+                        break
+                    if not service.rest_seed_backpressure_count:
+                        # A request/venue response produced no durable quote.
+                        # Retrying the identical response cannot repair it; keep
+                        # truthful debt and leave the optional audit lane idle.
+                        break
+                    canonical_backpressure_count += int(
+                        service.rest_seed_backpressure_count
                     )
+                    canonical_backpressure_reason = (
+                        service.rest_seed_backpressure_reason
+                    )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    time.sleep(min(0.01, remaining))
             optional_refresh_error = None
-            if residual_metadata_tokens and time.monotonic() < deadline:
+            canonical_refresh_debt = [
+                token_id
+                for token_id in canonical_metadata_tokens
+                if token_id not in canonical_rest_refreshed_token_ids
+            ]
+            residual_backpressure_count = 0
+            residual_backpressure_reason = None
+            # Optional historical/audit coverage must never consume the claim
+            # while one current open exposure still lacks a durable fresh quote.
+            if (
+                residual_metadata_tokens
+                and not canonical_refresh_debt
+                and time.monotonic() < deadline
+            ):
                 try:
                     with _held_quote_sqlite_deadline(
                         conn,
@@ -5029,6 +5068,12 @@ def _edli_refresh_held_position_quote_evidence(
                             past_end_exit_refresh=True,
                             post_commit_quote_sink=_post_commit_held_quote_actions,
                         )
+                    residual_backpressure_count = int(
+                        service.rest_seed_backpressure_count
+                    )
+                    residual_backpressure_reason = (
+                        service.rest_seed_backpressure_reason
+                    )
                 except (TimeoutError, sqlite3.OperationalError) as exc:
                     optional_refresh_error = f"{type(exc).__name__}: {exc}"
         audit_rows = 0
@@ -5085,10 +5130,16 @@ def _edli_refresh_held_position_quote_evidence(
             "budget_skipped_tokens": max(0, len(ordered_metadata_tokens) - int(written)),
             **snapshot_refresh_report,
         }
-        if service.rest_seed_backpressure_count:
+        total_backpressure_count = (
+            canonical_backpressure_count + residual_backpressure_count
+        )
+        if total_backpressure_count:
             result["backpressure"] = True
-            result["write_backpressure_count"] = service.rest_seed_backpressure_count
-            result["write_backpressure_reason"] = service.rest_seed_backpressure_reason
+            result["write_backpressure_count"] = total_backpressure_count
+            result["write_backpressure_reason"] = (
+                residual_backpressure_reason
+                or canonical_backpressure_reason
+            )
         if optional_refresh_error:
             result["audit_quote_refresh_degraded"] = True
             result["audit_quote_refresh_degraded_reason"] = optional_refresh_error
