@@ -170,3 +170,36 @@ def test_jma_not_fetched_at_non_publishing_cycle():
     assert _model_publishes_cycle("gfs_global", 6), "gfs_global must publish at 06Z (4x/day model)"
     assert _model_publishes_cycle("ecmwf_ifs", 6), "ecmwf_ifs must publish at 06Z (4x/day model)"
     assert _model_publishes_cycle("icon_global", 18), "icon_global must publish at 18Z (4x/day model)"
+
+
+def test_ukmo_uk_2km_not_fetched_off_3hour_grid():
+    """R3 quota root-cause 2026-09-05: ukmo_uk_deterministic_2km's model-updates feed
+    advances hourly but single-runs-api only archives its 3-hour grid. Curl-verified
+    2026-09-05: run=17:00Z -> {"error":true,"reason":"The requested model run is not
+    available."}; live log same day: 12Z/15Z/18Z succeeded, 11Z/13Z/14Z/16Z/17Z/19Z all
+    400'd and were re-attempted on every maintenance pass (96 wasted calls in one
+    afternoon) because the model was missing from SOURCE_CLOCK_STANDARD_CYCLE_MODELS.
+    """
+    from src.data.bayes_precision_fusion_download import (
+        _model_publishes_cycle,
+        source_clock_metadata_run_is_single_runs_served,
+    )
+
+    for hour in (0, 3, 6, 9, 12, 15, 18, 21):
+        assert _model_publishes_cycle("ukmo_uk_deterministic_2km", hour), (
+            f"ukmo_uk_deterministic_2km must publish at {hour:02d}Z (3-hour grid)"
+        )
+    for hour in (1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23):
+        assert not _model_publishes_cycle("ukmo_uk_deterministic_2km", hour), (
+            f"ukmo_uk_deterministic_2km must NOT publish at {hour:02d}Z (off 3-hour grid)"
+        )
+
+    # The source-clock fast path must treat off-grid hourly model-update runs as
+    # unservable so it never enters source_clock_single_runs and skips the fetch,
+    # exactly like gfs_hrrr/met_nordic.
+    assert source_clock_metadata_run_is_single_runs_served(
+        "ukmo_uk_deterministic_2km", 12
+    )
+    assert not source_clock_metadata_run_is_single_runs_served(
+        "ukmo_uk_deterministic_2km", 17
+    )

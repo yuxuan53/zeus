@@ -373,6 +373,15 @@ MODEL_PUBLISH_CYCLE_HOURS: dict[str, frozenset[int]] = {
     # return HTTP 400 and must not occupy the 15-second source-clock lane.
     "gfs_hrrr": frozenset(range(0, 24, 3)),
     "met_nordic": frozenset(range(0, 24, 3)),
+    # 2026-09-05 (curl-verified, quota root-cause): ukmo_uk_deterministic_2km's
+    # model-updates feed advances hourly (e.g. 13Z,14Z,16Z,17Z all reported as new
+    # runs), but single-runs-api only archives its 3-hour grid — off-grid runs
+    # return {"error":true,"reason":"The requested model run is not available."}.
+    # Live log 2026-09-05: 12Z/15Z/18Z succeeded (200); 11Z/13Z/14Z/16Z/17Z/19Z all
+    # failed (400) and were NOT cadence-gated because the model was missing from
+    # SOURCE_CLOCK_STANDARD_CYCLE_MODELS below — 96 wasted single-runs calls for
+    # this one model in one afternoon window alone (same defect class as gfs_hrrr).
+    "ukmo_uk_deterministic_2km": frozenset(range(0, 24, 3)),
 }
 _ALL_CYCLES: frozenset[int] = frozenset({0, 6, 12, 18})
 SOURCE_CLOCK_STANDARD_CYCLE_MODELS: frozenset[str] = frozenset(
@@ -381,6 +390,7 @@ SOURCE_CLOCK_STANDARD_CYCLE_MODELS: frozenset[str] = frozenset(
         # exposes only their 3-hour archived initialization cycles.
         "gfs_hrrr",
         "met_nordic",
+        "ukmo_uk_deterministic_2km",
     }
 )
 
