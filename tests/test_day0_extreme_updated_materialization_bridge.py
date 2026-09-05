@@ -1,6 +1,6 @@
 # Created: 2026-07-19
-# Last reused/audited: 2026-09-04
-# Lifecycle: created=2026-07-19; last_reviewed=2026-09-04; last_reused=2026-09-04
+# Last reused/audited: 2026-09-05
+# Lifecycle: created=2026-07-19; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Purpose: Prove Day0 reseed ownership and single-writer materialization ordering.
 # Reuse: Run after changing Day0 enqueue, replacement queue claims, or writer concurrency.
 # Authority basis: operator directive 2026-07-19 (Day0 is a zero-sum race against the market
@@ -3201,6 +3201,157 @@ def test_station_revision_fast_path_prefers_exact_chain_confirmed_held_family(
     assert not failed
     assert (request_dir / held.name).is_file()
     assert unheld.is_file()
+
+
+def test_station_revision_fast_path_returns_locked_without_racing_background(
+    tmp_path
+) -> None:
+    """A background claim lock leaves the exact station seed untouched for retry."""
+
+    seed_dir = tmp_path / "seeds"
+    request_dir = tmp_path / "requests"
+    seed_dir.mkdir()
+    request_dir.mkdir()
+    seed = seed_dir / "Hong_Kong.station-input-revision.enqueue.json"
+    seed.write_text("{}", encoding="utf-8")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def background_claim() -> None:
+        with materialization_queue._queue_lock(
+            request_dir.parent / ".materialization_queue.lock"
+        ) as acquired:
+            assert acquired
+            entered.set()
+            assert release.wait(1.0)
+
+    worker = threading.Thread(target=background_claim)
+    worker.start()
+    assert entered.wait(1.0)
+    try:
+        report = materialization_queue.process_own_clock_station_revision_fast_path(
+            request_dir=request_dir,
+            seed_dir=seed_dir,
+            seed_processed_dir=tmp_path / "seed_processed",
+            seed_failed_dir=tmp_path / "seed_failed",
+            forecast_db=None,
+        )
+    finally:
+        release.set()
+        worker.join(1.0)
+
+    assert report.status == "LOCKED"
+    assert seed.is_file()
+    assert report.processed_dir == str(tmp_path / "seed_processed")
+    assert report.failed_dir == str(tmp_path / "seed_failed")
+
+
+def test_station_revision_filename_cursor_prevents_continuous_new_seed_starvation(
+    tmp_path
+) -> None:
+    """A persisted cursor reaches an old held filename despite newly arriving names."""
+
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    old_held = seed_dir / "Z_Held.station-input-revision.enqueue.json"
+    old_held.write_text("{}", encoding="utf-8")
+    for index in range(materialization_queue._OWN_CLOCK_STATION_REVISION_CANDIDATE_LIMIT):
+        (seed_dir / f"A_New_{index:02d}.station-input-revision.enqueue.json").write_text(
+            "{}", encoding="utf-8"
+        )
+    first = materialization_queue._newest_own_clock_station_revision_seed_files(seed_dir)
+    assert old_held not in first
+    cursor = tmp_path / materialization_queue._OWN_CLOCK_STATION_REVISION_CURSOR_NAME
+    assert materialization_queue._write_day0_enqueue_ownership_cursor(
+        cursor, first[-1].name
+    )
+    (seed_dir / "A_New_later.station-input-revision.enqueue.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    second = materialization_queue._newest_own_clock_station_revision_seed_files(
+        seed_dir,
+        cursor=materialization_queue._read_day0_enqueue_ownership_cursor(cursor),
+    )
+
+    assert old_held in second
+
+
+def test_station_revision_malformed_seed_is_failed_terminal_not_deferred(
+    tmp_path
+) -> None:
+    """A malformed marker cannot remain in the fast/generic priority frontier."""
+
+    seed_dir = tmp_path / "seeds"
+    request_dir = tmp_path / "requests"
+    seed_dir.mkdir()
+    request_dir.mkdir()
+    malformed = seed_dir / "Hong_Kong.station-input-revision.enqueue.json"
+    malformed.write_text("{}", encoding="utf-8")
+    failed_dir = tmp_path / "seed_failed"
+
+    report = materialization_queue.process_own_clock_station_revision_fast_path(
+        request_dir=request_dir,
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=failed_dir,
+        forecast_db=None,
+    )
+
+    assert report.status == "FAILED"
+    assert report.seed_failed_count == 1
+    assert not malformed.exists()
+    terminal = next(
+        path
+        for path in failed_dir.glob("*.json")
+        if not path.name.endswith(".receipt.json")
+    )
+    receipt = json.loads(terminal.with_suffix(terminal.suffix + ".receipt.json").read_text())
+    assert receipt["status"] == "ERROR"
+
+
+def test_station_revision_fast_path_uses_claim_deadline_and_releases_lock(
+    monkeypatch, tmp_path
+) -> None:
+    """A stalled exact read is DEFERRED, then the following tick can acquire the lock."""
+
+    seed_dir = tmp_path / "seeds"
+    request_dir = tmp_path / "requests"
+    seed_dir.mkdir()
+    request_dir.mkdir()
+    (seed_dir / "Hong_Kong.station-input-revision.enqueue.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        materialization_queue,
+        "_MATERIALIZATION_CLAIM_DEADLINE_SECONDS",
+        0.001,
+    )
+    original = materialization_queue._newest_own_clock_station_revision_seed_files
+
+    def delayed(*args, **kwargs):
+        time.sleep(0.01)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        materialization_queue,
+        "_newest_own_clock_station_revision_seed_files",
+        delayed,
+    )
+
+    report = materialization_queue.process_own_clock_station_revision_fast_path(
+        request_dir=request_dir,
+        seed_dir=seed_dir,
+        seed_processed_dir=tmp_path / "seed_processed",
+        seed_failed_dir=tmp_path / "seed_failed",
+        forecast_db=None,
+    )
+
+    assert report.status == "DEFERRED"
+    with materialization_queue._queue_lock(
+        request_dir.parent / ".materialization_queue.lock"
+    ) as acquired:
+        assert acquired
 
 
 def test_priority_job_bridges_seeds_after_request_lane_is_empty(

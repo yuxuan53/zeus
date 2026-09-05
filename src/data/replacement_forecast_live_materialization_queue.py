@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import heapq
 import json
 import logging
 import os
@@ -86,6 +85,7 @@ _MATERIALIZATION_CLAIM_DEADLINE_SECONDS = 10.0
 _OWN_CLOCK_STATION_REVISION_MARKER = ".station-input-revision."
 _OWN_CLOCK_STATION_REVISION_FAST_LIMIT = 3
 _OWN_CLOCK_STATION_REVISION_CANDIDATE_LIMIT = 12
+_OWN_CLOCK_STATION_REVISION_CURSOR_NAME = ".replacement-station-revision.cursor"
 _CLAIM_READ_DEFERRED_REASON = "REPLACEMENT_LIVE_MATERIALIZATION_CLAIM_DEFERRED_READ_DEADLINE"
 _CLAIM_STALE_RECOVERY_DEFERRED_REASON = (
     "REPLACEMENT_LIVE_MATERIALIZATION_CLAIM_DEFERRED_STALE_RECOVERY"
@@ -4535,30 +4535,18 @@ def _prepare_seed_requests(
 def _newest_own_clock_station_revision_seed_files(
     seed_path: Path,
     *,
+    cursor: str | None = None,
     limit: int = _OWN_CLOCK_STATION_REVISION_CANDIDATE_LIMIT,
 ) -> tuple[Path, ...]:
-    """Select a small newest filename window without parsing the broad seed queue."""
+    """Select a fair bounded filename window without parsing the broad queue."""
 
     if not seed_path.exists() or limit <= 0:
         return ()
-    candidates = (
-        path
-        for path in seed_path.glob("*.station-input-revision.*.json")
-        if path.is_file()
-    )
-    def freshness(path: Path) -> tuple[int, str]:
-        try:
-            return path.stat().st_mtime_ns, path.name
-        except OSError:
-            return 0, path.name
-
-    return tuple(
-        heapq.nlargest(
-            limit,
-            candidates,
-            key=freshness,
-        )
-    )
+    snapshot = tuple(sorted(
+        (path for path in seed_path.glob("*.station-input-revision.*.json") if path.is_file()),
+        key=lambda path: path.name,
+    ))
+    return _rotate_seed_snapshot_after_cursor(snapshot, cursor)[:limit]
 
 
 def process_own_clock_station_revision_fast_path(
@@ -4572,88 +4560,126 @@ def process_own_clock_station_revision_fast_path(
 ) -> ReplacementForecastLiveMaterializationQueueReport:
     """Transport newest own-clock station revisions without broad queue priority reads.
 
-    SCOPE: at most ``limit`` newest ``.station-input-revision.`` seed files.
-    DRAIN: this function writes each exact family's durable request or terminal
-    receipt; the next priority tick claims that request through the existing
-    request-only path. RESET: no matching seed remains, or its moved terminal
-    receipt/request becomes the durable handoff.  This must not read the global
-    auction scope or traverse ordinary request/inflight debt: station evidence
-    is newly available causal truth, not generic compute backlog.
+    SCOPE: a persistent fair window of exact ``.station-input-revision.``
+    filenames. DRAIN: this function writes each family's durable request or
+    terminal receipt; the next priority tick claims that request through the
+    existing request-only path. RESET: no matching seed remains, or its moved
+    terminal receipt/request becomes the durable handoff. This must not read
+    global auction scope or traverse ordinary request/inflight debt.
     """
 
     request_path = Path(request_dir)
-    if seed_dir is None:
+    seed_processed_path = Path(seed_processed_dir or request_path)
+    seed_failed_path = Path(seed_failed_dir or request_path)
+
+    def report(
+        status: str,
+        *,
+        reason_codes: tuple[str, ...],
+        processed: Sequence[str] = (),
+        failed: Sequence[str] = (),
+    ) -> ReplacementForecastLiveMaterializationQueueReport:
         return ReplacementForecastLiveMaterializationQueueReport(
-            status="NO_SEEDS",
+            status=status,
             request_dir=str(request_path),
-            processed_dir=str(request_path),
-            failed_dir=str(request_path),
+            processed_dir=str(seed_processed_path),
+            failed_dir=str(seed_failed_path),
             processed_count=0,
             failed_count=0,
             skipped_count=0,
+            seed_processed_count=len(processed),
+            seed_failed_count=len(failed),
+            seed_processed_files=tuple(processed),
+            seed_failed_files=tuple(failed),
+            reason_codes=reason_codes,
+        )
+
+    if seed_dir is None:
+        return report(
+            "NO_SEEDS",
             reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_QUEUE_ABSENT",),
         )
     seed_path = Path(seed_dir)
-    candidates = _newest_own_clock_station_revision_seed_files(seed_path)
-    if not candidates:
-        return ReplacementForecastLiveMaterializationQueueReport(
-            status="NO_SEEDS",
-            request_dir=str(request_path),
-            processed_dir=str(request_path),
-            failed_dir=str(request_path),
-            processed_count=0,
-            failed_count=0,
-            skipped_count=0,
-            reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_QUEUE_EMPTY",),
-        )
     if seed_processed_dir is None or seed_failed_dir is None:
-        raise ValueError("station revision fast path requires seed terminal directories")
+        return report(
+            "FAILED",
+            reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_TERMINALS_MISSING",),
+        )
 
     forecast_conn: sqlite3.Connection | None = None
+    cursor_write_failed = False
     try:
-        if forecast_db is not None and Path(forecast_db).exists():
-            forecast_conn = _queue_read_only_connection(Path(forecast_db))
-        processed, failed, reasons = _prepare_seed_requests_with_connection(
-            seed_dir=seed_path,
-            seed_processed_dir=seed_processed_dir,
-            seed_failed_dir=seed_failed_dir,
-            request_dir=request_path,
-            forecast_db=forecast_db,
-            forecast_conn=forecast_conn,
-            trade_conn=None,
-            limit=min(max(int(limit), 1), len(candidates)),
-            lane=MATERIALIZATION_LANE_PRIORITY,
-            seed_files=candidates,
-            fast_own_clock_station_revision=True,
-        )
+        # The lock spans filename discovery, exact family reads, request write,
+        # and seed move. A background lane can therefore never claim the same
+        # seed between this fast path's validate and terminal receipt.
+        with _claim_read_deadline_guard():
+            with _queue_lock(
+                request_path.parent / ".materialization_queue.lock",
+                wait_seconds=0.0,
+            ) as acquired:
+                if not acquired:
+                    return report(
+                        "LOCKED",
+                        reason_codes=("REPLACEMENT_LIVE_MATERIALIZATION_QUEUE_LOCKED",),
+                    )
+                cursor_path = request_path.parent / _OWN_CLOCK_STATION_REVISION_CURSOR_NAME
+                candidates = _newest_own_clock_station_revision_seed_files(
+                    seed_path,
+                    cursor=_read_day0_enqueue_ownership_cursor(cursor_path),
+                )
+                _raise_if_claim_read_expired()
+                if not candidates:
+                    return report(
+                        "NO_SEEDS",
+                        reason_codes=("REPLACEMENT_LIVE_STATION_REVISION_SEED_QUEUE_EMPTY",),
+                    )
+                if forecast_db is not None and Path(forecast_db).exists():
+                    forecast_conn = _queue_read_only_connection(Path(forecast_db))
+                processed, failed, reasons = _prepare_seed_requests_with_connection(
+                    seed_dir=seed_path,
+                    seed_processed_dir=seed_processed_path,
+                    seed_failed_dir=seed_failed_path,
+                    request_dir=request_path,
+                    forecast_db=forecast_db,
+                    forecast_conn=forecast_conn,
+                    trade_conn=None,
+                    limit=min(max(int(limit), 1), len(candidates)),
+                    lane=MATERIALIZATION_LANE_PRIORITY,
+                    seed_files=candidates,
+                    fast_own_clock_station_revision=True,
+                )
+                _raise_if_claim_read_expired()
+                if not _write_day0_enqueue_ownership_cursor(
+                    cursor_path, candidates[-1].name
+                ):
+                    cursor_write_failed = True
+                    reasons.append(
+                        "REPLACEMENT_LIVE_STATION_REVISION_CURSOR_WRITE_FAILED"
+                    )
     except _ClaimReadDeadlineExceeded:
-        return ReplacementForecastLiveMaterializationQueueReport(
-            status="DEFERRED",
-            request_dir=str(request_path),
-            processed_dir=str(request_path),
-            failed_dir=str(request_path),
-            processed_count=0,
-            failed_count=0,
-            skipped_count=0,
+        return report(
+            "DEFERRED",
             reason_codes=(_CLAIM_READ_DEFERRED_REASON,),
+        )
+    except Exception as exc:  # noqa: BLE001 - fast lane must leave retries truthful
+        return report(
+            "FAILED",
+            reason_codes=(
+                "REPLACEMENT_LIVE_STATION_REVISION_FAST_PATH_FAILED",
+                type(exc).__name__,
+            ),
         )
     finally:
         if forecast_conn is not None:
             forecast_conn.close()
 
-    return ReplacementForecastLiveMaterializationQueueReport(
-        status="PROCESSED" if processed or failed else "DEFERRED",
-        request_dir=str(request_path),
-        processed_dir=str(request_path),
-        failed_dir=str(request_path),
-        processed_count=0,
-        failed_count=0,
-        skipped_count=0,
-        seed_processed_count=len(processed),
-        seed_failed_count=len(failed),
-        seed_processed_files=tuple(processed),
-        seed_failed_files=tuple(failed),
+    return report(
+        "FAILED"
+        if failed or cursor_write_failed
+        else ("PROCESSED" if processed else "DEFERRED"),
         reason_codes=tuple(dict.fromkeys(reasons)),
+        processed=processed,
+        failed=failed,
     )
 
 
@@ -4912,6 +4938,21 @@ def _prepare_seed_requests_with_connection(
         try:
             seed = _load_seed_json(seed_json)
             if not _looks_like_seed(seed):
+                if fast_own_clock_station_revision:
+                    moved = _move_request(seed_json, failed_path)
+                    _write_sidecar(
+                        moved,
+                        {
+                            "status": "ERROR",
+                            "reason_codes": [
+                                "REPLACEMENT_LIVE_MATERIALIZATION_SEED_CONTRACT_VIOLATION"
+                            ],
+                            "error": "station revision seed lacks required seed fields",
+                            "request_written": False,
+                        },
+                    )
+                    failed.append(str(moved))
+                    actionable_count += 1
                 continue
             ownership_check = ownership_snapshot.get(seed_json)
             if ownership_check is None:
