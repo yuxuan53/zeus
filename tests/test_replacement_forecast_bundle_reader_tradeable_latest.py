@@ -1,5 +1,5 @@
 # Created: 2026-06-10
-# Last reused/audited: 2026-09-02
+# Last reused/audited: 2026-09-04
 # Authority basis: docs/authority/replacement_final_form_2026_06_09.md; 2026-08-19
 #   market-relative capital evidence retirement of stale ENS live authority.
 """Relationship tests for readiness-bound replacement posterior selection.
@@ -360,6 +360,7 @@ def test_held_provenance_binds_configured_station_and_source_pair() -> None:
     assert reader._held_pinned_provenance_reason(
         provenance,
         city="Tel Aviv",
+        target_date="2026-06-07",
         metric="high",
         decision_time=_dt(6, 12),
     ) is None
@@ -378,6 +379,7 @@ def test_held_provenance_binds_configured_station_and_source_pair() -> None:
     assert reader._held_pinned_provenance_reason(
         wu_icao,
         city="Jinan",
+        target_date="2026-06-07",
         metric="high",
         decision_time=_dt(6, 12),
     ) is None
@@ -387,6 +389,7 @@ def test_held_provenance_binds_configured_station_and_source_pair() -> None:
     assert reader._held_pinned_provenance_reason(
         wrong_station,
         city="Tel Aviv",
+        target_date="2026-06-07",
         metric="high",
         decision_time=_dt(6, 12),
     ) == "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_STATION_MISMATCH"
@@ -399,6 +402,7 @@ def test_held_provenance_binds_configured_station_and_source_pair() -> None:
     assert reader._held_pinned_provenance_reason(
         wrong_pair,
         city="Tel Aviv",
+        target_date="2026-06-07",
         metric="high",
         decision_time=_dt(6, 12),
     ) == "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SOURCE_PAIR_MISMATCH"
@@ -457,6 +461,7 @@ def test_noaa_producer_likelihood_persists_and_reader_accepts_exact_identity(
     assert reader._held_pinned_provenance_reason(
         provenance,
         city="Tel Aviv",
+        target_date="2026-06-07",
         metric="high",
         decision_time=_dt(6, 12),
     ) is None
@@ -548,9 +553,26 @@ def test_hko_pinned_carrier_accepts_exact_revision_likelihood_identity() -> None
     assert reader._held_pinned_provenance_reason(
         provenance,
         city="Hong Kong",
+        target_date="2026-06-07",
         metric="low",
         decision_time=_dt(7, 12),
     ) is None
+
+    assert reader._held_pinned_provenance_reason(
+        provenance,
+        city="Hong Kong",
+        target_date="2026-06-07",
+        metric="low",
+        decision_time=_dt(8, 0),
+    ) is None
+
+    assert reader._held_pinned_provenance_reason(
+        provenance,
+        city="Hong Kong",
+        target_date="2026-06-08",
+        metric="low",
+        decision_time=_dt(8, 0),
+    ) == "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
 
     provenance["day0_preliminary_report_survival_likelihood"][
         "transition_count"
@@ -558,6 +580,7 @@ def test_hko_pinned_carrier_accepts_exact_revision_likelihood_identity() -> None
     assert reader._held_pinned_provenance_reason(
         provenance,
         city="Hong Kong",
+        target_date="2026-06-07",
         metric="low",
         decision_time=_dt(7, 12),
     ) == "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"

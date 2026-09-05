@@ -307,6 +307,7 @@ def _held_pinned_provenance_reason(
     provenance: Mapping[str, Any],
     *,
     city: str,
+    target_date: date | str,
     metric: str,
     decision_time: datetime,
 ) -> str | None:
@@ -350,13 +351,7 @@ def _held_pinned_provenance_reason(
             "hko_provisional_monotonic_survival_beta_jeffreys_v1"
         ):
             return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_SEMANTICS_MISMATCH"
-        try:
-            hko_target_date = decision_time.astimezone(
-                ZoneInfo(str(getattr(city_obj, "timezone", "") or ""))
-            ).date().isoformat()
-        except (ValueError, ZoneInfoNotFoundError):
-            return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
-        if str(likelihood.get("lookback_end") or "") != hko_target_date:
+        if str(likelihood.get("lookback_end") or "") != _date_text(target_date):
             return "REPLACEMENT_PINNED_DAY0_LIKELIHOOD_IDENTITY_MISMATCH"
         identity_fields = (
             "semantics",
@@ -1549,6 +1544,7 @@ def read_prior_complete_replacement_forecast_bundle(
                 provenance_reason = _held_pinned_provenance_reason(
                     latest_provenance,
                     city=city,
+                    target_date=target_date_text,
                     metric=metric,
                     decision_time=decision_utc,
                 )
@@ -1725,6 +1721,7 @@ def read_prior_complete_replacement_forecast_bundle(
     candidate_reason = _held_pinned_provenance_reason(
         candidate_provenance,
         city=city,
+        target_date=target_date_text,
         metric=metric,
         decision_time=decision_utc,
     )
