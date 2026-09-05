@@ -4,7 +4,7 @@
 # Reuse: asserts the FAIL-SOFT contract (a locked/empty/missing DB degrades one
 #   section to ERR, the rest still render) and that each script runs read-only
 #   against temp DBs. No live DB is touched.
-# Last reused/audited: 2026-08-29
+# Last reused/audited: 2026-09-05
 # Authority basis: operator big-direction 2026-06-12 ("大方向现在也只是添加几个文件现在做")
 """Smoke tests for scripts/zeus_status.py, deploy_live.py, generate_schema_cheatsheet.py."""
 from __future__ import annotations
@@ -2584,7 +2584,7 @@ def test_deploy_live_warm_preflight_defers_only_monitor_cadence_to_handoff(
     assert "handoff remains mandatory immediately before stop" in detail
 
 
-def test_deploy_live_warm_preflight_never_defers_another_blocker(
+def test_deploy_live_warm_preflight_defers_collateral_only_with_stale_monitor(
     monkeypatch, tmp_path
 ):
     dl = _load("deploy_live_warm_other_blocker", "deploy_live.py")
@@ -2630,8 +2630,104 @@ def test_deploy_live_warm_preflight_never_defers_another_blocker(
         defer_running_monitor_cadence=True,
     )
 
+    assert ok is True
+    assert "collateral_snapshot_freshness" in detail
+    assert "post-start chain snapshot" in detail
+
+
+def test_deploy_live_warm_preflight_never_defers_unrelated_blocker(
+    monkeypatch, tmp_path
+):
+    dl = _load("deploy_live_warm_unrelated_blocker", "deploy_live.py")
+    dl.LIVE_REPO = str(tmp_path)
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    blockers = [
+        {
+            "name": "monitor_cadence_restart_evidence",
+            "ok": False,
+            "restart_blocking": True,
+        },
+        {
+            "name": "pending_exit_safety",
+            "ok": False,
+            "restart_blocking": True,
+        },
+    ]
+    payload = {
+        "ok": False,
+        "expected_live_process_state": "running",
+        "checks": [
+            {
+                "name": "absolute_live_unit_price_band",
+                "ok": True,
+                "restart_blocking": True,
+            },
+            *blockers,
+        ],
+        "blockers": blockers,
+    }
+    monkeypatch.setattr(
+        dl.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, json.dumps(payload), ""
+        ),
+    )
+
+    ok, detail = dl._run_restart_preflight_if_needed(
+        [dl.LIVE_TRADING_LABEL],
+        expected_live_process_state="running",
+        defer_running_monitor_cadence=True,
+    )
+
     assert ok is False
     assert "preflight failed" in detail
+
+
+def test_post_start_collateral_requires_new_non_degraded_snapshot(monkeypatch, tmp_path):
+    dl = _load("deploy_live_post_start_collateral", "deploy_live.py")
+    state = tmp_path / "state"
+    state.mkdir()
+    conn = sqlite3.connect(state / "zeus_trades.db")
+    conn.execute(
+        """
+        CREATE TABLE collateral_ledger_snapshots (
+            id INTEGER PRIMARY KEY,
+            captured_at TEXT,
+            authority_tier TEXT
+        )
+        """
+    )
+    launched = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO collateral_ledger_snapshots VALUES (1, ?, 'CHAIN')",
+        ((launched + timedelta(seconds=1)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(dl, "LIVE_REPO", str(tmp_path))
+
+    ok, detail = dl._wait_for_post_start_collateral_snapshot(
+        launched_after=launched,
+        timeout_seconds=0,
+    )
+
+    assert ok is True
+    assert "post-start collateral snapshot verified" in detail
+
+    conn = sqlite3.connect(state / "zeus_trades.db")
+    conn.execute(
+        "INSERT INTO collateral_ledger_snapshots VALUES (2, ?, 'CHAIN')",
+        ((launched + timedelta(minutes=5)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+    ok, detail = dl._wait_for_post_start_collateral_snapshot(
+        launched_after=launched,
+        timeout_seconds=0,
+    )
+    assert ok is False
+    assert "did not verify" in detail
 
 
 def test_deploy_live_trading_restart_runs_recovery(monkeypatch, tmp_path):

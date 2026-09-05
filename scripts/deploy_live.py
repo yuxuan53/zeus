@@ -765,6 +765,74 @@ def _wait_for_post_start_monitor_cadence(
         time.sleep(LIVE_RUNTIME_FRESH_VERIFY_POLL_SECONDS)
 
 
+def _wait_for_post_start_collateral_snapshot(
+    *,
+    launched_after: datetime,
+    timeout_seconds: float = LIVE_RUNTIME_FRESH_VERIFY_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Require new chain collateral truth before the restart pause may clear."""
+
+    trade_db = Path(_require_live_repo()) / "state" / "zeus_trades.db"
+    launched_floor = launched_after.astimezone(timezone.utc) - timedelta(
+        seconds=max(0.0, LIVE_RUNTIME_FRESH_VERIFY_CLOCK_TOLERANCE_SECONDS)
+    )
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last_detail = "not checked"
+    while True:
+        try:
+            conn = sqlite3.connect(f"file:{trade_db}?mode=ro", uri=True, timeout=2.0)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, captured_at, authority_tier
+                  FROM collateral_ledger_snapshots
+                 ORDER BY id DESC
+                 LIMIT 1
+                """
+            ).fetchone()
+            conn.close()
+            captured_at = (
+                _parse_iso_utc(row["captured_at"])
+                if row is not None
+                else None
+            )
+            authority = str(row["authority_tier"] or "") if row is not None else ""
+            now_utc = datetime.now(timezone.utc)
+            if (
+                captured_at is not None
+                and captured_at >= launched_floor
+                and captured_at
+                <= now_utc
+                + timedelta(
+                    seconds=max(
+                        0.0,
+                        LIVE_RUNTIME_FRESH_VERIFY_CLOCK_TOLERANCE_SECONDS,
+                    )
+                )
+                and authority != "DEGRADED"
+            ):
+                return (
+                    True,
+                    "post-start collateral snapshot verified: "
+                    f"id={int(row['id'])} captured_at={captured_at.isoformat()} "
+                    f"authority_tier={authority}",
+                )
+            last_detail = (
+                f"captured_at={captured_at.isoformat() if captured_at else '<missing>'} "
+                f"authority_tier={authority or '<missing>'} "
+                f"launched_floor={launched_floor.isoformat()}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_detail = f"collateral snapshot read failed: {type(exc).__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            return (
+                False,
+                "post-start collateral snapshot did not verify after restart: "
+                + last_detail,
+            )
+        time.sleep(LIVE_RUNTIME_FRESH_VERIFY_POLL_SECONDS)
+
+
 def _wait_for_post_start_edli_queue_progress(
     *,
     launched_after: datetime,
@@ -3012,6 +3080,15 @@ def _run_restart_preflight_if_needed(
     if res.returncode == 0 and payload.get("ok") is True:
         return True, "live restart preflight passed"
     blockers = payload.get("blockers")
+    recoverable_warm_blockers = {
+        "monitor_cadence_restart_evidence",
+        "collateral_snapshot_freshness",
+    }
+    blocker_names = {
+        str(blocker.get("name") or "")
+        for blocker in blockers or ()
+        if isinstance(blocker, dict)
+    }
     monitor_only = (
         defer_running_monitor_cadence
         and expected_live_process_state == "running"
@@ -3019,9 +3096,10 @@ def _run_restart_preflight_if_needed(
         and payload.get("ok") is False
         and isinstance(blockers, list)
         and bool(blockers)
+        and "monitor_cadence_restart_evidence" in blocker_names
+        and blocker_names.issubset(recoverable_warm_blockers)
         and all(
             isinstance(blocker, dict)
-            and blocker.get("name") == "monitor_cadence_restart_evidence"
             and blocker.get("restart_blocking") is True
             for blocker in blockers
         )
@@ -3029,8 +3107,10 @@ def _run_restart_preflight_if_needed(
     if monitor_only:
         return (
             True,
-            "warm preflight passed except monitor cadence; exact current-capital "
-            "handoff remains mandatory immediately before stop",
+            "warm preflight deferred recoverable runtime proofs "
+            f"{sorted(blocker_names)}; exact current-capital handoff remains "
+            "mandatory immediately before stop and deferred collateral requires "
+            "a post-start chain snapshot before entry resume",
         )
     tail = "\n".join(output.splitlines()[-80:]) if output else "<no output>"
     return False, f"live restart preflight failed rc={res.returncode}:\n{tail}"
@@ -3738,6 +3818,7 @@ def _cmd_restart_locked(args: argparse.Namespace) -> int:
     )
     prerequisite_launch_started_at = datetime.now(timezone.utc)
     continuous_monitor_cutover = False
+    deferred_collateral_recovery = False
     for label in preflight_prerequisite_labels:
         if label in reusable_prerequisite_labels:
             print(f"retained current prerequisite {label}: loaded SHA and heartbeat verified")
@@ -3789,6 +3870,9 @@ def _cmd_restart_locked(args: argparse.Namespace) -> int:
                     return 1
                 print(warm_detail)
                 continuous_monitor_cutover = True
+                deferred_collateral_recovery = (
+                    "collateral_snapshot_freshness" in warm_detail
+                )
 
         # Keep the currently loaded order daemon monitoring held capital while
         # new-code prerequisites become ready.  Stopping it before sidecar
@@ -3931,6 +4015,7 @@ def _cmd_restart_locked(args: argparse.Namespace) -> int:
                     print(deferred_detail, file=sys.stderr)
             queue_ok = False
             monitor_ok = False
+            collateral_ok = not deferred_collateral_recovery
             if not runtime_ok:
                 rc_all = 1
             else:
@@ -3944,14 +4029,31 @@ def _cmd_restart_locked(args: argparse.Namespace) -> int:
                 if not monitor_ok:
                     rc_all = 1
                 else:
+                    if deferred_collateral_recovery:
+                        collateral_ok, collateral_detail = (
+                            _wait_for_post_start_collateral_snapshot(
+                                launched_after=launched_after,
+                            )
+                        )
+                        print(collateral_detail)
+                        if not collateral_ok:
+                            rc_all = 1
                     queue_ok, queue_detail = _wait_for_post_start_edli_queue_progress(
                         launched_after=launched_after,
-                        post_start_freshness_verified=(runtime_ok and monitor_ok),
+                        post_start_freshness_verified=(
+                            runtime_ok and monitor_ok and collateral_ok
+                        ),
                     )
                     print(queue_detail)
                     if not queue_ok:
                         rc_all = 1
-            if runtime_ok and queue_ok and monitor_ok and post_live_ok:
+            if (
+                runtime_ok
+                and queue_ok
+                and monitor_ok
+                and collateral_ok
+                and post_live_ok
+            ):
                 resume_ok, resume_detail = (
                     _resume_entries_after_verified_live_restart_if_needed(labels)
                 )
