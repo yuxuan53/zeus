@@ -1140,6 +1140,55 @@ def test_hko_daily_extract_poll_materializes_final_source_once(monkeypatch) -> N
     )
 
 
+def test_hko_rhrread_finalizer_keeps_provisional_coverage_out_of_daily_authority() -> None:
+    """Hourly spot sampling remains distinct from HKO's official daily extrema.
+
+    The official witness can be 31/26.4 while the samples observe 30/26;
+    recording the latter must not create a daily settlement candidate.
+    """
+    conn = _memdb()
+    target_date = "2026-07-15"
+    conn.executemany(
+        """
+        INSERT INTO hko_hourly_accumulator
+            (target_date, hour_utc, temperature, fetched_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                target_date,
+                f"2026-07-15T{hour:02d}:00Z",
+                30.0 if hour else 26.0,
+                "2026-07-16T02:00:00+00:00",
+            )
+            for hour in range(24)
+        ],
+    )
+
+    result = daily_obs_append._finalize_hko_yesterday(
+        conn,
+        now_utc=datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc),
+        rebuild_run_id="test-hko-rhrread-coverage",
+    )
+    daily_row = conn.execute(
+        """
+        SELECT 1
+          FROM observations
+         WHERE city = 'Hong Kong' AND target_date = ?
+           AND source = 'hko_realtime_api'
+        """,
+        (target_date,),
+    ).fetchone()
+
+    assert result == {
+        "inserted": 0,
+        "guard_rejected": 0,
+        "fetch_errors": 0,
+        "provisional_coverage": 1,
+    }
+    assert daily_row is None
+
+
 def test_hko_daily_extract_poll_catches_up_recent_missing_dates_once(
     monkeypatch,
 ) -> None:

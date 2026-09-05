@@ -1015,11 +1015,13 @@ def _finalize_hko_yesterday(
     rebuild_run_id: str = "",
     accumulator_schema: str = "main",
 ) -> dict | None:
-    """Check if yesterday (HKT) has enough accumulated readings to produce an observation.
+    """Report provisional coverage from yesterday's rhrread samples.
 
     HKT midnight = UTC 16:00, so at UTC hour 2 (the call site), yesterday's
     HKT day is fully complete. We require >= HKO_REALTIME_MIN_READINGS
-    readings to trust the daily max/min.
+    readings before reporting coverage. These spot readings are not HKO's
+    official Daily Extract and must never become settlement authority: sampling
+    can miss the official one-minute extrema.
 
     Returns stats dict on success, None if not enough data or already written.
     """
@@ -1060,71 +1062,21 @@ def _finalize_hko_yesterday(
     high_val = float(math.floor(max(temps)))
     low_val = float(math.floor(min(temps)))
 
+    # ``ObservationAtom`` intentionally represents only validated daily
+    # observations. Do not manufacture an UNVERIFIED daily atom here: the
+    # sampled rhrread aggregate remains in ``hko_hourly_accumulator`` as
+    # coverage, while the missing official HKO Daily Extract must leave the
+    # settlement and completed-day held paths fail-closed.
     logger.info(
-        "HKO realtime: finalizing %s — %d readings, high=%.0f low=%.0f",
+        "HKO realtime: provisional coverage only for %s — %d readings, high=%.0f low=%.0f",
         yesterday_str, len(rows), high_val, low_val,
     )
-
-    stats = {"inserted": 0, "guard_rejected": 0, "fetch_errors": 0}
-
-    try:
-        atom_high, atom_low = _build_atom_pair(
-            city_name=HKO_CITY_NAME,
-            target_d=yesterday_hkt,
-            high_val=high_val,
-            low_val=low_val,
-            raw_unit="C",
-            target_unit="C",
-            station_id=HKO_STATION,
-            source=HKO_REALTIME_SOURCE,
-            rebuild_run_id=rebuild_run_id,
-            data_source_version="hko_rhrread_accumulated_v1",
-            api_endpoint=f"{HKO_REALTIME_URL}?dataType=rhrread&lang=en",
-            provenance={
-                "station": "Hong Kong Observatory",
-                "method": "hourly_rhrread_accumulation",
-                "readings_count": len(rows),
-                "raw_max": max(temps),
-                "raw_min": min(temps),
-            },
-            fetch_utc=now_utc,
-        )
-    except IngestionRejected as e:
-        stats["guard_rejected"] += 1
-        logger.warning("HKO realtime guard dropped %s: %s", yesterday_str, e)
-        record_legitimate_gap(
-            conn,
-            data_table=DataTable.OBSERVATIONS,
-            city=HKO_CITY_NAME,
-            data_source=HKO_REALTIME_SOURCE,
-            target_date=yesterday_hkt,
-            reason=CoverageReason.GUARD_REJECTED,
-        )
-        conn.commit()
-        return stats
-
-    try:
-        _write_atom_with_coverage(conn, atom_high, atom_low, data_source=HKO_REALTIME_SOURCE)
-        stats["inserted"] += 1
-        logger.info(
-            "HKO realtime: wrote observation for %s (high=%.0f low=%.0f)",
-            yesterday_str, high_val, low_val,
-        )
-    except Exception as e:
-        stats["fetch_errors"] += 1
-        logger.error("HKO realtime insert failed %s: %s", yesterday_str, e)
-        record_failed(
-            conn,
-            data_table=DataTable.OBSERVATIONS,
-            city=HKO_CITY_NAME,
-            data_source=HKO_REALTIME_SOURCE,
-            target_date=yesterday_hkt,
-            reason=CoverageReason.NETWORK_ERROR,
-            retry_after=_retry_embargo(hours=1),
-        )
-
-    conn.commit()
-    return stats
+    return {
+        "inserted": 0,
+        "guard_rejected": 0,
+        "fetch_errors": 0,
+        "provisional_coverage": 1,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -96,12 +96,12 @@ def _make_forecasts_db():
     return tmp.name, conn
 
 
-def test_hko_realtime_daily_observation_is_settlement_source_family():
-    """HKO realtime daily supplement is settlement truth for HKO until archive publishes.
+def test_hko_settlement_rejects_rhrread_coverage_and_accepts_daily_extract():
+    """A sampled HKO rhrread aggregate cannot replace the official Daily Extract.
 
-    Regression root: 2026-06-05 Hong Kong had a VERIFIED hko_realtime_api daily
-    observation, but harvester_truth_writer accepted only hko_daily_api for HKO
-    settlement markets, so settlement_outcomes stayed incomplete.
+    The witness deliberately disagrees: official HKO minute-extrema is 31/26.4,
+    while 24 hourly rhrread samples yield 30/26. Only the exact daily product
+    may authorize settlement truth.
     """
     from src.ingest.harvester_truth_writer import (
         _lookup_settlement_obs,
@@ -119,10 +119,36 @@ def test_hko_realtime_daily_observation_is_settlement_source_family():
             "Hong Kong",
             "2026-06-05",
             "hko_realtime_api",
-            35.0,
-            28.0,
+            30.0,
+            26.0,
             "C",
             "2026-06-06T02:00:00Z",
+            "UNVERIFIED",
+        ),
+    )
+    conn.commit()
+
+    assert _lookup_settlement_obs(
+        conn,
+        _hko_city(),
+        "2026-06-05",
+        temperature_metric="high",
+    ) is None
+
+    conn.execute(
+        """
+        INSERT INTO observations
+            (city, target_date, source, high_temp, low_temp, unit, fetched_at, authority)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "Hong Kong",
+            "2026-06-05",
+            "hko_daily_api",
+            31.0,
+            26.4,
+            "C",
+            "2026-06-06T03:00:00Z",
             "VERIFIED",
         ),
     )
@@ -130,13 +156,13 @@ def test_hko_realtime_daily_observation_is_settlement_source_family():
 
     try:
         assert _source_matches_settlement_family("hko_daily_api", "hko")
-        assert _source_matches_settlement_family("hko_realtime_api", "hko")
+        assert not _source_matches_settlement_family("hko_realtime_api", "hko")
         assert not _source_matches_settlement_family("wu_icao_history", "hko")
 
         obs = _lookup_settlement_obs(conn, _hko_city(), "2026-06-05", temperature_metric="high")
         assert obs is not None
-        assert obs["source"] == "hko_realtime_api"
-        assert obs["observed_temp"] == 35.0
+        assert obs["source"] == "hko_daily_api"
+        assert obs["observed_temp"] == 31.0
     finally:
         conn.close()
 

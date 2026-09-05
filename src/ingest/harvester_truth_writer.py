@@ -175,13 +175,17 @@ def _row_value(row, key: str):
 
 
 def _source_matches_settlement_family(source: str, settlement_source_type: str) -> bool:
-    """Route obs to the correct source-family per DR-33 plan §3.3."""
+    """Route only settlement-authoritative observations per DR-33 plan §3.3."""
     if settlement_source_type == "wu_icao":
         return source == "wu_icao_history"
     if settlement_source_type == "noaa":
         return source.startswith("ogimet_metar_")
     if settlement_source_type == "hko":
-        return source in {"hko_daily_api", "hko_realtime_api"}
+        # rhrread accumulation is a sampled current-temperature coverage lane,
+        # not HKO's official daily extrema product. It can disagree with the
+        # official one-minute extrema, so a missing Daily Extract must block
+        # settlement truth rather than silently promoting the fallback.
+        return source == "hko_daily_api"
     return False
 
 
