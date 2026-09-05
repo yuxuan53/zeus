@@ -20016,6 +20016,10 @@ def test_current_global_book_epoch_batches_snapshot_invalidation_truth():
     )
 
     assert len(invalidation_reads) == 1
+    invalidation_read = invalidation_reads[0].upper()
+    assert "CONDITION_ID IN" in invalidation_read
+    assert "TOKEN_ID IN" in invalidation_read
+    assert "WHERE INVALIDATED_AT <=" not in invalidation_read
 
 
 def test_global_book_metadata_refresh_tracks_unresolved_invalidation():
