@@ -392,6 +392,116 @@ def test_live_day0_current_state_witness_is_required_by_both_consumers() -> None
     conn.close()
 
 
+@pytest.mark.parametrize("metric", ["high", "low"])
+def test_attached_world_witness_keeps_producer_and_held_paths_identical(
+    metric: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Attached canonical witness rejects future/mismatched prints on both paths."""
+    import src.data.day0_hourly_vectors as hourly
+    import src.data.replacement_forecast_materializer as materializer
+    import src.engine.event_reactor_adapter as era
+
+    target_date = "2026-06-10"
+    decision_time = datetime(2026, 6, 10, 19, 45, tzinfo=UTC)
+    models = ("ecmwf_ifs", "icon_global")
+    vectors = [
+        Day0HourlyVector(
+            model=model,
+            city="NYC",
+            target_date=target_date,
+            timezone_name="America/New_York",
+            captured_at="2026-06-10T19:40:00+00:00",
+            times=tuple(f"{target_date}T{hour:02d}:00" for hour in range(24)),
+            temps_c=tuple(base + hour * 0.1 for hour in range(24)),
+        )
+        for model, base in (("ecmwf_ifs", 24.0), ("icon_global", 24.5))
+    ]
+    monkeypatch.setattr(hourly, "day0_hourly_models_for_city", lambda _city: models)
+    monkeypatch.setattr(
+        hourly, "read_freshest_day0_hourly_vectors", lambda **_kwargs: vectors
+    )
+
+    world_path = tmp_path / "world.db"
+    world = sqlite3.connect(world_path)
+    world.execute(
+        """CREATE TABLE observation_prints (
+            id INTEGER PRIMARY KEY, city TEXT, station_id TEXT,
+            source_channel TEXT, publish_ts_utc TEXT, value_native REAL,
+            unit TEXT, fetched_at_utc TEXT, raw_report TEXT
+        )"""
+    )
+    world.executemany(
+        "INSERT INTO observation_prints VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            # Latest valid same-station record: the T group supplies exact F.
+            (
+                1, "NYC", "KLGA", "aviationweather_metar",
+                "2026-06-10T19:30:00+00:00", 26.0, "C",
+                "2026-06-10T19:35:00+00:00",
+                "METAR KLGA 101930Z 18008KT 10SM CLR 26/16 A2998 T02560161",
+            ),
+            # Causal publication but not causally possessed at the cutoff.
+            (
+                2, "NYC", "KLGA", "aviationweather_metar",
+                "2026-06-10T19:40:00+00:00", 27.0, "C",
+                "2026-06-10T19:50:00+00:00",
+                "METAR KLGA 101940Z 18008KT 10SM CLR 27/16 A2998 T02700161",
+            ),
+            # Possessed, but a different station cannot condition KLGA paths.
+            (
+                3, "NYC", "KJFK", "aviationweather_metar",
+                "2026-06-10T19:42:00+00:00", 28.0, "C",
+                "2026-06-10T19:43:00+00:00",
+                "METAR KJFK 101942Z 18008KT 10SM CLR 28/16 A2998 T02800161",
+            ),
+        ),
+    )
+    world.commit()
+    world.close()
+    forecast = sqlite3.connect(":memory:")
+    forecast.execute("ATTACH DATABASE ? AS world", (str(world_path),))
+
+    city = runtime_cities_by_name()["NYC"]
+    state = hourly.read_day0_current_temperature_state(
+        conn=forecast,
+        city=city,
+        target_date=target_date,
+        decision_time=decision_time,
+    )
+    assert state is not None
+    assert state.value_native == pytest.approx(78.08)
+    assert state.observed_at == datetime(2026, 6, 10, 19, 30, tzinfo=UTC)
+    assert state.source == "aviationweather_metar"
+
+    request = SimpleNamespace(
+        city="NYC",
+        target_date=target_date,
+        computed_at=decision_time.isoformat(),
+        day0_observed_extreme_observation_time="2026-06-10T19:00:00+00:00",
+    )
+    producer_values, _sigma, _cutoff = materializer._day0_noaa_future_vector_members(
+        forecast, request, metric=metric
+    )
+    held_state = era._latest_day0_current_temperature_native(
+        world_conn=forecast,
+        family=SimpleNamespace(city="NYC", target_date=target_date, metric=metric),
+        decision_time=decision_time,
+    )
+    assert held_state is not None
+    held_values, _innovations = era._remaining_day_extremes_c_with_current_state_evidence(
+        vectors,
+        target_date=target_date,
+        decision_time=decision_time,
+        observation_time=held_state[1],
+        current_temp_c=(held_state[0] - 32.0) * 5.0 / 9.0,
+        metric=metric,
+    )
+    assert held_values == pytest.approx(producer_values)
+    forecast.close()
+
+
 @pytest.mark.parametrize(
     ("identity", "bounds", "error"),
     (
@@ -1218,6 +1328,21 @@ def test_istanbul_ogimet_materializer_carrier_path_has_numpy_and_500_rows(
         day0_observed_extreme_unit="C",
     )
     conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE observation_prints (
+            id INTEGER PRIMARY KEY, city TEXT, station_id TEXT,
+            source_channel TEXT, publish_ts_utc TEXT, value_native REAL,
+            unit TEXT, fetched_at_utc TEXT, raw_report TEXT
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO observation_prints VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            1, "Istanbul", "LTFM", "ogimet_metar_ltfm",
+            "2026-08-24T06:20:00+00:00", 26.0, "C",
+            "2026-08-24T06:25:00+00:00", None,
+        ),
+    )
     future, path_sigma, cutoff = _day0_noaa_future_vector_members(
         conn, request, metric="high"
     )
@@ -1426,6 +1551,14 @@ def test_tel_aviv_no_confirmed_prior_uses_real_jeffreys_carrier(
             source_channel TEXT, publish_ts_utc TEXT, value_native REAL,
             unit TEXT, fetched_at_utc TEXT, raw_report TEXT
         )"""
+    )
+    conn.execute(
+        "INSERT INTO observation_prints VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            1, "Tel Aviv", "LLBG", "ogimet_metar_llbg",
+            "2026-08-24T06:20:00+00:00", 31.0, "C",
+            "2026-08-24T06:25:00+00:00", None,
+        ),
     )
     future, path_sigma, cutoff = _day0_noaa_future_vector_members(
         conn, request, metric="high"
@@ -1716,6 +1849,14 @@ def test_tel_aviv_ogimet_publish_clock_uses_real_pair_history(
     conn.executemany(
         "INSERT INTO observation_prints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
+    )
+    conn.execute(
+        "INSERT INTO observation_prints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            999, "Tel Aviv", "LLBG", "ogimet_metar_llbg",
+            "2026-08-24T06:20:00+00:00", 31.0, "C",
+            "2026-08-24T06:25:00+00:00", None,
+        ),
     )
     future, path_sigma, _ = _day0_noaa_future_vector_members(
         conn, request, metric="high"
@@ -2566,6 +2707,20 @@ def test_day0_provider_run_witness_reaches_receipt_carrier(monkeypatch: pytest.M
     )
     assert len(vectors) == len(models)
     conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE observation_prints (
+            id INTEGER PRIMARY KEY, city TEXT, station_id TEXT,
+            source_channel TEXT, publish_ts_utc TEXT, value_native REAL,
+            unit TEXT, fetched_at_utc TEXT, raw_report TEXT
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO observation_prints VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            1, "Paris", "LFPG", "wu_icao_history", now.isoformat(), 20.0,
+            "C", now.isoformat(), None,
+        ),
+    )
     assert persist_day0_hourly_vectors(
         vectors,
         target_date=target_date,

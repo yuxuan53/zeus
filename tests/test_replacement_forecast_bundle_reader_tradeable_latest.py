@@ -425,11 +425,25 @@ def test_noaa_producer_likelihood_persists_and_reader_accepts_exact_identity(
     request = SimpleNamespace(
         city="Tel Aviv",
         city_timezone="Asia/Jerusalem",
-        target_date=date(2026, 6, 7),
+        target_date=date(2026, 6, 6),
         temperature_metric="high",
         computed_at=_dt(6, 12),
         day0_observed_extreme_source="aviationweather_metar",
         day0_observed_extreme_c=33.0,
+    )
+    conn.execute(
+        "INSERT INTO observation_prints VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            1,
+            "Tel Aviv",
+            "LLBG",
+            "ogimet_metar_llbg",
+            _dt(6, 11).isoformat(),
+            31.0,
+            "C",
+            _dt(6, 11, 5).isoformat(),
+            None,
+        ),
     )
     bins = (
         SimpleNamespace(lower_c=None, upper_c=32.0),
@@ -461,7 +475,7 @@ def test_noaa_producer_likelihood_persists_and_reader_accepts_exact_identity(
     assert reader._held_pinned_provenance_reason(
         provenance,
         city="Tel Aviv",
-        target_date="2026-06-07",
+        target_date="2026-06-06",
         metric="high",
         decision_time=_dt(6, 12),
     ) is None
@@ -488,6 +502,9 @@ def test_noaa_producer_likelihood_persists_and_reader_accepts_exact_identity(
         "_edli_day0_remaining_carrier_future_extremes_c": [28.0, 29.0, 30.0],
         "_edli_day0_remaining_carrier_path_error_sigma_c": 0.5,
         "_edli_day0_remaining_carrier_probability_cutoff_utc": _dt(6, 12).isoformat(),
+        "_edli_day0_current_temperature_native": 31.0,
+        "_edli_day0_current_temperature_observed_at_utc": _dt(6, 11).isoformat(),
+        "_edli_day0_current_temperature_source": "ogimet_metar_llbg",
         "_edli_day0_remaining_vector_witness": {
             "vector_id": "vector-id-1",
             "expected_models": ["ecmwf_ifs"],
