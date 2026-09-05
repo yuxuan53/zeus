@@ -238,6 +238,7 @@ def bounded_sqlite_write(
 
     if max_hold_ms <= 0:
         raise ValueError("max_hold_ms must be positive")
+    lease.record_stage("sqlite_write")
     now = clock or time.monotonic
     remaining_ms = float(max_hold_ms) - max(
         0.0,
@@ -260,7 +261,7 @@ def bounded_sqlite_write(
     try:
         yield
     except sqlite3.OperationalError as exc:
-        stage = lease._metrics.stage or "sqlite"
+        stage = lease._metrics.stage or "sqlite_write"
         lease.record_sqlite_error(exc, stage=stage)
         if _sqlite_busy(exc):
             name = lease._metrics.sqlite_errorname or "SQLITE_BUSY"
@@ -468,7 +469,7 @@ class WriteCoordinator:
         deadline_ms: int | None,
         max_hold_ms: int | None,
         deadline_exceeded: bool,
-    ) -> None:
+    ) -> BaseException | None:
         metrics = lease._metrics
         hold_ms = max(0.0, (released_at - lease.acquired_at) * 1000.0)
         row = WriteLeaseTelemetry(
@@ -505,7 +506,11 @@ class WriteCoordinator:
             self._active_telemetry.pop(id(lease), None)
             self._telemetry_ring.append(row)
         if self._telemetry_sink is not None:
-            self._telemetry_sink(row)
+            try:
+                self._telemetry_sink(row)
+            except BaseException as exc:
+                return exc
+        return None
 
     def has_pending_monitor_waiter(
         self,
@@ -626,6 +631,7 @@ class WriteCoordinator:
         acquired_at: float | None = None
         lease: WriteLease | None = None
         timeout_error: WriteLeaseTimeout | None = None
+        pending_error: BaseException | None = None
         try:
             monitor_waiting = resolved_priority is WritePriority.MONITOR
             monitor_intent_fds: list[int] = []
@@ -690,13 +696,16 @@ class WriteCoordinator:
                 yield lease
             except BaseException as exc:
                 metrics.error = type(exc).__name__
+                pending_error = exc
                 raise
         except WriteLeaseTimeout as exc:
             timeout_error = exc
             metrics.error = type(exc).__name__
+            pending_error = exc
             raise
         except BaseException as exc:
             metrics.error = type(exc).__name__
+            pending_error = exc
             raise
         finally:
             released_at = self._clock()
@@ -710,32 +719,46 @@ class WriteCoordinator:
                 release_error = exc
                 metrics.error = type(exc).__name__
                 metrics.stage = "release"
-            if lease is not None:
-                self._record_released_telemetry(
-                    lease,
-                    started=started,
-                    released_at=released_at,
-                    released_wall_time=time.time(),
-                    deadline_ms=deadline_ms,
-                    max_hold_ms=max_hold_ms,
-                    deadline_exceeded=timeout_error is not None,
-                )
-            else:
-                self._emit_telemetry(
-                    owner=owner,
-                    ordered=ordered,
-                    write_class=resolved_class,
-                    priority=resolved_priority,
-                    started=started,
-                    acquired_at=acquired_at,
-                    released_at=released_at,
-                    deadline_ms=deadline_ms,
-                    max_hold_ms=max_hold_ms,
-                    metrics=metrics,
-                    deadline_exceeded=timeout_error is not None,
-                )
+            sink_error: BaseException | None = None
+            try:
+                if lease is not None:
+                    sink_error = self._record_released_telemetry(
+                        lease,
+                        started=started,
+                        released_at=released_at,
+                        released_wall_time=time.time(),
+                        deadline_ms=deadline_ms,
+                        max_hold_ms=max_hold_ms,
+                        deadline_exceeded=timeout_error is not None,
+                    )
+                else:
+                    sink_error = self._emit_telemetry(
+                        owner=owner,
+                        ordered=ordered,
+                        write_class=resolved_class,
+                        priority=resolved_priority,
+                        started=started,
+                        acquired_at=acquired_at,
+                        released_at=released_at,
+                        deadline_ms=deadline_ms,
+                        max_hold_ms=max_hold_ms,
+                        metrics=metrics,
+                        deadline_exceeded=timeout_error is not None,
+                    )
+            except BaseException as exc:
+                sink_error = exc
             if release_error is not None:
+                if sink_error is not None:
+                    raise release_error from sink_error
                 raise release_error
+            if pending_error is not None:
+                if sink_error is not None:
+                    pending_error.add_note(
+                        "telemetry sink failed: "
+                        f"{type(sink_error).__name__}: {sink_error}"
+                    )
+            elif sink_error is not None:
+                raise sink_error
 
     @contextlib.contextmanager
     def transaction(
@@ -780,17 +803,17 @@ class WriteCoordinator:
             before_changes = int(conn.total_changes)
             began = False
             try:
+                lease.record_stage("sqlite_write")
                 with bounded_sqlite_write(
                     conn,
                     lease,
                     max_hold_ms=max_hold_ms,
                     clock=self._clock,
                 ) if max_hold_ms is not None else contextlib.nullcontext():
-                    lease.record_stage("sqlite_begin")
                     try:
                         conn.execute(f"BEGIN {tx_mode.value}")
                     except sqlite3.OperationalError as exc:
-                        lease.record_sqlite_error(exc, stage="sqlite_begin")
+                        lease.record_sqlite_error(exc, stage="sqlite_write")
                         if _sqlite_busy(exc):
                             name = lease._metrics.sqlite_errorname or "SQLITE_BUSY"
                             raise WriteLeaseTimeout(
@@ -1471,7 +1494,7 @@ class WriteCoordinator:
         max_hold_ms: int | None,
         metrics: _LeaseMetrics,
         deadline_exceeded: bool,
-    ) -> None:
+    ) -> BaseException | None:
         wait_stop = acquired_at if acquired_at is not None else released_at
         hold_ms = 0.0 if acquired_at is None else (released_at - acquired_at) * 1000.0
         telemetry = WriteLeaseTelemetry(
@@ -1507,7 +1530,11 @@ class WriteCoordinator:
         with self._telemetry_lock:
             self._telemetry_ring.append(telemetry)
         if self._telemetry_sink is not None:
-            self._telemetry_sink(telemetry)
+            try:
+                self._telemetry_sink(telemetry)
+            except BaseException as exc:
+                return exc
+        return None
 
 
 def _default_connection_factory(path: Path) -> sqlite3.Connection:

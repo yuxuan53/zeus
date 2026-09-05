@@ -1,7 +1,7 @@
 # Created: 2026-06-26
-# Last reused or audited: 2026-08-11
+# Last reused or audited: 2026-09-05
 # Authority basis: docs/operations/current/reports/runtime_db_lock_refactor_design_2026-06-26.md
-# Lifecycle: created=2026-06-26; last_reviewed=2026-08-11; last_reused=2026-08-11
+# Lifecycle: created=2026-06-26; last_reviewed=2026-09-05; last_reused=2026-09-05
 # Purpose: Runtime DB write coordinator skeleton antibodies: unified same-file
 #   LIVE/BULK writer gate, canonical multi-DB lease order, and single-DB
 #   BEGIN IMMEDIATE commit/rollback telemetry.
@@ -819,14 +819,44 @@ def test_busy_snapshot_keeps_extended_sqlite_classification(tmp_path: Path) -> N
     conn = Connection()
     with pytest.raises(WriteLeaseTimeout, match="SQLITE_BUSY_SNAPSHOT"):
         with coordinator.lease((DBIdentity.TRADE,), owner="busy-snapshot") as lease:
-            lease.record_stage("sqlite_begin")
             with bounded_sqlite_write(conn, lease, max_hold_ms=100):
                 conn.execute("INSERT")
 
     row = telemetry[0]
     assert row.sqlite_errorcode == sqlite3.SQLITE_BUSY_SNAPSHOT
     assert row.sqlite_errorname == "SQLITE_BUSY_SNAPSHOT"
-    assert row.stage == "sqlite_begin"
+    assert row.stage == "sqlite_write"
+
+
+def test_release_error_precedes_telemetry_sink_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink_error = RuntimeError("telemetry sink failed")
+    release_error = RuntimeError("release failed")
+
+    def _sink(_row: WriteLeaseTelemetry) -> None:
+        raise sink_error
+
+    coordinator = WriteCoordinator(
+        _db_paths(tmp_path),
+        telemetry_sink=_sink,
+    )
+
+    def _broken_release(_acquired: list[object]) -> None:
+        raise release_error
+
+    monkeypatch.setattr(coordinator, "_release_gates", _broken_release)
+    with pytest.raises(RuntimeError, match="release failed") as caught:
+        with coordinator.lease((DBIdentity.TRADE,), owner="release-priority"):
+            pass
+
+    assert caught.value is release_error
+    assert caught.value.__cause__ is sink_error
+    row = coordinator.telemetry_history_snapshot()[0]
+    assert row.owner == "release-priority"
+    assert row.error == "RuntimeError"
+    assert row.stage == "release"
 
 
 def test_owner_telemetry_history_is_bounded(tmp_path: Path) -> None:
