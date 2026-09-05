@@ -10108,20 +10108,14 @@ def _exit_monitor_cycle(
     # the later network phase. Reactor handoff and all pre-monitor preparation
     # consume the same finite budget so a stalled handoff cannot shift the
     # probability/exit work beyond its advertised cadence.
-    # A targeted wake that absorbs canonical overdue families has become a
-    # book-recovery tranche in substance.  Giving it the ordinary targeted
-    # 75-second budget lets max_instances=1 skip multiple 30-second recovery
-    # ticks while the oldest held position remains overdue.  Bound every claim
-    # that owns canonical cadence debt to the recovery quantum; the admitted
-    # positions retain their fair next-cycle reservation if the tranche ends.
-    cadence_recovery_claim = (
-        periodic_full_book
-        or recovery_claim
-        or debt_scope_is_full_book
-        or bool(absorbed_overdue_families)
-    )
+    # Every path owns the same process-wide claim that the 30-second scheduler
+    # needs.  A targeted wake with no debt at admission can itself create debt
+    # by holding the claim for the old 75-second budget, skipping two periodic
+    # ticks before the recovery flag exists.  Treat every invocation as one
+    # bounded tranche; durable wakes and canonical debt select the next tranche
+    # without letting any single family monopolize the monitor writer.
     claim_budget_seconds = _held_position_monitor_claim_budget_seconds(
-        periodic_full_book=cadence_recovery_claim,
+        periodic_full_book=True,
     )
     monitor_deadline_monotonic = time.monotonic() + claim_budget_seconds
     def _periodic_preemption_requested_since_claim() -> bool:

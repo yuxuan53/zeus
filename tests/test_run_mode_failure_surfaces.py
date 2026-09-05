@@ -8839,7 +8839,7 @@ def test_exit_monitor_claims_priority_and_waits_for_reactor_handoff(monkeypatch)
     assert main_module._exit_monitor_cycle() is True
 
     assert calls == [
-        ("wait", main_module._EXIT_MONITOR_REACTOR_HANDOFF_SECONDS, True, True),
+        ("wait", pytest.approx(29.0, abs=0.01), True, True),
         "release",
         ("run", True, None, False),
     ]
@@ -9800,6 +9800,7 @@ def test_urgent_exit_monitor_finishes_before_newer_day0_wake(monkeypatch) -> Non
     from src.runtime import reactor_wake
 
     captured = {}
+    bounded_claims = []
 
     class ReactorGate:
         def acquire(self, *, timeout: float) -> bool:
@@ -9826,6 +9827,12 @@ def test_urgent_exit_monitor_finishes_before_newer_day0_wake(monkeypatch) -> Non
         lambda: False,
     )
     monkeypatch.setattr(main_module, "_edli_reactor_active_lock", ReactorGate())
+    monkeypatch.setattr(
+        main_module,
+        "_held_position_monitor_claim_budget_seconds",
+        lambda *, periodic_full_book: bounded_claims.append(periodic_full_book)
+        or 29.0,
+    )
     monkeypatch.setattr(exit_module, "run_exit_monitor_cycle", _run)
     monkeypatch.setattr(
         reactor_wake,
@@ -9846,6 +9853,7 @@ def test_urgent_exit_monitor_finishes_before_newer_day0_wake(monkeypatch) -> Non
         is True
     )
     assert captured["target_families"] == frozenset({("Paris", "2026-07-17", "high")})
+    assert bounded_claims == [True]
     assert main_module._held_position_monitor_active.is_set() is False
 
 
@@ -10818,7 +10826,7 @@ def test_exit_monitor_handoff_timeout_releases_priority_claim(monkeypatch) -> No
     assert main_module._exit_monitor_cycle() is False
 
     assert calls == []
-    assert observed_timeouts == [main_module._EXIT_MONITOR_REACTOR_HANDOFF_SECONDS]
+    assert observed_timeouts == [pytest.approx(29.0, abs=0.01)]
     assert main_module._periodic_held_position_monitor_fairness_debt.is_set()
     assert not main_module._held_position_monitor_active.is_set()
     assert not main_module._held_position_monitor_handoff_pending.is_set()
