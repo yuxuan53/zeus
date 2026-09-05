@@ -30770,10 +30770,12 @@ class TestRecoveryResolutionTable:
             "cost_basis_usd": 21.6129,
         }
 
+    @pytest.mark.parametrize("close_position", [True, False])
     def test_terminal_exit_residual_priority_projects_hkg_shape_db_only(
         self,
         tmp_path,
         monkeypatch,
+        close_position,
     ):
         """A stalled selector cannot strand the HKG terminal FAK residual."""
         from src.execution import command_recovery, venue_sync_contract
@@ -30810,6 +30812,37 @@ class TestRecoveryResolutionTable:
             shares=48.2258,
             occurred_at="2026-09-03T21:05:41+00:00",
         )
+        if not close_position:
+            sequence_no = seed.execute(
+                "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM position_events "
+                "WHERE position_id = '32d6009c-007'"
+            ).fetchone()[0]
+            seed.execute(
+                """
+                INSERT INTO position_events (
+                    event_id, position_id, event_version, sequence_no, event_type,
+                    occurred_at, phase_before, phase_after, strategy_key,
+                    source_module, env, payload_json
+                ) VALUES (?, '32d6009c-007', 1, ?, 'EXIT_INTENT',
+                          '2026-09-03T21:05:42+00:00', 'day0_window',
+                          'pending_exit', 'opening_inertia',
+                          'tests.test_command_recovery', 'live', ?)
+                """,
+                (
+                    "32d6009c-007:partial_exit_intent",
+                    sequence_no,
+                    json.dumps(
+                        {
+                            "exit_intent_close_position": False,
+                            "exit_intent_shares": 48.22,
+                            "exit_intent_capital_certificate": {
+                                "held_shares": "48.2258"
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
         _insert(
             seed,
             command_id="cmd-hkg-terminal-partial",
@@ -30858,6 +30891,29 @@ class TestRecoveryResolutionTable:
             _conn_factory,
         )
         summary = command_recovery.reconcile_terminal_exit_residual_projections_priority()
+
+        if not close_position:
+            assert summary == {"scanned": 1, "advanced": 0, "stayed": 0, "errors": 1}
+            verified = _conn_factory()
+            try:
+                current = verified.execute(
+                    """
+                    SELECT phase, shares, chain_shares, cost_basis_usd,
+                           chain_cost_basis_usd
+                      FROM position_current
+                     WHERE position_id = '32d6009c-007'
+                    """
+                ).fetchone()
+            finally:
+                verified.close()
+            assert dict(current) == {
+                "phase": "day0_window",
+                "shares": 48.225805,
+                "chain_shares": 43.2258,
+                "cost_basis_usd": 16.675806,
+                "chain_cost_basis_usd": 14.9468744999653,
+            }
+            return
 
         assert summary == {"scanned": 1, "advanced": 1, "stayed": 0, "errors": 0}
         # The converged terminal receipt is no longer a recovery candidate;

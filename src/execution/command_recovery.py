@@ -12867,6 +12867,9 @@ def _repair_terminal_partial_exit_projection(
         expected_remaining * entry_price if entry_price is not None else None
     )
     residual_tolerance = Decimal("0.000001")
+    chain_residual_share_tolerance = (
+        Decimal("0") if close_position else residual_tolerance
+    )
     local_is_residual = bool(
         local_shares is not None
         and local_basis is not None
@@ -12882,15 +12885,24 @@ def _repair_terminal_partial_exit_projection(
         and local_basis is not None
         and pre_fill_basis is not None
         and abs(local_shares - holding_shares)
-        <= _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
+        <= (
+            _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
+            if close_position
+            else residual_tolerance
+        )
         and abs(local_basis - pre_fill_basis)
-        <= _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
+        <= (
+            _TERMINAL_EXIT_FLOOR_QUANTIZATION_TOLERANCE
+            if close_position
+            else residual_tolerance
+        )
     )
     chain_is_residual = bool(
         chain_shares is not None
         and chain_basis is not None
         and expected_basis is not None
-        and abs(chain_shares - expected_remaining) <= residual_tolerance
+        and abs(chain_shares - expected_remaining)
+        <= chain_residual_share_tolerance
         and abs(chain_basis - expected_basis) <= residual_tolerance
     )
     chain_is_pre_fill = bool(
@@ -12901,12 +12913,15 @@ def _repair_terminal_partial_exit_projection(
         and abs(chain_basis - pre_fill_basis) <= residual_tolerance
     )
     if chain_is_pre_fill:
-        return False
+        raise RuntimeError(
+            f"terminal partial EXIT chain residual is unproven for {command_id}"
+        )
     if not chain_is_residual or not (local_is_residual or local_is_pre_fill):
         raise RuntimeError(
             f"terminal partial EXIT residual exposure conflicts for {command_id}"
         )
 
+    quantized_full_close_pre_fill = close_position and local_is_pre_fill
     applied = _complete_intentional_position_reduction(
         position,
         intended_shares=intended_shares,
@@ -12918,15 +12933,17 @@ def _repair_terminal_partial_exit_projection(
         economic_fills=fills,
         intent_holding_shares=holding_shares,
         release_after_fill=True,
-        # Chain truth has already proved the post-fill residual.  When the
-        # local projection still names the full holding, its effective view
-        # routes through that chain residual. The permitted floor tail is
-        # normalized to the immutable full-close holding; chain residual cost
-        # is then the exact final local basis, never a second chain scaling.
-        projection_open_shares=holding_shares if local_is_pre_fill else None,
+        # Only full-close terminal SELLs may normalize the venue-floor tail
+        # to the immutable intent and adopt the proven chain residual basis.
+        # Partial-exit recovery retains the local reduction basis exactly.
+        projection_open_shares=(
+            holding_shares
+            if quantized_full_close_pre_fill
+            else local_shares if local_is_pre_fill else None
+        ),
         projection_open_cost_basis_usd=local_basis if local_is_pre_fill else None,
         projection_remaining_cost_basis_usd=(
-            chain_basis if local_is_pre_fill else None
+            chain_basis if quantized_full_close_pre_fill else None
         ),
         preserve_proven_chain_projection=local_is_pre_fill,
     )
@@ -12938,7 +12955,7 @@ def _repair_terminal_partial_exit_projection(
         """,
         (position_id,),
     ).fetchone()
-    if local_is_pre_fill:
+    if quantized_full_close_pre_fill:
         projected_shares = _positive_decimal_or_none(
             phase_after[1] if phase_after is not None else None
         )
