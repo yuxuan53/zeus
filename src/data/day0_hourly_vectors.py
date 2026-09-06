@@ -1161,6 +1161,71 @@ def _current_provider_bundle_already_persisted(
         return False
 
 
+def _current_ensemble_bundle_already_persisted(
+    *,
+    city: str,
+    target_dates: Sequence[str],
+    run_hwm: Day0ProviderRunHwm,
+    decision_time: datetime,
+    remaining_window_starts: Mapping[str, datetime | None],
+) -> bool:
+    """Prove that shared storage already has this exact 51-member ENS bundle.
+
+    One provider run (``ecmwf_ifs025``) backs every member row, so a single
+    probed HWM is checked against each persisted member's own recorded run
+    identity, mirroring ``_current_provider_bundle_already_persisted`` above
+    for the deterministic models.
+    """
+
+    expected = day0_source_clock_ensemble_member_models()
+    try:
+        from src.state.db import get_forecasts_connection_read_only
+
+        conn = get_forecasts_connection_read_only()
+        try:
+            for target_date in target_dates:
+                window_start = remaining_window_starts.get(str(target_date))
+                if window_start is None:
+                    return False
+                vectors = read_freshest_day0_hourly_vectors(
+                    city=city,
+                    target_date=str(target_date),
+                    now=decision_time,
+                    expected_models=expected,
+                    require_expected=True,
+                    max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
+                    remaining_window_start=window_start,
+                    require_complete_remaining_window=True,
+                    conn=conn,
+                    raise_on_db_error=True,
+                )
+                by_model = {str(vector.model): vector for vector in vectors}
+                if set(by_model) != set(expected):
+                    return False
+                for model in expected:
+                    try:
+                        payload = json.loads(
+                            str(by_model[model].source_run_meta_json or "")
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return False
+                    actual = _provider_run_identity_from_meta(
+                        payload if isinstance(payload, Mapping) else None,
+                        expected_model=model,
+                    )
+                    if actual is None:
+                        return False
+                    # QUOTA (round 3): run identity is (model, run_initialisation_time)
+                    # only -- see _current_provider_bundle_already_persisted above.
+                    if actual[0] != run_hwm.run_initialisation_time.astimezone(UTC):
+                        return False
+            return True
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, RuntimeError):
+        return False
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_TABLE_DDL)
     conn.execute(_INDEX_DDL)
@@ -1526,6 +1591,42 @@ def parse_openmeteo_ensemble_hourly_payload(
             )
         )
     return vectors
+
+
+def _probe_day0_source_clock_ensemble_run_hwm(
+    *,
+    decision_time: datetime,
+    timeout_s: float,
+) -> Day0ProviderRunHwm | None:
+    """Cheap meta-only probe of the ENS carrier's current provider run.
+
+    Folded through the same monotone per-model HWM pin used for the
+    deterministic models (commit a09d8b0c0) so a stale meta.json replica can
+    never look newer than a run already accepted for ``ecmwf_ifs025``.
+    """
+
+    try:
+        from src.data.openmeteo_model_updates import fetch_model_updates
+
+        updates = fetch_model_updates(
+            [DAY0_SOURCE_CLOCK_ENSEMBLE_MODEL],
+            timeout_seconds=max(0.25, float(timeout_s)),
+            max_workers=1,
+            priority=True,
+        )
+    except Exception:  # noqa: BLE001 - probe failure just skips the dedup check
+        return None
+    if len(updates) != 1:
+        return None
+    update = updates[0]
+    probe = Day0ProviderRunHwm(
+        model=DAY0_SOURCE_CLOCK_ENSEMBLE_MODEL,
+        run_initialisation_time=update.last_run_initialisation_time.astimezone(UTC),
+        run_availability_time=update.last_run_availability_time.astimezone(UTC),
+    )
+    return _apply_day0_provider_run_hwm_pin({DAY0_SOURCE_CLOCK_ENSEMBLE_MODEL: probe})[
+        DAY0_SOURCE_CLOCK_ENSEMBLE_MODEL
+    ]
 
 
 def fetch_day0_source_clock_ensemble_vectors(
@@ -2817,6 +2918,33 @@ def maybe_refresh_day0_hourly_vectors(
                 if quota_lane in {"priority", "recovery"}
                 else ()
             )
+            if ensemble_target_dates:
+                ensemble_window_starts = {
+                    target_date: (
+                        window_starts.get(target_date)
+                        or strict_window_start(city, target_date)
+                    )
+                    for target_date in ensemble_target_dates
+                }
+                ensemble_run_hwm = _probe_day0_source_clock_ensemble_run_hwm(
+                    decision_time=decision_time, timeout_s=timeout_s
+                )
+                if (
+                    ensemble_run_hwm is not None
+                    and _current_ensemble_bundle_already_persisted(
+                        city=name,
+                        target_dates=ensemble_target_dates,
+                        run_hwm=ensemble_run_hwm,
+                        decision_time=decision_time,
+                        remaining_window_starts=ensemble_window_starts,
+                    )
+                ):
+                    # Already have this exact provider run's 51-member bundle
+                    # persisted for every requested date -- an unconditional
+                    # re-fetch here re-reserved already-successful ensemble
+                    # keys on every incomplete-bundle retry and held-city
+                    # release_due pass (round-3 residual leak).
+                    ensemble_target_dates = ()
             ensemble_vectors: list[Day0HourlyVector] = []
             ensemble_request_hash = ""
             with _REFRESH_LOCK:
