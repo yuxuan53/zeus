@@ -1139,7 +1139,12 @@ def _fetch_standard_meta_stamped_payloads(
     deadline_monotonic: float | None,
     past_hours: int = 0,
 ) -> tuple[tuple[Mapping[str, object], ...], _StandardMetaStampedTransport]:
-    """Fetch one current model from the standard API under an atomic metadata window."""
+    """Fetch one current model from the standard API under an atomic metadata window.
+
+    Run identity is (model, last_run_initialisation_time) only: replicas behind Open-Meteo's
+    meta.json endpoint disagree on last_run_availability_time for the same run, so availability
+    is recorded as evidence (earliest of before/after) but never gates the refuse/discard checks.
+    """
 
     if source_available_at is None:
         raise ValueError(f"{model} standard fallback requires frozen source availability")
@@ -1148,7 +1153,6 @@ def _fetch_standard_meta_stamped_payloads(
     from src.data.openmeteo_model_updates import fetch_model_updates  # noqa: PLC0415
 
     expected_run = _utc_datetime(run)
-    expected_available = _utc_datetime(source_available_at)
 
     def _meta() -> object:
         deadline_kwargs = _deadline_fetch_kwargs(deadline_monotonic)
@@ -1168,7 +1172,7 @@ def _fetch_standard_meta_stamped_payloads(
     before_run = meta_before.last_run_initialisation_time.astimezone(UTC)
     before_available = meta_before.last_run_availability_time.astimezone(UTC)
     before_modified = meta_before.last_run_modification_time
-    if before_run != expected_run or before_available != expected_available:
+    if before_run != expected_run:
         raise ValueError(
             f"{model} standard fallback refused: provider metadata no longer matches frozen run"
         )
@@ -1206,17 +1210,17 @@ def _fetch_standard_meta_stamped_payloads(
         raise ValueError(f"{model} standard fallback multi-location response shape mismatch")
 
     meta_after = _meta()
+    after_available = meta_after.last_run_availability_time.astimezone(UTC)
     after_modified = meta_after.last_run_modification_time
     if (
         meta_after.last_run_initialisation_time.astimezone(UTC) != before_run
-        or meta_after.last_run_availability_time.astimezone(UTC) != before_available
         or after_modified is None
         or after_modified.astimezone(UTC) != before_modified
     ):
         raise ValueError(f"{model} standard fallback discarded: provider metadata changed mid-fetch")
     return tuple(payloads), _StandardMetaStampedTransport(
         run=before_run,
-        source_available_at=before_available,
+        source_available_at=min(before_available, after_available),
         modification_time=before_modified,
         forecast_hours=int(forecast_hours),
     )

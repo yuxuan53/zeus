@@ -709,6 +709,8 @@ def test_single_runs_quota_rejects_standard_payload_when_frozen_run_mismatches(
 
     model = "icon_global"
     frozen_run = datetime(2026, 8, 18, 6, tzinfo=UTC)
+    # availability is held identical to the frozen run on purpose: only initialisation_time
+    # differs, so this pins refusal to a run-identity mismatch, not an availability replica skew.
     available = datetime(2026, 8, 18, 15, 44, 39, tzinfo=UTC)
     update = metadata.OpenMeteoModelUpdate(
         model=model,
@@ -815,6 +817,68 @@ def test_nbm_standard_fallback_discards_payload_when_metadata_changes(
     assert "ncep_nbm_conus" not in result
     assert dl._BATCH_TRANSPORT_ERROR_KEY in result
     assert "metadata changed mid-fetch" in result[dl._BATCH_TRANSPORT_ERROR_KEY][0]
+
+
+def test_standard_fallback_accepts_availability_skew_across_meta_replicas(
+    monkeypatch,
+) -> None:
+    """Replicas behind meta.json disagree on availability for the same run; run identity
+    is (model, last_run_initialisation_time) only, so an availability mismatch (before vs
+    after, and vs the frozen expectation) must not refuse or discard the fetch."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+    import src.data.openmeteo_model_updates as metadata
+
+    model = "ncep_nbm_conus"
+    run = datetime(2026, 7, 27, 15, tzinfo=UTC)
+    modified = datetime(2026, 7, 27, 16, 3, tzinfo=UTC)
+    expected_available = datetime(2026, 7, 27, 16, 4, tzinfo=UTC)
+    before_available = datetime(2026, 7, 27, 16, 4, 11, tzinfo=UTC)
+    after_available = datetime(2026, 7, 27, 16, 27, 39, tzinfo=UTC)
+    updates = iter(
+        (
+            metadata.OpenMeteoModelUpdate(
+                model=model,
+                last_run_initialisation_time=run,
+                last_run_availability_time=before_available,
+                last_run_modification_time=modified,
+            ),
+            metadata.OpenMeteoModelUpdate(
+                model=model,
+                last_run_initialisation_time=run,
+                last_run_availability_time=after_available,
+                last_run_modification_time=modified,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        metadata,
+        "fetch_model_updates",
+        lambda *_args, **_kwargs: (next(updates),),
+    )
+
+    def _fetch(_url, _params, **_kwargs):
+        return {
+            "hourly": {
+                "time": ["2026-07-28T00:00", "2026-07-28T12:00"],
+                "temperature_2m": [20.0, 30.0],
+            }
+        }
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+    payloads, stamp = dl._fetch_standard_meta_stamped_payloads(
+        model=model,
+        locations=((30.267, -97.743, "America/Chicago", (date(2026, 7, 28),)),),
+        run=run,
+        source_available_at=expected_available,
+        forecast_hours=120,
+        deadline_monotonic=None,
+    )
+
+    assert len(payloads) == 1
+    assert stamp.run == run
+    assert stamp.modification_time == modified
+    assert stamp.source_available_at == before_available
 
 
 def test_nbm_meta_stamped_transport_is_persisted_as_physical_identity(
