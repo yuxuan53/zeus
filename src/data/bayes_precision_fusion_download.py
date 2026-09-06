@@ -38,9 +38,11 @@ missing current capture is therefore a live probability-input gap, not a harmles
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -557,6 +559,135 @@ _EXACT_RUN_IMMUTABLE_GAP_REASONS = (
 _EXACT_RUN_UNMATERIALIZABLE_MEMO: dict[tuple[str, str, str, str], str] = {}
 _EXACT_RUN_MEMO_RETENTION_DAYS = 3
 
+# 2026-09-05 (quota root-cause, round 2): this memo was in-process-memory ONLY — every
+# restart of either live daemon (src.main / src.ingest_main) forgot every previously
+# proven-immutable gap, and the two daemons never shared what the other had already
+# learned, so the SAME already-proven-dead (model, city, target_date, run) scope paid
+# its "first miss" HTTP cost again on every restart and in both processes independently
+# (owner_pid alternates between the two in state/openmeteo_quota.json for the same
+# request hash). Persisting the memo to a small shared, lock-guarded state file — the
+# exact pattern already used by state/openmeteo_quota.json — makes a proven gap durable
+# and cross-process, without changing WHICH reasons are memoizable (the whitelist above
+# is untouched: transport/temperature_series_missing gaps still are NOT memoized, since
+# those may legitimately resolve on retry per the existing design).
+_EXACT_RUN_GAP_MEMO_SCHEMA_VERSION = 1
+_EXACT_RUN_GAP_MEMO_LOAD_INTERVAL_SECONDS = 30.0
+_exact_run_gap_memo_state_path: Path | None = None
+_exact_run_gap_memo_last_loaded_monotonic: float = 0.0
+
+
+def _exact_run_gap_memo_persistence_enabled() -> bool:
+    """Mirror OpenMeteoQuotaTracker._shared_enabled: no file I/O under test.
+
+    Tests manipulate ``_EXACT_RUN_UNMATERIALIZABLE_MEMO`` directly and run with a
+    module-level state path fixed at import time — same reason the quota tracker
+    itself skips its shared file under ZEUS_TESTING/pytest.
+    """
+    return not (
+        os.environ.get("ZEUS_TESTING") == "1" or "PYTEST_CURRENT_TEST" in os.environ
+    )
+
+
+def _exact_run_gap_memo_path() -> Path:
+    global _exact_run_gap_memo_state_path
+    if _exact_run_gap_memo_state_path is None:
+        from src.config import state_path  # noqa: PLC0415
+
+        _exact_run_gap_memo_state_path = state_path(
+            "bayes_precision_fusion_run_gap_memo.json"
+        )
+    return _exact_run_gap_memo_state_path
+
+
+def _exact_run_gap_scope_key(scope: tuple[str, str, str, str]) -> str:
+    return "|".join(scope)
+
+
+def _load_persisted_exact_run_memo(*, force: bool = False) -> None:
+    """Merge durably-recorded gaps from disk into the in-process memo.
+
+    Cheap-refreshed (every ~30s of wall time) rather than on every invocation — this
+    runs inside a 15s-cadence reactive poll, and a full disk read+lock per call would
+    trade one waste for another.
+    """
+    if not _exact_run_gap_memo_persistence_enabled():
+        return
+    global _exact_run_gap_memo_last_loaded_monotonic
+    now = time.monotonic()
+    if not force and (now - _exact_run_gap_memo_last_loaded_monotonic) < _EXACT_RUN_GAP_MEMO_LOAD_INTERVAL_SECONDS:
+        return
+    _exact_run_gap_memo_last_loaded_monotonic = now
+    path = _exact_run_gap_memo_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, dict):
+        return
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        parts = str(key).split("|")
+        if len(parts) != 4:
+            continue
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason:
+            continue
+        scope = (parts[0], parts[1], parts[2], parts[3])
+        _EXACT_RUN_UNMATERIALIZABLE_MEMO.setdefault(scope, reason)
+
+
+def _persist_exact_run_gap(scope: tuple[str, str, str, str], reason: str) -> None:
+    """Durably record one proven-immutable gap so any process/restart can see it."""
+    if not _exact_run_gap_memo_persistence_enabled():
+        return
+    path = _exact_run_gap_memo_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if path.exists():
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        payload = {}
+                else:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if payload.get("schema_version") != _EXACT_RUN_GAP_MEMO_SCHEMA_VERSION:
+                    payload = {
+                        "schema_version": _EXACT_RUN_GAP_MEMO_SCHEMA_VERSION,
+                        "entries": {},
+                    }
+                entries = payload.get("entries")
+                if not isinstance(entries, dict):
+                    entries = {}
+                    payload["entries"] = entries
+                entries[_exact_run_gap_scope_key(scope)] = {
+                    "reason": reason,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                }
+                temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                try:
+                    temp.write_text(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    os.replace(temp, path)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        temp.unlink()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        # Durability is an optimization here, not a correctness requirement: the
+        # in-process memo (and the existing persisted-row check) still apply.
+        _LOG.debug("BAYES_PRECISION_FUSION could not persist exact-run gap memo", exc_info=True)
+
 
 def _memoize_exact_run_gap(
     scope: tuple[str, str, str, str],
@@ -569,11 +700,13 @@ def _memoize_exact_run_gap(
         _LOG.debug(
             "BAYES_PRECISION_FUSION memoized exact-run gap %s: %s", scope, reason
         )
+        _persist_exact_run_gap(scope, reason)
     _EXACT_RUN_UNMATERIALIZABLE_MEMO[scope] = reason
 
 
 def _prune_exact_run_memo(*, cycle_utc: datetime) -> None:
     """Drop memo entries whose run predates the retention floor. O(len(memo))."""
+    _load_persisted_exact_run_memo()
     floor = cycle_utc - timedelta(days=_EXACT_RUN_MEMO_RETENTION_DAYS)
     stale = [
         scope

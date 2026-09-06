@@ -2244,6 +2244,52 @@ def test_transport_shaped_gap_reason_is_never_memoized(tmp_path, monkeypatch) ->
     assert calls == [[(date_a, date_b)], [(date_b,)]]
 
 
+def test_memoized_exact_run_gap_survives_process_restart(tmp_path, monkeypatch) -> None:
+    """QUOTA (2026-09-05, round 2): _EXACT_RUN_UNMATERIALIZABLE_MEMO was in-process-memory
+    ONLY. Two long-lived daemons (src.main / src.ingest_main) each independently rediscover
+    the SAME proven-immutable gap after any restart of either process, paying the HTTP cost
+    again (owner_pid alternates on the same request hash in state/openmeteo_quota.json).
+    A gap that is memoized must survive clearing the in-memory dict (simulating a restart)
+    by round-tripping through the durable, lock-guarded state file.
+    """
+    import src.data.bayes_precision_fusion_download as dl
+
+    memo_path = tmp_path / "bayes_precision_fusion_run_gap_memo.json"
+    monkeypatch.setattr(dl, "_exact_run_gap_memo_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_exact_run_gap_memo_path", lambda: memo_path)
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+
+    scope = ("icon_eu", "Paris", "2026-09-07", "2026-09-03T18:00:00+00:00")
+    dl._memoize_exact_run_gap(scope, _MEMO_GAP_REASON)
+
+    assert memo_path.exists(), "a memoized immutable gap must be written durably"
+
+    # Simulate a process restart: the in-process memo is gone, but a fresh process
+    # (or the same process after restart) must recover it from disk.
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+    assert dl._EXACT_RUN_UNMATERIALIZABLE_MEMO == {}
+    dl._load_persisted_exact_run_memo(force=True)
+
+    assert dl._EXACT_RUN_UNMATERIALIZABLE_MEMO == {scope: _MEMO_GAP_REASON}
+
+
+def test_transport_shaped_gap_reason_is_not_persisted_to_disk(tmp_path, monkeypatch) -> None:
+    """The whitelist decision (which reasons are immutable) must hold for the durable
+    memo too -- a transport-shaped reason must never be written to the state file."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    memo_path = tmp_path / "bayes_precision_fusion_run_gap_memo.json"
+    monkeypatch.setattr(dl, "_exact_run_gap_memo_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_exact_run_gap_memo_path", lambda: memo_path)
+    dl._EXACT_RUN_UNMATERIALIZABLE_MEMO.clear()
+
+    scope = ("icon_eu", "Paris", "2026-09-07", "2026-09-03T18:00:00+00:00")
+    dl._memoize_exact_run_gap(scope, "temperature_series_missing")
+
+    assert dl._EXACT_RUN_UNMATERIALIZABLE_MEMO == {}
+    assert not memo_path.exists(), "a retry-able gap must never be persisted durably"
+
+
 def test_previous_runs_unservable_models_are_dropped_from_the_batched_leg(
     tmp_path, monkeypatch
 ) -> None:
