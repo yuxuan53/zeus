@@ -154,6 +154,25 @@ def _staleness_variance_test_isolation(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _single_runs_payload_cache_test_isolation():
+    """Isolate the BPF single-runs payload cache (quota root-cause, round 3).
+
+    ``src.data.bayes_precision_fusion_download._SINGLE_RUNS_PAYLOAD_CACHE`` is a
+    process-lifetime, immutable-run cache keyed on (model-set, run, location,
+    forecast_hours, past_hours) so a repeat request for the same exact run is served
+    without HTTP. Left unclear between tests, two tests that happen to share a
+    (model, run, lat, lon, forecast_hours) tuple would let the SECOND test's mocked
+    ``fetch`` go uncalled -- a cache hit from the first test's payload, not the
+    behavior the second test is asserting.
+    """
+    from src.data.bayes_precision_fusion_download import _SINGLE_RUNS_PAYLOAD_CACHE
+
+    _SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    yield
+    _SINGLE_RUNS_PAYLOAD_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _bankroll_provider_test_isolation(monkeypatch):
     """P0-A antibody: deterministic bankroll, no live wallet fetches in tests.
 

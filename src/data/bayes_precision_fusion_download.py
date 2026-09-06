@@ -38,6 +38,7 @@ missing current capture is therefore a live probability-input gap, not a harmles
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -728,6 +729,169 @@ def _exact_run_memo_run_utc(run_iso: str) -> datetime | None:
     return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+# 2026-09-05 (quota root-cause, round 3): a fetched single-runs payload for one
+# (model-set, run, location, forecast_hours/past_hours) is an IMMUTABLE identity -- the
+# exact same bytes are returned on every repeat request until the provider retires the
+# run. Two independent call sites re-issue byte-identical requests for a payload the
+# process (or a sibling process) already holds:
+#   (1) the per-(city,target_date) BPF loop calls _default_live_fetch_batched once per
+#       target date even though one forecast_hours=120 payload covers several dates
+#       (only the requested date's rows were ever kept -- the rest of the payload was
+#       parsed once and discarded);
+#   (2) day0_hourly_vectors._day0_exact_run_payloads fetches one model at a time inside
+#       an all-or-nothing bundle (fetch_day0_hourly_vectors) -- when a LATER model in the
+#       bundle raises, the whole bundle is discarded unpersisted, so the EARLIER models'
+#       already-successful payloads are silently thrown away and re-fetched on every
+#       45s-cadence incomplete-bundle retry (INCOMPLETE_BUNDLE_RETRY_INTERVAL_S).
+# Caching the raw payload at the shared choke point below -- _fetch_single_runs_hourly_
+# payloads_batched, the only place either caller ever calls fetch() on
+# SINGLE_RUNS_FORECAST_URL -- turns a repeat of either shape into a zero-HTTP cache hit
+# without changing the bundle-completeness law, the per-date row semantics, or the
+# fail-soft contract. Persisted to disk (same lock-guarded state-file pattern as the
+# exact-run-gap memo above) so a second daemon process, or the same daemon after a
+# restart, also gets the cache hit instead of re-paying the HTTP cost.
+_SINGLE_RUNS_PAYLOAD_CACHE: dict[str, dict[str, object]] = {}
+_SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION = 1
+_SINGLE_RUNS_PAYLOAD_CACHE_LOAD_INTERVAL_SECONDS = 30.0
+_SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES = 1000
+_single_runs_payload_cache_state_path: Path | None = None
+_single_runs_payload_cache_last_loaded_monotonic: float = 0.0
+
+
+def _single_runs_payload_cache_persistence_enabled() -> bool:
+    """Mirror _exact_run_gap_memo_persistence_enabled: no file I/O under test."""
+    return not (
+        os.environ.get("ZEUS_TESTING") == "1" or "PYTEST_CURRENT_TEST" in os.environ
+    )
+
+
+def _single_runs_payload_cache_path() -> Path:
+    global _single_runs_payload_cache_state_path
+    if _single_runs_payload_cache_state_path is None:
+        from src.config import state_path  # noqa: PLC0415
+
+        _single_runs_payload_cache_state_path = state_path(
+            "bayes_precision_fusion_single_runs_payload_cache.json"
+        )
+    return _single_runs_payload_cache_state_path
+
+
+def _single_runs_payload_cache_key(
+    *,
+    om_ids: tuple[str, ...],
+    run_iso: str,
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+    forecast_hours: int,
+    past_hours: int,
+) -> str:
+    canonical = "|".join((
+        ",".join(sorted(om_ids)),
+        run_iso,
+        f"{float(latitude):.6f}",
+        f"{float(longitude):.6f}",
+        timezone_name,
+        str(int(forecast_hours)),
+        str(int(past_hours)),
+    ))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
+    """Merge durably-cached payloads from disk into the in-process cache.
+
+    Cheap-refreshed like the exact-run-gap memo rather than reloaded on every call.
+    """
+    if not _single_runs_payload_cache_persistence_enabled():
+        return
+    global _single_runs_payload_cache_last_loaded_monotonic
+    now = time.monotonic()
+    if (
+        not force
+        and (now - _single_runs_payload_cache_last_loaded_monotonic)
+        < _SINGLE_RUNS_PAYLOAD_CACHE_LOAD_INTERVAL_SECONDS
+    ):
+        return
+    _single_runs_payload_cache_last_loaded_monotonic = now
+    path = _single_runs_payload_cache_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, dict):
+        return
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        raw_payload = entry.get("payload")
+        if not isinstance(raw_payload, dict):
+            continue
+        _SINGLE_RUNS_PAYLOAD_CACHE.setdefault(str(key), raw_payload)
+
+
+def _store_single_runs_payload_cache(key: str, payload: Mapping[str, object]) -> None:
+    """Cache one fetched payload in-process and, when enabled, durably."""
+    stored = copy.deepcopy(dict(payload))
+    _SINGLE_RUNS_PAYLOAD_CACHE[key] = stored
+    if not _single_runs_payload_cache_persistence_enabled():
+        return
+    path = _single_runs_payload_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if path.exists():
+                    try:
+                        on_disk = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        on_disk = {}
+                else:
+                    on_disk = {}
+                if not isinstance(on_disk, dict):
+                    on_disk = {}
+                if on_disk.get("schema_version") != _SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION:
+                    on_disk = {
+                        "schema_version": _SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION,
+                        "entries": {},
+                    }
+                entries = on_disk.get("entries")
+                if not isinstance(entries, dict):
+                    entries = {}
+                    on_disk["entries"] = entries
+                recorded_at = datetime.now(UTC).isoformat()
+                entries[key] = {"payload": stored, "recorded_at": recorded_at}
+                if len(entries) > _SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES:
+                    ordered = sorted(
+                        entries.items(),
+                        key=lambda item: str(item[1].get("recorded_at") or "")
+                        if isinstance(item[1], dict)
+                        else "",
+                    )
+                    overflow = len(entries) - _SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES
+                    for stale_key, _ in ordered[:overflow]:
+                        entries.pop(stale_key, None)
+                temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                try:
+                    temp.write_text(
+                        json.dumps(on_disk, sort_keys=True, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    os.replace(temp, path)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        temp.unlink()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        # Durability is an optimization: the in-process cache still serves this
+        # process's remaining repeat requests even if the disk write failed.
+        _LOG.debug("BAYES_PRECISION_FUSION could not persist single-runs payload cache", exc_info=True)
+
+
 def _typed_transport_outcome(error: object) -> dict[str, object] | None:
     """Preserve a redacted HTTP outcome through BPF's fail-soft report boundary."""
 
@@ -1080,14 +1244,36 @@ def _default_live_fetch_batched(
             "temperature_unit": "celsius",
             "timezone": timezone_name,
         }
-        payload = fetch(
-            SINGLE_RUNS_FORECAST_URL,
-            params,
-            endpoint_label="bayes_precision_fusion_single_runs_batched",
-            quota=_BPF_OPENMETEO_QUOTA_TRACKER,
-            fast_fail_429=True,
-            **_deadline_fetch_kwargs(deadline_monotonic),
+        # QUOTA (round 3): this exact (model-set, run, location, forecast_hours) payload
+        # covers every target_date in the run's forecast_hours window, but the caller
+        # (the per-(city, target_date) BPF loop) requests it again -- byte-identical URL --
+        # for each OTHER target_date in scope, since only `target_local_date` was ever kept
+        # from a prior parse. Serve repeats from the shared immutable-run payload cache
+        # instead of re-hitting the transport.
+        _load_persisted_single_runs_payload_cache()
+        cache_key = _single_runs_payload_cache_key(
+            om_ids=tuple(om_ids),
+            run_iso=run_iso,
+            latitude=latitude,
+            longitude=longitude,
+            timezone_name=timezone_name,
+            forecast_hours=forecast_hours,
+            past_hours=0,
         )
+        cached_payload = _SINGLE_RUNS_PAYLOAD_CACHE.get(cache_key)
+        if cached_payload is not None:
+            payload = copy.deepcopy(cached_payload)
+        else:
+            payload = fetch(
+                SINGLE_RUNS_FORECAST_URL,
+                params,
+                endpoint_label="bayes_precision_fusion_single_runs_batched",
+                quota=_BPF_OPENMETEO_QUOTA_TRACKER,
+                fast_fail_429=True,
+                **_deadline_fetch_kwargs(deadline_monotonic),
+            )
+            if isinstance(payload, Mapping):
+                _store_single_runs_payload_cache(cache_key, payload)
         return _parse_batched_single_runs_payload(payload, models, target_local_date, timezone_name)
     except Exception as exc:
         batched_error_text = str(exc)
@@ -1339,6 +1525,63 @@ def _default_live_fetch_locations_batched(
 
 
 def _fetch_single_runs_hourly_payloads_batched(
+    *,
+    models: Sequence[str],
+    locations: Sequence[tuple[float, float, str, Sequence[date]]],
+    run: datetime,
+    forecast_hours: int,
+    deadline_monotonic: float | None = None,
+    past_hours: int = 0,
+) -> tuple[Mapping[str, object], ...]:
+    """Read-through cache in front of the raw single-runs transport.
+
+    QUOTA (2026-09-05, round 3): this is the ONE choke point both the BPF
+    location-batched fast path (_default_live_fetch_locations_batched) and the day0
+    hourly-vector refresh (day0_hourly_vectors._day0_exact_run_payloads) use to reach
+    SINGLE_RUNS_FORECAST_URL. A payload for one (model-set, run, location,
+    forecast_hours, past_hours) is immutable, so a cache hit here serves either caller,
+    either process, and any retry of an all-or-nothing bundle (day0's incomplete-bundle
+    retry re-requests every model in the bundle, including the ones that already
+    succeeded) at zero HTTP cost. Locations not already cached are fetched together in
+    ONE reduced multi-location call, preserving the exact request/response shape of the
+    uncached transport below.
+    """
+    if not models or not locations:
+        return ()
+    om_ids = tuple(OPENMETEO_MODEL_IDS.get(model, model) for model in models)
+    run_iso = run.strftime("%Y-%m-%dT%H:%M")
+    _load_persisted_single_runs_payload_cache()
+    cache_keys = [
+        _single_runs_payload_cache_key(
+            om_ids=om_ids,
+            run_iso=run_iso,
+            latitude=latitude,
+            longitude=longitude,
+            timezone_name=timezone_name,
+            forecast_hours=forecast_hours,
+            past_hours=past_hours,
+        )
+        for latitude, longitude, timezone_name, _dates in locations
+    ]
+    cached = [_SINGLE_RUNS_PAYLOAD_CACHE.get(key) for key in cache_keys]
+    missing_positions = [index for index, entry in enumerate(cached) if entry is None]
+    if missing_positions:
+        missing_locations = [locations[index] for index in missing_positions]
+        fetched = _fetch_single_runs_hourly_payloads_batched_uncached(
+            models=models,
+            locations=missing_locations,
+            run=run,
+            forecast_hours=forecast_hours,
+            deadline_monotonic=deadline_monotonic,
+            past_hours=past_hours,
+        )
+        for index, payload in zip(missing_positions, fetched, strict=True):
+            cached[index] = payload
+            _store_single_runs_payload_cache(cache_keys[index], payload)
+    return tuple(copy.deepcopy(entry) for entry in cached)
+
+
+def _fetch_single_runs_hourly_payloads_batched_uncached(
     *,
     models: Sequence[str],
     locations: Sequence[tuple[float, float, str, Sequence[date]]],

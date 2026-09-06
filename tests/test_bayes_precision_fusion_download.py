@@ -2389,3 +2389,128 @@ def test_previous_runs_unservable_models_are_dropped_from_the_legacy_leg(
     assert seen_models == ["ecmwf_ifs"]
     assert "kma_gdps:previous_runs_unservable" in report["dropped"]
     assert _count(db, model="kma_gdps", endpoint="previous_runs") == 0
+
+
+def _two_day_single_runs_payload() -> dict:
+    """A forecast_hours=120 single-runs payload genuinely covering two local days."""
+    return {
+        "hourly": {
+            "time": [
+                "2026-09-06T00:00", "2026-09-06T03:00", "2026-09-06T12:00", "2026-09-06T21:00",
+                "2026-09-07T00:00", "2026-09-07T03:00", "2026-09-07T12:00", "2026-09-07T21:00",
+            ],
+            "temperature_2m": [24.0, 23.0, 31.0, 26.0, 25.0, 24.0, 32.0, 27.0],
+        },
+        "hourly_units": {"temperature_2m": "°C"},
+    }
+
+
+def test_single_runs_payload_cache_serves_second_target_date_without_http(
+    monkeypatch,
+) -> None:
+    """QUOTA round 3 (shape 1): a forecast_hours=120 payload for one (model, run,
+    location) genuinely covers several target dates. The per-(city, target_date) BPF
+    loop calls _default_live_fetch_batched once per date with a byte-identical URL --
+    the second call must be served from the payload cache, not a second HTTP GET."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _two_day_single_runs_payload()
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    common = dict(
+        models=["ecmwf_ifs"],
+        latitude=1.35019,
+        longitude=103.994003,
+        timezone_name="Asia/Singapore",
+        run=datetime(2026, 9, 5, 18, tzinfo=UTC),
+        forecast_hours=120,
+    )
+    first = dl._default_live_fetch_batched(target_local_date=date(2026, 9, 6), **common)
+    second = dl._default_live_fetch_batched(target_local_date=date(2026, 9, 7), **common)
+
+    assert len(calls) == 1, "second target_date must be a cache hit, not a second HTTP GET"
+    assert first["ecmwf_ifs"] == (31.0, 23.0)
+    assert second["ecmwf_ifs"] == (32.0, 24.0)
+
+
+def test_single_runs_payload_cache_shared_between_locations_batched_and_single_caller(
+    monkeypatch,
+) -> None:
+    """QUOTA round 3 (shape 3): _fetch_single_runs_hourly_payloads_batched is the ONE
+    choke point both the BPF location-batched fast path and day0_hourly_vectors use.
+    Two callers requesting the identical (model, run, location) must issue ONE HTTP
+    call between them, regardless of which caller goes first."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _two_day_single_runs_payload()
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    location = (1.35019, 103.994003, "Asia/Singapore", (date(2026, 9, 6),))
+    run = datetime(2026, 9, 5, 18, tzinfo=UTC)
+
+    # Caller 1: the BPF location-batched fast path (multi-location shaped call).
+    first = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[location], run=run, forecast_hours=120,
+    )
+    # Caller 2: day0_hourly_vectors' one-model-one-location shape, same identity.
+    second = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[location], run=run, forecast_hours=120,
+    )
+
+    assert len(calls) == 1, "the second caller must be served from the shared cache"
+    assert first == second
+    assert first[0]["hourly"]["temperature_2m"] == _two_day_single_runs_payload()["hourly"]["temperature_2m"]
+
+
+def test_single_runs_payload_cache_persists_across_process_restart(
+    monkeypatch, tmp_path,
+) -> None:
+    """QUOTA round 3: a second process (or the same process after a restart) reading
+    the durable payload cache must issue zero HTTP calls for an already-cached
+    (model, run, location, forecast_hours)."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    cache_path = tmp_path / "bayes_precision_fusion_single_runs_payload_cache.json"
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_path", lambda: cache_path)
+    dl._SINGLE_RUNS_PAYLOAD_CACHE.clear()
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _two_day_single_runs_payload()
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    location = (1.35019, 103.994003, "Asia/Singapore", (date(2026, 9, 6),))
+    run = datetime(2026, 9, 5, 18, tzinfo=UTC)
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[location], run=run, forecast_hours=120,
+    )
+    assert len(calls) == 1
+    assert cache_path.exists(), "a fetched payload must be durably cached"
+
+    # Simulate a fresh process: the in-process cache is empty, but the durable file
+    # (a second daemon, or this same daemon after a restart) must still hit.
+    dl._SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    dl._load_persisted_single_runs_payload_cache(force=True)
+    second = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[location], run=run, forecast_hours=120,
+    )
+
+    assert len(calls) == 1, "a restarted/second process must serve from the durable cache"
+    assert second[0]["hourly"]["temperature_2m"] == _two_day_single_runs_payload()["hourly"]["temperature_2m"]
