@@ -408,3 +408,112 @@ def test_ensemble_fetch_skips_http_when_current_run_already_persisted(monkeypatc
     current_run["avail"] = avail_b
     _refresh()
     assert ensemble_calls["n"] == 2, "a genuinely newer run must fetch exactly once more"
+
+
+def test_complete_ensemble_bundle_persists_when_deterministic_bundle_is_unavailable(
+    monkeypatch,
+) -> None:
+    """QUOTA (round 6, 2026-09-06): the ENS carrier was persisted only after the
+    deterministic bundle passed every completeness gate, so a deterministic
+    ``continue`` discarded an already-paid complete 51-member bundle and the same
+    ensemble request re-issued on every pass (Los Angeles / Seattle / San Francisco /
+    Lucknow: zero member rows ever persisted). A complete ensemble bundle must persist
+    on the pass that fetched it, whatever the deterministic bundle did; the next pass
+    for the same run must then not fetch the ensemble again."""
+    from src.data.openmeteo_quota import OpenMeteoQuotaTracker
+
+    city = SimpleNamespace(
+        name="Los Angeles", timezone="America/Los_Angeles", lat=33.94, lon=-118.41
+    )
+    model_det = "ncep_nbm_conus"
+    decision_time = datetime(2026, 9, 6, 6, 25, 0, tzinfo=UTC)
+    target_date = decision_time.astimezone(ZoneInfo(city.timezone)).date().isoformat()
+    members = day0.day0_source_clock_ensemble_member_models()
+    run = datetime(2026, 9, 5, 18, tzinfo=UTC)
+    avail = datetime(2026, 9, 6, 1, 8, 57, tzinfo=UTC)
+
+    ensemble_calls = {"n": 0}
+    persisted_endpoints: list[tuple[str | None, int]] = []
+    persisted = {"done": False}
+
+    day0._LAST_REFRESH_MONOTONIC.clear()
+    day0._INCOMPLETE_RETRY_NOT_BEFORE_MONOTONIC.clear()
+    day0._INCOMPLETE_RETRY_STREAK.clear()
+    day0._DAY0_PROVIDER_RUN_HWM_PIN.clear()
+    monkeypatch.setattr(day0, "_day0_provider_run_hwm_pin_persistence_enabled", lambda: False)
+    monkeypatch.setattr(day0, "quota_tracker", OpenMeteoQuotaTracker())
+    monkeypatch.setattr(day0, "day0_hourly_models_for_city", lambda _city: [model_det])
+    monkeypatch.setattr(
+        day0, "day0_source_clock_ensemble_target_dates", lambda **_kwargs: (target_date,)
+    )
+    # Deterministic carrier unavailable on every pass (the live Los Angeles shape:
+    # DAY0_HOURLY_BUNDLE_FETCH_UNAVAILABLE missing=ncep_nbm_conus).
+    monkeypatch.setattr(
+        day0,
+        "fetch_day0_hourly_vectors",
+        lambda city_arg, *, models=None, now=None, timeout_s=None: ([], ""),
+    )
+    monkeypatch.setattr(
+        day0,
+        "_probe_day0_source_clock_ensemble_run_hwm",
+        lambda *, decision_time, timeout_s: Day0ProviderRunHwm(
+            model=day0.DAY0_SOURCE_CLOCK_ENSEMBLE_MODEL,
+            run_initialisation_time=run,
+            run_availability_time=avail,
+        ),
+    )
+
+    def fake_fetch_ensemble(city_arg, *, now=None, timeout_s=None):
+        ensemble_calls["n"] += 1
+        return (
+            [_ensemble_member_vector(city_arg, member, run, avail, now) for member in members],
+            "sha256:ens",
+        )
+
+    monkeypatch.setattr(day0, "fetch_day0_source_clock_ensemble_vectors", fake_fetch_ensemble)
+
+    def fake_persist(vectors, *, target_date, request_hash, endpoint=None, **_kwargs):
+        persisted_endpoints.append((endpoint, len(vectors)))
+        if endpoint == day0.OPENMETEO_ENSEMBLE_URL:
+            persisted["done"] = True
+        return len(vectors)
+
+    monkeypatch.setattr(day0, "persist_day0_hourly_vectors", fake_persist)
+
+    def fake_read_freshest(**kwargs):
+        expected = tuple(kwargs.get("expected_models") or ())
+        if set(expected) == set(members) and persisted["done"]:
+            return [
+                _ensemble_member_vector(city, member, run, avail, decision_time)
+                for member in members
+            ]
+        return []
+
+    monkeypatch.setattr(day0, "read_freshest_day0_hourly_vectors", fake_read_freshest)
+
+    class _FakeConn:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "src.state.db.get_forecasts_connection_read_only", lambda: _FakeConn()
+    )
+
+    def _refresh() -> None:
+        day0.maybe_refresh_day0_hourly_vectors(
+            [city], decision_time=decision_time, interval_s=0.0, quota_priority_cities=1,
+        )
+
+    _refresh()
+    assert ensemble_calls["n"] == 1
+    assert persisted_endpoints == [(day0.OPENMETEO_ENSEMBLE_URL, len(members))], (
+        "a complete ensemble bundle must persist on the pass that fetched it even "
+        "though the deterministic bundle was unavailable"
+    )
+
+    day0._INCOMPLETE_RETRY_NOT_BEFORE_MONOTONIC.clear()
+    day0._INCOMPLETE_RETRY_STREAK.clear()
+    _refresh()
+    assert ensemble_calls["n"] == 1, (
+        "the next pass for the same run must reuse the persisted bundle, not re-fetch"
+    )

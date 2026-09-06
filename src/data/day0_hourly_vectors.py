@@ -2699,6 +2699,65 @@ def _refresh_throttled_locked(
     return last is not None and now_monotonic - last < float(interval_s)
 
 
+def _persist_complete_ensemble_bundle(
+    *,
+    name: str,
+    ensemble_vectors: list[Day0HourlyVector],
+    ensemble_request_hash: str,
+    ensemble_target_dates: tuple[str, ...],
+    ensemble_window_starts: Mapping[str, datetime | None],
+    decision_time: datetime,
+    persist_lock_blocking: bool,
+) -> int:
+    """Persist a complete 51-member ENS carrier for every requested date.
+
+    Selection is the same strict live-authority read the deterministic bundle
+    uses (all members, bounded skew, complete remaining window). An incomplete
+    carrier is logged and never persisted as a partial bundle.
+    """
+
+    if not ensemble_target_dates:
+        return 0
+    ensemble_expected = day0_source_clock_ensemble_member_models()
+    persisted = 0
+    for target_date in ensemble_target_dates:
+        window_start = ensemble_window_starts.get(target_date)
+        selected_ensemble = (
+            select_ready_day0_hourly_vectors(
+                ensemble_vectors,
+                target_date=target_date,
+                now=decision_time,
+                expected_models=ensemble_expected,
+                require_expected=True,
+                max_bundle_skew_minutes=DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES,
+                remaining_window_start=window_start,
+                require_complete_remaining_window=True,
+            )
+            if window_start is not None
+            and ensemble_request_hash
+            and len(ensemble_vectors) == DAY0_SOURCE_CLOCK_ENSEMBLE_MEMBER_COUNT
+            else []
+        )
+        if not selected_ensemble:
+            logger.warning(
+                "DAY0_SOURCE_CLOCK_ENSEMBLE_BUNDLE_UNAVAILABLE "
+                "city=%s target_date=%s available=%d expected=%d",
+                name,
+                target_date,
+                len(ensemble_vectors),
+                DAY0_SOURCE_CLOCK_ENSEMBLE_MEMBER_COUNT,
+            )
+            continue
+        persisted += persist_day0_hourly_vectors(
+            selected_ensemble,
+            target_date=target_date,
+            request_hash=ensemble_request_hash,
+            endpoint=OPENMETEO_ENSEMBLE_URL,
+            lock_blocking=persist_lock_blocking,
+        )
+    return persisted
+
+
 def maybe_refresh_day0_hourly_vectors(
     cities: list[Any],
     *,
@@ -3012,6 +3071,25 @@ def maybe_refresh_day0_hourly_vectors(
                             timeout_s=timeout_s,
                         )
                     )
+                    # QUOTA (round 6, 2026-09-06): persist the ENS carrier the moment it
+                    # is complete. It used to be persisted only after the deterministic
+                    # bundle had passed every completeness gate below, so each
+                    # deterministic ``continue`` (fetch unavailable, model missing,
+                    # remaining window incomplete) discarded an already-paid, complete
+                    # 51-member bundle and the same ensemble request re-issued on every
+                    # pass for any city whose deterministic bundle stays incomplete
+                    # (Los Angeles / Seattle / San Francisco / Lucknow: zero member rows
+                    # ever persisted, 9-17 attempts each). The two carriers are
+                    # independent data products; only their fetch shares a pass.
+                    written += _persist_complete_ensemble_bundle(
+                        name=name,
+                        ensemble_vectors=ensemble_vectors,
+                        ensemble_request_hash=ensemble_request_hash,
+                        ensemble_target_dates=ensemble_target_dates,
+                        ensemble_window_starts=ensemble_window_starts,
+                        decision_time=decision_time,
+                        persist_lock_blocking=persist_lock_blocking,
+                    )
             expected_models = tuple(dict.fromkeys(str(model) for model in models))
             vector_models = tuple(dict.fromkeys(str(vector.model) for vector in vectors))
             missing_models = tuple(
@@ -3109,48 +3187,6 @@ def maybe_refresh_day0_hourly_vectors(
                     request_hash=request_hash,
                     lock_blocking=persist_lock_blocking,
                 )
-            if ensemble_target_dates:
-                ensemble_expected = day0_source_clock_ensemble_member_models()
-                for target_date in ensemble_target_dates:
-                    window_start = window_starts.get(target_date)
-                    if window_start is None:
-                        window_start = strict_window_start(city, target_date)
-                    selected_ensemble = (
-                        select_ready_day0_hourly_vectors(
-                            ensemble_vectors,
-                            target_date=target_date,
-                            now=decision_time,
-                            expected_models=ensemble_expected,
-                            require_expected=True,
-                            max_bundle_skew_minutes=(
-                                DAY0_HOURLY_BUNDLE_MAX_SKEW_MINUTES
-                            ),
-                            remaining_window_start=window_start,
-                            require_complete_remaining_window=True,
-                        )
-                        if window_start is not None
-                        and ensemble_request_hash
-                        and len(ensemble_vectors)
-                        == DAY0_SOURCE_CLOCK_ENSEMBLE_MEMBER_COUNT
-                        else []
-                    )
-                    if not selected_ensemble:
-                        logger.warning(
-                            "DAY0_SOURCE_CLOCK_ENSEMBLE_BUNDLE_UNAVAILABLE "
-                            "city=%s target_date=%s available=%d expected=%d",
-                            name,
-                            target_date,
-                            len(ensemble_vectors),
-                            DAY0_SOURCE_CLOCK_ENSEMBLE_MEMBER_COUNT,
-                        )
-                        continue
-                    persisted += persist_day0_hourly_vectors(
-                        selected_ensemble,
-                        target_date=target_date,
-                        request_hash=ensemble_request_hash,
-                        endpoint=OPENMETEO_ENSEMBLE_URL,
-                        lock_blocking=persist_lock_blocking,
-                    )
             drained = all(
                 read_freshest_day0_hourly_vectors(
                     city=name,
