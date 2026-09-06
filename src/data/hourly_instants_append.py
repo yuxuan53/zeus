@@ -55,6 +55,7 @@ from src.state.data_coverage import (
     DataTable,
     record_failed,
     record_written,
+    written_fetch_times,
 )
 
 from src.data.openmeteo_client import ARCHIVE_URL, fetch as openmeteo_fetch
@@ -416,6 +417,74 @@ def _city_yesterday_local(city: City, now_utc: datetime) -> date:
     return (now_utc.astimezone(tz) - timedelta(days=1)).date()
 
 
+# QUOTA (2026-09-05, round 3, item B): hourly_tick's rolling window re-pulled
+# ALL `days_window` local days for every city on EVERY tick regardless of
+# whether any of them could plausibly have changed -- 54 cities x 3 days x 24
+# ticks/day, ~3,888 day-pulls/day on the Open-Meteo archive endpoint's own
+# per-day unit cost, on its own above the whole 2,000/day design ceiling
+# (tests/test_openmeteo_call_budget.py SANE_DAILY_CEILING). The docstring's own
+# justification ("catches any late Open-Meteo data promotions") never states a
+# cadence, and INSERT OR REPLACE overwrites in place, so whether a re-pull ever
+# actually changed an existing row is not observable from the current schema
+# without a captured-value history this worktree cannot add read-only.
+# ASSUMPTION (stated per the "cannot measure read-only" fallback): a local
+# day's archive-hourly readings may still be revised for up to
+# _LATE_PROMOTION_HOT_DAYS days after that local day ends, and checking more
+# often than every _LATE_PROMOTION_RECHECK_INTERVAL_HOURS within that window
+# adds no value. A day already WRITTEN and older than the hot window is
+# treated as final and is never re-pulled again. A day never written (or
+# FAILED) is always needed (case i); a WRITTEN day inside the hot window whose
+# last fetch exceeds the recheck interval is needed (case ii); everything else
+# is skipped. This is need-driven, not a throttle: a genuinely stale/missing
+# day is still fetched on the very next tick that notices it.
+_LATE_PROMOTION_HOT_DAYS = 2
+_LATE_PROMOTION_RECHECK_INTERVAL_HOURS = 6.0
+
+
+def _dates_needing_fetch(
+    conn, city: City, start_d: date, end_d: date, *, now_utc: datetime,
+) -> list[date]:
+    """Which dates in [start_d, end_d] actually need a fetch this tick.
+
+    See the QUOTA comment above `_LATE_PROMOTION_HOT_DAYS` for the policy and
+    its stated assumption.
+    """
+    all_dates: list[date] = []
+    d = start_d
+    while d <= end_d:
+        all_dates.append(d)
+        d += timedelta(days=1)
+    if not all_dates:
+        return []
+    written = written_fetch_times(
+        conn,
+        data_table=DataTable.OBSERVATION_INSTANTS,
+        city=city.name,
+        data_source=SOURCE,
+        target_dates=all_dates,
+    )
+    hot_floor = end_d - timedelta(days=_LATE_PROMOTION_HOT_DAYS - 1)
+    needed: list[date] = []
+    for candidate in all_dates:
+        fetched_at = written.get(candidate.isoformat())
+        if fetched_at is None:
+            needed.append(candidate)  # never written (or FAILED) -- case (i)
+            continue
+        if candidate < hot_floor:
+            continue  # WRITTEN and outside the hot window: final.
+        try:
+            last = datetime.fromisoformat(fetched_at)
+        except ValueError:
+            needed.append(candidate)
+            continue
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        age_hours = (now_utc - last).total_seconds() / 3600.0
+        if age_hours >= _LATE_PROMOTION_RECHECK_INTERVAL_HOURS:
+            needed.append(candidate)  # hot window, stale recheck -- case (ii)
+    return needed
+
+
 def hourly_tick(
     conn,
     *,
@@ -424,17 +493,24 @@ def hourly_tick(
     rebuild_run_id: Optional[str] = None,
     days_window: int = 3,
 ) -> dict:
-    """Daemon per-hour entrypoint: rolling [today-N, today-1] window append.
+    """Daemon per-hour entrypoint: need-driven [today-N, today-1] window append.
 
     For each city:
       - start = max(local today - days_window, global_floor)
       - end   = local yesterday (per-city)
-      - append_hourly_window fetches and upserts
+      - _dates_needing_fetch decides which dates in that window actually need
+        a fetch this tick (never-written dates, or hot-window dates whose last
+        write has aged past the recheck interval -- see the QUOTA comment
+        above `_LATE_PROMOTION_HOT_DAYS`)
+      - append_hourly_window fetches and upserts only the contiguous span
+        covering the needed dates (skipped entirely when nothing is needed)
       - data_coverage flipped per local_date
 
-    Default `days_window=3` means every hour we re-pull the last 3 local
-    days per city. This is idempotent (INSERT OR REPLACE) and catches
-    any late Open-Meteo data promotions, 1-hour network blips, etc.
+    `days_window=3` bounds how far back a never-written or FAILED date is
+    still eligible to be picked up; it no longer means every one of those
+    days is re-pulled on every tick. This is still idempotent (INSERT OR
+    REPLACE) and still catches late Open-Meteo data promotions within the hot
+    window, at a fraction of the unconditional re-pull's unit cost.
 
     Returns aggregate stats across all 46 cities.
     """
@@ -452,10 +528,14 @@ def hourly_tick(
     for city in cities:
         end_d = _city_yesterday_local(city, now_utc)
         start_d = end_d - timedelta(days=days_window - 1)
-        stats = append_hourly_window(
-            city, start_d, end_d, conn, rebuild_run_id=rebuild_run_id,
-        )
         totals["cities_processed"] += 1
+        needed_dates = _dates_needing_fetch(conn, city, start_d, end_d, now_utc=now_utc)
+        if not needed_dates:
+            continue
+        stats = append_hourly_window(
+            city, min(needed_dates), max(needed_dates), conn,
+            rebuild_run_id=rebuild_run_id,
+        )
         for k in ("fetched", "inserted", "guard_rejected",
                   "fetch_errors", "dates_marked_written"):
             totals[k] += stats.get(k, 0)

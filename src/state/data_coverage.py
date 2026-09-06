@@ -435,6 +435,43 @@ def coverage_summary(
     ).fetchall()
 
 
+def written_fetch_times(
+    conn: WorldConnection,
+    *,
+    data_table: DataTable,
+    city: str,
+    data_source: str,
+    target_dates: Iterable[date | str],
+    sub_key: str = "",
+) -> dict[str, str]:
+    """Return {target_date: fetched_at} for the WRITTEN rows among the given dates.
+
+    A date absent from the result is not currently WRITTEN (MISSING, FAILED, or never
+    attempted) — the caller must fetch it. A date present tells the caller when it was
+    last successfully fetched, which a need-driven re-fetch policy (only re-pull a
+    recently-written date if it is still young enough to plausibly receive a late
+    upstream promotion) uses instead of unconditionally re-pulling every date in a
+    rolling window every tick.
+    """
+    dates = [_coerce_target_date(d) for d in target_dates]
+    if not dates:
+        return {}
+    table_ref = _coverage_table_ref(conn)
+    placeholders = ",".join("?" for _ in dates)
+    rows = conn.execute(
+        f"""
+        SELECT target_date, fetched_at FROM {table_ref}
+        WHERE data_table = ? AND city = ? AND data_source = ? AND sub_key = ?
+          AND status = ? AND target_date IN ({placeholders})
+        """,
+        (
+            data_table.value, city, data_source, sub_key,
+            CoverageStatus.WRITTEN.value, *dates,
+        ),
+    ).fetchall()
+    return {str(row[0]): str(row[1]) for row in rows if row[1] is not None}
+
+
 def bulk_record_written(
     conn: WorldConnection,
     *,
