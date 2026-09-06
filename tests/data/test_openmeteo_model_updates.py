@@ -709,3 +709,88 @@ def test_source_clock_metadata_poll_backs_off_without_missing_off_cycle_update(
         update.last_run_initialisation_time
         for update in probe.read_model_updates_jsonl(updates_path)
     } == {datetime(2026, 8, 4, 12, 30, tzinfo=UTC)}
+
+
+def test_source_clock_cursor_ignores_availability_only_replica_skew(
+    tmp_path, monkeypatch
+) -> None:
+    """QUOTA root-cause round 3: a direct probe of Open-Meteo's meta.json caught two
+    replicas naming the SAME run (identical last_run_initialisation_time and
+    last_run_modification_time) but reporting two different last_run_availability_time
+    values. v3 folded availability_time into the cursor identity, so every replica skew
+    fired SOURCE_CLOCK_UPDATES_CHANGED (641 events on 2026-09-05 alone) and re-ran the
+    scoped BPF download for a run already captured. v4 must treat this as no change,
+    a genuinely newer run as exactly one change, and a stale replica's older run (seen
+    after a newer one was already accepted) as no change at all."""
+    import src.data.source_clock_update_probe as probe
+
+    updates_path = tmp_path / "updates.jsonl"
+    cursor_path = tmp_path / "cursor.json"
+    monkeypatch.setattr(probe, "all_configured_source_ids", lambda: ("ecmwf_ifs",))
+    monkeypatch.setattr(
+        probe, "affected_cities_for_source_updates", lambda _sources: ("Singapore",)
+    )
+
+    replica_a = OpenMeteoModelUpdate(
+        model="ecmwf_ifs",
+        last_run_initialisation_time=datetime(2026, 9, 5, 18, 0, tzinfo=UTC),
+        last_run_availability_time=datetime(2026, 9, 6, 0, 27, 39, tzinfo=UTC),
+    )
+    write_model_updates_jsonl(updates_path, [replica_a])
+    first = probe_openmeteo_source_clock_updates(
+        model_updates_path=updates_path,
+        cursor_path=cursor_path,
+        use_network=False,
+        decision_time=datetime(2026, 9, 6, 1, 0, tzinfo=UTC),
+    )
+    assert first.updated_sources == ("ecmwf_ifs",)
+
+    # Same run, a different replica's availability_time (00:27:39 -> 00:54:11).
+    replica_b = OpenMeteoModelUpdate(
+        model="ecmwf_ifs",
+        last_run_initialisation_time=datetime(2026, 9, 5, 18, 0, tzinfo=UTC),
+        last_run_availability_time=datetime(2026, 9, 6, 0, 54, 11, tzinfo=UTC),
+    )
+    write_model_updates_jsonl(updates_path, [replica_b])
+    same_run = probe_openmeteo_source_clock_updates(
+        model_updates_path=updates_path,
+        cursor_path=cursor_path,
+        use_network=False,
+        decision_time=datetime(2026, 9, 6, 1, 5, tzinfo=UTC),
+    )
+    assert same_run.updated_sources == (), (
+        "an availability-only replica skew for the same run must not look changed"
+    )
+
+    # A genuinely newer run (00Z) must advance exactly once.
+    newer_run = OpenMeteoModelUpdate(
+        model="ecmwf_ifs",
+        last_run_initialisation_time=datetime(2026, 9, 6, 0, 0, tzinfo=UTC),
+        last_run_availability_time=datetime(2026, 9, 6, 6, 30, 0, tzinfo=UTC),
+    )
+    write_model_updates_jsonl(updates_path, [newer_run])
+    advanced = probe_openmeteo_source_clock_updates(
+        model_updates_path=updates_path,
+        cursor_path=cursor_path,
+        use_network=False,
+        decision_time=datetime(2026, 9, 6, 7, 0, tzinfo=UTC),
+    )
+    assert advanced.updated_sources == ("ecmwf_ifs",)
+
+    # A stale replica reporting the OLDER 18Z run after 00Z was already accepted must
+    # never look changed again.
+    stale_replica = OpenMeteoModelUpdate(
+        model="ecmwf_ifs",
+        last_run_initialisation_time=datetime(2026, 9, 5, 18, 0, tzinfo=UTC),
+        last_run_availability_time=datetime(2026, 9, 6, 0, 27, 39, tzinfo=UTC),
+    )
+    write_model_updates_jsonl(updates_path, [stale_replica])
+    reverted = probe_openmeteo_source_clock_updates(
+        model_updates_path=updates_path,
+        cursor_path=cursor_path,
+        use_network=False,
+        decision_time=datetime(2026, 9, 6, 7, 5, tzinfo=UTC),
+    )
+    assert reverted.updated_sources == (), (
+        "a stale replica's older run must never re-trigger after a newer run was accepted"
+    )

@@ -43,6 +43,32 @@ _CURSOR_V3_RE = re.compile(
     r"(?P<availability>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})):"
     r"(?P<route>[0-9a-f]{64})$"
 )
+# QUOTA (2026-09-05, round 3): Open-Meteo's meta.json is served from more than one
+# replica; replicas have been observed reporting two different
+# last_run_availability_time values for the exact SAME immutable run (same
+# initialisation_time, same modification_time). v3 folded availability_time into the
+# cursor identity, so every replica skew looked like "the run changed" and re-fired
+# SOURCE_CLOCK_UPDATES_CHANGED (641 events in one day on 2026-09-05) -- re-running the
+# scoped BPF download for a run already captured. v4 drops availability_time from the
+# identity: a run is identified by (initialisation_time, route) alone. availability_time
+# remains available from the fetched OpenMeteoModelUpdate for the +10min public-
+# usability wait; it was never read from the cursor string for that purpose.
+_CURSOR_V4_RE = re.compile(
+    r"^v4:"
+    r"(?P<initialisation>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})):"
+    r"(?P<route>[0-9a-f]{64})$"
+)
+
+
+def _cursor_initialisation_time(value: str) -> datetime | None:
+    """Parse a v4 (or legacy v3) cursor value's initialisation_time only."""
+    match = _CURSOR_V4_RE.fullmatch(value) or _CURSOR_V3_RE.fullmatch(value)
+    if match is None:
+        return None
+    try:
+        return datetime.fromisoformat(match["initialisation"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
 _DOWNLOAD_CURSOR_COMMIT_STATUSES = frozenset(
     {
         "SOURCE_CLOCK_SCOPED_BAYES_PRECISION_FUSION_EXTRA_RAW_INPUTS_DOWNLOADED",
@@ -230,24 +256,37 @@ def _commit_cursor_values(
 
 
 def _cursor_value_is_strictly_newer(proposed: str, current: str | None) -> bool:
+    """Compare two cursor values by run identity (initialisation_time) alone.
+
+    QUOTA (round 3): availability_time is freshness evidence, not run identity, and a
+    stale meta.json replica has been observed reporting an availability_time either side
+    of another replica's for the SAME run. Ordering on the full v3 pair made a same-run
+    replica skew look like a "newer" cursor half the time and an unmovable one the other
+    half. Reads both the current v4 format and legacy-persisted v3 values.
+    """
     if current is None:
         return False
-    proposed_match = _CURSOR_V3_RE.fullmatch(proposed)
-    current_match = _CURSOR_V3_RE.fullmatch(current)
-    if proposed_match is None or current_match is None:
+    proposed_init = _cursor_initialisation_time(proposed)
+    current_init = _cursor_initialisation_time(current)
+    if proposed_init is None or current_init is None:
         return False
-    try:
-        proposed_order = (
-            datetime.fromisoformat(proposed_match["initialisation"].replace("Z", "+00:00")),
-            datetime.fromisoformat(proposed_match["availability"].replace("Z", "+00:00")),
-        )
-        current_order = (
-            datetime.fromisoformat(current_match["initialisation"].replace("Z", "+00:00")),
-            datetime.fromisoformat(current_match["availability"].replace("Z", "+00:00")),
-        )
-    except ValueError:
+    return proposed_init > current_init
+
+
+def _cursor_transition_is_regression(proposed: str, current: str | None) -> bool:
+    """True only when ``proposed``'s run_initialisation_time is OLDER than ``current``'s.
+
+    A same-run route change (the affected-city set changed for the SAME run) or a
+    genuine advance to a newer run must both still register as "changed"; only a
+    stale-replica regression to an OLDER run must not.
+    """
+    if current is None:
         return False
-    return proposed_order > current_order
+    proposed_init = _cursor_initialisation_time(proposed)
+    current_init = _cursor_initialisation_time(current)
+    if proposed_init is None or current_init is None:
+        return False
+    return proposed_init < current_init
 
 
 def _source_route_identity(model: str) -> str:
@@ -259,8 +298,7 @@ def _source_route_identity(model: str) -> str:
 def _cursor_for_updates(updates: tuple[OpenMeteoModelUpdate, ...]) -> dict[str, str]:
     return {
         update.model: (
-            f"v3:{update.last_run_initialisation_time.isoformat()}:"
-            f"{update.last_run_availability_time.isoformat()}:"
+            f"v4:{update.last_run_initialisation_time.isoformat()}:"
             f"{_source_route_identity(update.model)}"
         )
         for update in updates
@@ -341,7 +379,20 @@ def probe_openmeteo_source_clock_updates(
         updates = cached
     old = _read_cursor(cursor)
     new = _cursor_for_updates(updates)
-    changed = tuple(sorted(model for model, ts in new.items() if old.get(model) != ts))
+    # QUOTA (round 3): a differing cursor string is only a genuine run change if the
+    # new value's run_initialisation_time is strictly newer than the persisted one (or
+    # there was no persisted cursor for this model yet). A stale meta.json replica
+    # reporting an OLDER run than one already accepted must never look "changed" --
+    # that is the ecmwf_ifs 12Z/18Z flip observed live (five flips in twelve minutes),
+    # each one re-triggering the scoped BPF download for a run already captured.
+    changed = tuple(
+        sorted(
+            model
+            for model, ts in new.items()
+            if old.get(model) != ts
+            and not _cursor_transition_is_regression(ts, old.get(model))
+        )
+    )
     usable_changed: list[str] = []
     update_by_model = {u.model: u for u in updates}
     for model in changed:
@@ -533,14 +584,12 @@ def advance_source_clock_cursor(
             continue
         if isinstance(source_runs, Mapping):
             source_run = source_runs.get(model)
-            match = _CURSOR_V3_RE.fullmatch(ts)
+            match = _CURSOR_V4_RE.fullmatch(ts)
             if (
                 not isinstance(source_run, Mapping)
                 or match is None
                 or match["initialisation"]
                 != str(source_run.get("initialisation_time") or "")
-                or match["availability"]
-                != str(source_run.get("availability_time") or "")
             ):
                 continue
         values[model] = ts
