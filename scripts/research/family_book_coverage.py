@@ -1,17 +1,23 @@
 """Coverage census for a family_book_capture.py database.
 
 Answers, before any book-only replay runs, whether the feed can support it:
-  - per family: fraction of instants (1-minute grid) at which EVERY bin of the family has a
-    top-of-book observation within the last 60 s;
+  - per family: fraction of instants (1-minute grid) at which EVERY bin of the family is VALID
+    (its token was initialised — a ``book`` snapshot arrived — in the connection epoch active at
+    that instant, and the feed was connected at that instant). An unchanged quote on a healthy
+    connection counts as valid: validity is a state, not "a row landed in the last fresh_s";
   - median gap between consecutive top-of-book CHANGES per token;
   - ask-only share (rows with an ask but no bid);
   - feed health summary (connected minutes, msgs/min, reconnects).
+
+Families and their token sets come from ``token_meta`` (the subscribed universe), so a
+subscribed family with zero rows stays in the denominator at 0 coverage rather than vanishing.
 
 Usage: .venv/bin/python scripts/research/family_book_coverage.py --db <path> [--fresh-s 60]
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import sqlite3
 import statistics
 from collections import defaultdict
@@ -20,6 +26,53 @@ from datetime import datetime
 
 def _dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _validity_fn(conn: sqlite3.Connection):
+    """Build validity(token_id, instant_epoch_s) -> bool from connection_epoch + feed_health.
+
+    A token is valid at an instant when: (a) the instant falls within the time window of some
+    connection epoch (the largest epoch whose earliest book_top row is at or before the instant);
+    (b) that token has a book_top row in that same epoch at or before the instant (i.e. it was
+    initialised by a ``book`` snapshot this epoch); and (c) the feed's most recent feed_health
+    tick at or before the instant reports connected=1.
+    """
+    epoch_rows = conn.execute(
+        "SELECT connection_epoch AS e, MIN(received_at_utc) AS m FROM book_top GROUP BY connection_epoch"
+    ).fetchall()
+    epoch_starts = sorted((r["e"], _dt(r["m"]).timestamp()) for r in epoch_rows if r["e"] is not None)
+    epoch_start_times = [t for _, t in epoch_starts]
+    epoch_ids = [e for e, _ in epoch_starts]
+
+    init_rows = conn.execute(
+        "SELECT token_id AS t, connection_epoch AS e, MIN(received_at_utc) AS m FROM book_top GROUP BY token_id, connection_epoch"
+    ).fetchall()
+    token_epoch_init: dict[tuple[str, int], float] = {
+        (r["t"], r["e"]): _dt(r["m"]).timestamp() for r in init_rows if r["e"] is not None
+    }
+
+    health_rows = conn.execute("SELECT received_at_utc, connected FROM feed_health ORDER BY received_at_utc").fetchall()
+    health_times = [_dt(r["received_at_utc"]).timestamp() for r in health_rows]
+    health_connected = [bool(r["connected"]) for r in health_rows]
+
+    def epoch_at(instant: float) -> int | None:
+        i = bisect.bisect_right(epoch_start_times, instant) - 1
+        return epoch_ids[i] if i >= 0 else None
+
+    def connected_at(instant: float) -> bool:
+        i = bisect.bisect_right(health_times, instant) - 1
+        return health_connected[i] if i >= 0 else False
+
+    def validity(token_id: str, instant: float) -> bool:
+        e = epoch_at(instant)
+        if e is None:
+            return False
+        init = token_epoch_init.get((token_id, e))
+        if init is None or init > instant:
+            return False
+        return connected_at(instant)
+
+    return validity
 
 
 def census(db_path: str, *, fresh_s: float = 60.0, grid_s: float = 60.0) -> dict:
@@ -32,6 +85,7 @@ def census(db_path: str, *, fresh_s: float = 60.0, grid_s: float = 60.0) -> dict
     health = conn.execute(
         "SELECT COUNT(*) n, SUM(connected) up, AVG(msgs_per_min) mpm, MAX(reconnects) rc FROM feed_health"
     ).fetchone()
+    validity = _validity_fn(conn)
     conn.close()
     if not rows:
         return {"rows": 0}
@@ -39,6 +93,8 @@ def census(db_path: str, *, fresh_s: float = 60.0, grid_s: float = 60.0) -> dict
     by_token: dict[str, list[datetime]] = defaultdict(list)
     fam_tokens: dict[str, set[str]] = defaultdict(set)
     ask_only = 0
+    for token_id, m in meta.items():
+        fam_tokens[m.get("event_slug") or "?"].add(token_id)
     for r in rows:
         ts = _dt(r["received_at_utc"])
         by_token[r["token_id"]].append(ts)
@@ -46,10 +102,6 @@ def census(db_path: str, *, fresh_s: float = 60.0, grid_s: float = 60.0) -> dict
         fam_tokens[slug].add(r["token_id"])
         if r["best_ask"] is not None and r["best_bid"] is None:
             ask_only += 1
-    for slug, tokens in list(fam_tokens.items()):
-        for token_id, m in meta.items():
-            if m.get("event_slug") == slug:
-                tokens.add(token_id)
 
     t0 = _dt(rows[0]["received_at_utc"])
     t1 = _dt(rows[-1]["received_at_utc"])
@@ -63,18 +115,9 @@ def census(db_path: str, *, fresh_s: float = 60.0, grid_s: float = 60.0) -> dict
     families = {}
     for slug, tokens in fam_tokens.items():
         fresh_hits = 0
-        cursors = {t: 0 for t in tokens}
-        last_seen: dict[str, datetime | None] = dict.fromkeys(tokens)
         for k in range(n_grid):
             instant = t0.timestamp() + k * grid_s
-            for t in tokens:
-                seq = by_token.get(t, [])
-                i = cursors[t]
-                while i < len(seq) and seq[i].timestamp() <= instant:
-                    last_seen[t] = seq[i]
-                    i += 1
-                cursors[t] = i
-            if all(ls is not None and instant - ls.timestamp() <= fresh_s for ls in last_seen.values()):
+            if all(validity(t, instant) for t in tokens):
                 fresh_hits += 1
         families[slug] = {
             "tokens": len(tokens),

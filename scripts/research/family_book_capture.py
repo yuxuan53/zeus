@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -36,6 +37,7 @@ UNIVERSE_REFRESH_S = 30 * 60
 DEPTH_MIN_INTERVAL_S = 60.0
 HEALTH_INTERVAL_S = 60.0
 RETENTION_TICK_S = 3600.0
+PING_INTERVAL_S = 10.0  # Polymarket market channel: client must send text frame "PING" every 10 s
 
 log = logging.getLogger("family_book_capture")
 
@@ -90,10 +92,14 @@ def tokens_from_event(event: dict) -> list[dict]:
 
 
 def resolve_universe(cities: list[str], *, days_ahead: int, fetch, today: date | None = None) -> dict[str, dict]:
-    """token_id -> metadata for every active family. ``fetch(slug) -> list[event] | None``."""
+    """token_id -> metadata for every active family. ``fetch(slug) -> list[event] | None``.
+
+    Includes yesterday (offset -1): a still-open older market (e.g. a lowest-temperature
+    bin that resolves after midnight local time) must not drop out of the census denominator.
+    """
     today = today or datetime.now(UTC).date()
     universe: dict[str, dict] = {}
-    for offset in range(days_ahead + 1):
+    for offset in range(-1, days_ahead + 1):
         target = today + timedelta(days=offset)
         for city in cities:
             for prefix in SLUG_PREFIXES:
@@ -136,8 +142,7 @@ def make_gamma_fetch(session, cache_ttl_s: float = 60.0):
 
 # --------------------------------------------------------------------------- frames
 
-def top_of_book(levels: list | None, *, best: str) -> tuple[float | None, float | None]:
-    """(price, size) at the best level; bids take the max price, asks the min."""
+def _parse_levels(levels: list | None) -> list[tuple[float, float]]:
     parsed: list[tuple[float, float]] = []
     for level in levels or []:
         try:
@@ -147,21 +152,71 @@ def top_of_book(levels: list | None, *, best: str) -> tuple[float | None, float 
                 parsed.append((float(level[0]), float(level[1])))
         except (TypeError, ValueError, KeyError, IndexError):
             continue
-    if not parsed:
-        return None, None
-    return max(parsed) if best == "bid" else min(parsed)
+    return parsed
+
+
+class Ladder:
+    """Per-token price->size ladder, one side each. The only book-state authority: best bid/ask
+    and their sizes are always derived from here, never carried from a prior top-of-book row."""
+
+    __slots__ = ("bids", "asks")
+
+    def __init__(self) -> None:
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+
+    def load_book(self, bids: list | None, asks: list | None) -> None:
+        self.bids = {p: s for p, s in _parse_levels(bids) if s > 0}
+        self.asks = {p: s for p, s in _parse_levels(asks) if s > 0}
+
+    def apply_change(self, side: str, price: float, size: float) -> None:
+        book = self.bids if side == "BUY" else self.asks
+        if size <= 0:
+            book.pop(price, None)
+        else:
+            book[price] = size
+
+    def top_bid(self) -> tuple[float | None, float | None]:
+        if not self.bids:
+            return None, None
+        p = max(self.bids)
+        return p, self.bids[p]
+
+    def top_ask(self) -> tuple[float | None, float | None]:
+        if not self.asks:
+            return None, None
+        p = min(self.asks)
+        return p, self.asks[p]
+
+    def snapshot(self) -> dict:
+        return {
+            "bids": [{"price": p, "size": s} for p, s in sorted(self.bids.items(), reverse=True)],
+            "asks": [{"price": p, "size": s} for p, s in sorted(self.asks.items())],
+        }
 
 
 def top_hash(best_bid, best_ask, bid_size, ask_size) -> str:
     return hashlib.sha1(f"{best_bid}|{best_ask}|{bid_size}|{ask_size}".encode()).hexdigest()[:16]
 
 
-def parse_frame(message: dict, *, prior_top: dict[str, dict]) -> list[dict]:
-    """Normalise one websocket message into zero or more top-of-book updates.
+def parse_frame(
+    message: dict,
+    *,
+    ladders: dict[str, Ladder],
+    initialised: dict[str, int],
+    epoch: int,
+    stats: dict[str, int] | None = None,
+) -> list[dict]:
+    """Normalise one websocket message into zero or more top-of-book updates, deriving best
+    bid/ask and their sizes from a per-token ``Ladder`` maintained across the connection's life.
 
-    ``book``: full snapshot (bids/asks). ``price_change``: list of per-asset changes carrying
-    best_bid/best_ask (sizes unknown -> carried from the prior top when the price is unchanged,
-    else None). ``last_trade_price`` and ``tick_size_change`` carry no book state and are skipped.
+    ``book``: full snapshot; (re)initialises the token's ladder and marks it initialised for
+    ``epoch``. ``price_change``: per-asset ``{asset_id, price, size, side, hash, best_bid,
+    best_ask}`` entries (``size`` is the new aggregate size at that price level; ``0`` removes
+    the level) applied to the token's ladder. A ``price_change`` for a token not initialised in
+    the current ``epoch`` (no ``book`` snapshot yet this connection) is dropped and counted in
+    ``stats["dropped_uninitialised"]``. ``last_trade_price`` and ``tick_size_change`` carry no
+    book state and are skipped.
     """
     event_type = str(message.get("event_type") or message.get("type") or "")
     exchange_ts = message.get("timestamp")
@@ -170,8 +225,11 @@ def parse_frame(message: dict, *, prior_top: dict[str, dict]) -> list[dict]:
         asset = str(message.get("asset_id") or "")
         if not asset:
             return out
-        bid, bid_size = top_of_book(message.get("bids"), best="bid")
-        ask, ask_size = top_of_book(message.get("asks"), best="ask")
+        ladder = ladders.setdefault(asset, Ladder())
+        ladder.load_book(message.get("bids"), message.get("asks"))
+        initialised[asset] = epoch
+        bid, bid_size = ladder.top_bid()
+        ask, ask_size = ladder.top_ask()
         out.append(
             {
                 "token_id": asset,
@@ -181,7 +239,8 @@ def parse_frame(message: dict, *, prior_top: dict[str, dict]) -> list[dict]:
                 "bid_size": bid_size,
                 "ask_size": ask_size,
                 "book_hash": str(message.get("hash") or ""),
-                "levels": {"bids": message.get("bids") or [], "asks": message.get("asks") or []},
+                "levels": ladder.snapshot(),
+                "is_snapshot": True,
             }
         )
         return out
@@ -195,19 +254,29 @@ def parse_frame(message: dict, *, prior_top: dict[str, dict]) -> list[dict]:
             asset = str(change.get("asset_id") or message.get("asset_id") or "")
             if not asset:
                 continue
-            prior = prior_top.get(asset) or {}
-            bid = _float(change.get("best_bid"))
-            ask = _float(change.get("best_ask"))
+            if initialised.get(asset) != epoch:
+                if stats is not None:
+                    stats["dropped_uninitialised"] = stats.get("dropped_uninitialised", 0) + 1
+                continue
+            ladder = ladders.setdefault(asset, Ladder())
+            side = str(change.get("side") or "").upper()
+            price = _float(change.get("price"))
+            size = _float(change.get("size"))
+            if side in ("BUY", "SELL") and price is not None and size is not None:
+                ladder.apply_change(side, price, size)
+            bid, bid_size = ladder.top_bid()
+            ask, ask_size = ladder.top_ask()
             out.append(
                 {
                     "token_id": asset,
                     "exchange_ts": change.get("timestamp") or exchange_ts,
                     "best_bid": bid,
                     "best_ask": ask,
-                    "bid_size": prior.get("bid_size") if prior.get("best_bid") == bid else None,
-                    "ask_size": prior.get("ask_size") if prior.get("best_ask") == ask else None,
+                    "bid_size": bid_size,
+                    "ask_size": ask_size,
                     "book_hash": str(change.get("hash") or ""),
                     "levels": None,
+                    "is_snapshot": False,
                 }
             )
     return out
@@ -222,21 +291,26 @@ def _float(value) -> float | None:
 
 # --------------------------------------------------------------------------- sink
 
+SCHEMA_VERSION = 2  # v2: connection_epoch on book_top/book_depth; dropped_uninitialised, db_bytes on feed_health
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS book_top (
     token_id TEXT NOT NULL, condition_id TEXT, event_slug TEXT, outcome_label TEXT,
     received_at_utc TEXT NOT NULL, received_monotonic REAL NOT NULL, exchange_ts TEXT,
-    best_bid REAL, best_ask REAL, bid_size REAL, ask_size REAL, hash TEXT NOT NULL
+    best_bid REAL, best_ask REAL, bid_size REAL, ask_size REAL, hash TEXT NOT NULL,
+    connection_epoch INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_book_top_token_time ON book_top(token_id, received_at_utc);
 CREATE INDEX IF NOT EXISTS idx_book_top_time ON book_top(received_at_utc);
 CREATE TABLE IF NOT EXISTS book_depth (
-    token_id TEXT NOT NULL, received_at_utc TEXT NOT NULL, exchange_ts TEXT, levels_json TEXT NOT NULL
+    token_id TEXT NOT NULL, received_at_utc TEXT NOT NULL, exchange_ts TEXT, levels_json TEXT NOT NULL,
+    connection_epoch INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_book_depth_token_time ON book_depth(token_id, received_at_utc);
 CREATE TABLE IF NOT EXISTS feed_health (
     received_at_utc TEXT NOT NULL, connected INTEGER NOT NULL, subscribed_tokens INTEGER NOT NULL,
-    msgs_per_min REAL NOT NULL, reconnects INTEGER NOT NULL
+    msgs_per_min REAL NOT NULL, reconnects INTEGER NOT NULL,
+    dropped_uninitialised INTEGER NOT NULL DEFAULT 0, db_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS token_meta (
     token_id TEXT PRIMARY KEY, condition_id TEXT, event_slug TEXT, market_slug TEXT, outcome_label TEXT,
@@ -247,15 +321,17 @@ CREATE TABLE IF NOT EXISTS token_meta (
 
 
 class Sink:
-    """Single-writer SQLite sink: change-deduped top-of-book, rate-limited depth, retention."""
+    """Single-writer SQLite sink: change-deduped top-of-book, ladder-checkpointed depth, retention."""
 
     def __init__(self, path: Path, *, retain_days: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path), isolation_level=None)
+        self.path = path
+        self.conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA journal_size_limit=67108864")
         self.conn.executescript(SCHEMA)
+        self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.retain_days = retain_days
         self.last_top: dict[str, dict] = {}
         self.last_depth_at: dict[str, float] = {}
@@ -277,8 +353,8 @@ class Sink:
             )
         self.conn.execute("COMMIT")
 
-    def write_update(self, update: dict, meta: dict | None, *, now_iso: str, now_mono: float) -> bool:
-        """Persist one normalised update; returns True when the top-of-book changed."""
+    def write_top(self, update: dict, meta: dict | None, *, now_iso: str, now_mono: float, epoch: int) -> bool:
+        """Persist one normalised update; returns True when the top-of-book (price or size) changed."""
         token = update["token_id"]
         h = top_hash(update["best_bid"], update["best_ask"], update["bid_size"], update["ask_size"])
         prior = self.last_top.get(token)
@@ -286,12 +362,12 @@ class Sink:
         if changed:
             self.conn.execute(
                 """INSERT INTO book_top(token_id, condition_id, event_slug, outcome_label, received_at_utc,
-                   received_monotonic, exchange_ts, best_bid, best_ask, bid_size, ask_size, hash)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   received_monotonic, exchange_ts, best_bid, best_ask, bid_size, ask_size, hash, connection_epoch)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     token, (meta or {}).get("condition_id"), (meta or {}).get("event_slug"),
                     (meta or {}).get("outcome_label"), now_iso, now_mono, _ts_iso(update.get("exchange_ts")),
-                    update["best_bid"], update["best_ask"], update["bid_size"], update["ask_size"], h,
+                    update["best_bid"], update["best_ask"], update["bid_size"], update["ask_size"], h, epoch,
                 ),
             )
             self.rows_written += 1
@@ -299,21 +375,45 @@ class Sink:
                 "hash": h, "best_bid": update["best_bid"], "best_ask": update["best_ask"],
                 "bid_size": update["bid_size"], "ask_size": update["ask_size"],
             }
-        levels = update.get("levels")
-        if levels is not None and changed and now_mono - self.last_depth_at.get(token, -1e9) >= DEPTH_MIN_INTERVAL_S:
-            self.conn.execute(
-                "INSERT INTO book_depth(token_id, received_at_utc, exchange_ts, levels_json) VALUES(?,?,?,?)",
-                (token, now_iso, _ts_iso(update.get("exchange_ts")), json.dumps(levels, separators=(",", ":"))),
-            )
-            self.last_depth_at[token] = now_mono
-            self.rows_written += 1
         return changed
 
-    def write_health(self, *, now_iso: str, connected: bool, subscribed: int, msgs_per_min: float, reconnects: int) -> None:
+    def write_depth(self, token: str, levels: dict, *, now_iso: str, exchange_ts, epoch: int) -> None:
+        """Unconditional depth checkpoint from the maintained ladder (never rate-limited here;
+        callers gate cadence via ``maybe_checkpoint_depth`` or write immediately on a ``book`` snapshot)."""
         self.conn.execute(
-            "INSERT INTO feed_health(received_at_utc, connected, subscribed_tokens, msgs_per_min, reconnects) VALUES(?,?,?,?,?)",
-            (now_iso, int(connected), subscribed, msgs_per_min, reconnects),
+            "INSERT INTO book_depth(token_id, received_at_utc, exchange_ts, levels_json, connection_epoch) VALUES(?,?,?,?,?)",
+            (token, now_iso, _ts_iso(exchange_ts), json.dumps(levels, separators=(",", ":")), epoch),
         )
+        self.rows_written += 1
+
+    def maybe_checkpoint_depth(self, ladders: dict[str, "Ladder"], *, now_iso: str, now_mono: float, epoch: int) -> int:
+        """Write a book_depth row for every token whose ladder hasn't been checkpointed in
+        DEPTH_MIN_INTERVAL_S, independent of whether its top-of-book changed. Returns rows written."""
+        written = 0
+        for token, ladder in ladders.items():
+            if now_mono - self.last_depth_at.get(token, -1e9) >= DEPTH_MIN_INTERVAL_S:
+                self.write_depth(token, ladder.snapshot(), now_iso=now_iso, exchange_ts=None, epoch=epoch)
+                self.last_depth_at[token] = now_mono
+                written += 1
+        return written
+
+    def write_health(
+        self, *, now_iso: str, connected: bool, subscribed: int, msgs_per_min: float, reconnects: int,
+        dropped_uninitialised: int = 0, db_bytes: int = 0,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO feed_health(received_at_utc, connected, subscribed_tokens, msgs_per_min, reconnects,
+               dropped_uninitialised, db_bytes) VALUES(?,?,?,?,?,?,?)""",
+            (now_iso, int(connected), subscribed, msgs_per_min, reconnects, dropped_uninitialised, db_bytes),
+        )
+
+    def db_bytes(self) -> int:
+        """Measured size of the DB file + its WAL sidecar (replaces the rows*180 byte estimate)."""
+        total = self.path.stat().st_size if self.path.exists() else 0
+        wal = self.path.with_name(self.path.name + "-wal")
+        if wal.exists():
+            total += wal.stat().st_size
+        return total
 
     def apply_retention(self, now: datetime) -> int:
         cutoff = (now - timedelta(days=self.retain_days)).isoformat()
@@ -349,6 +449,10 @@ async def run(args: argparse.Namespace) -> None:
     fetch = make_gamma_fetch(session)
     cities = city_slugs(REPO / "config" / "cities.json", set(args.cities) if args.cities else None)
     universe: dict[str, dict] = {}
+    ladders: dict[str, Ladder] = {}
+    initialised: dict[str, int] = {}
+    stats: dict[str, int] = {"dropped_uninitialised": 0}
+    epoch = 0
     reconnects = 0
     msgs_window: list[float] = []
     stop_at = time.monotonic() + args.duration_s if args.duration_s else None
@@ -360,7 +464,7 @@ async def run(args: argparse.Namespace) -> None:
     t_start = time.monotonic()
 
     while stop_at is None or time.monotonic() < stop_at:
-        if time.monotonic() - last_universe >= UNIVERSE_REFRESH_S:
+        if not universe or time.monotonic() - last_universe >= UNIVERSE_REFRESH_S:
             new_universe = await asyncio.to_thread(resolve_universe, cities, days_ahead=args.days_ahead, fetch=fetch)
             if new_universe:
                 universe = new_universe
@@ -378,17 +482,16 @@ async def run(args: argparse.Namespace) -> None:
                 WS_ENDPOINT, ping_interval=30, ping_timeout=90, max_size=16 * 1024 * 1024,
                 additional_headers={"User-Agent": USER_AGENT},
             ) as ws:
+                epoch += 1
                 for i in range(0, len(subscribed), SUBSCRIBE_BATCH):
                     await ws.send(json.dumps({"assets_ids": subscribed[i:i + SUBSCRIBE_BATCH], "type": "market"}))
-                log.info("connected; subscribed %d tokens in %d message(s)", len(subscribed), (len(subscribed) + SUBSCRIBE_BATCH - 1) // SUBSCRIBE_BATCH)
-                next_universe_at = last_universe + UNIVERSE_REFRESH_S
+                log.info("connected (epoch %d); subscribed %d tokens in %d message(s)", epoch, len(subscribed), (len(subscribed) + SUBSCRIBE_BATCH - 1) // SUBSCRIBE_BATCH)
                 connected_at_mono = time.monotonic()
                 last_health = connected_at_mono
+                last_ping = connected_at_mono
                 steady_t0, steady_rows_at = None, None
                 quiet_ticks = 0
                 while stop_at is None or time.monotonic() < stop_at:
-                    if time.monotonic() >= next_universe_at:
-                        break  # reconnect with the refreshed universe
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
@@ -411,24 +514,57 @@ async def run(args: argparse.Namespace) -> None:
                         for item in items:
                             if not isinstance(item, dict):
                                 continue
-                            for update in parse_frame(item, prior_top=sink.last_top):
-                                sink.write_update(update, universe.get(update["token_id"]), now_iso=now_iso, now_mono=now_mono)
+                            for update in parse_frame(item, ladders=ladders, initialised=initialised, epoch=epoch, stats=stats):
+                                token = update["token_id"]
+                                sink.write_top(update, universe.get(token), now_iso=now_iso, now_mono=now_mono, epoch=epoch)
+                                if update.get("is_snapshot"):
+                                    # immediate depth checkpoint on every book snapshot; non-snapshot
+                                    # (price_change) updates are picked up by the 60 s ladder checkpoint below
+                                    sink.write_depth(token, update["levels"], now_iso=now_iso, exchange_ts=update.get("exchange_ts"), epoch=epoch)
+                                    sink.last_depth_at[token] = now_mono
                         sink.conn.execute("COMMIT")
+                    if now_mono - last_ping >= PING_INTERVAL_S:
+                        await ws.send("PING")
+                        last_ping = now_mono
+                    sink.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=now_mono, epoch=epoch)
                     if steady_t0 is None and now_mono - connected_at_mono >= 60.0:
                         steady_t0, steady_rows_at = now_mono, sink.rows_written  # after the subscribe snapshot burst
                     if now_mono - last_health >= HEALTH_INTERVAL_S:
                         msgs_window = [t for t in msgs_window if now_mono - t <= 60.0]
-                        sink.write_health(now_iso=now_iso, connected=True, subscribed=len(subscribed), msgs_per_min=float(len(msgs_window)), reconnects=reconnects)
-                        rows_per_day = _rows_per_day(sink.rows_written, steady_rows_at, steady_t0, now_mono)
-                        log.info("health: msgs/min=%d rows=%d steady_rows/day=%s est_bytes/day≈%s MB", len(msgs_window), sink.rows_written, "n/a" if rows_per_day is None else f"{rows_per_day:.0f}", "n/a" if rows_per_day is None else f"{rows_per_day * 180 / 1e6:.1f}")
+                        db_bytes = sink.db_bytes()
+                        sink.write_health(
+                            now_iso=now_iso, connected=True, subscribed=len(subscribed), msgs_per_min=float(len(msgs_window)),
+                            reconnects=reconnects, dropped_uninitialised=stats["dropped_uninitialised"], db_bytes=db_bytes,
+                        )
+                        log.info(
+                            "health: msgs/min=%d rows=%d db_bytes=%d dropped_uninitialised=%d",
+                            len(msgs_window), sink.rows_written, db_bytes, stats["dropped_uninitialised"],
+                        )
                         last_health = now_mono
                     if now_mono - last_retention >= RETENTION_TICK_S:
-                        deleted = sink.apply_retention(datetime.now(UTC))
+                        deleted = await asyncio.to_thread(sink.apply_retention, datetime.now(UTC))
                         log.info("retention: deleted %d rows older than %d d", deleted, args.retain_days)
                         last_retention = now_mono
+                    if now_mono - last_universe >= UNIVERSE_REFRESH_S:
+                        new_universe = await asyncio.to_thread(resolve_universe, cities, days_ahead=args.days_ahead, fetch=fetch)
+                        if new_universe:
+                            added = sorted(set(new_universe) - set(universe))
+                            removed = sorted(set(universe) - set(new_universe))
+                            for i in range(0, len(added), SUBSCRIBE_BATCH):
+                                await ws.send(json.dumps({"assets_ids": added[i:i + SUBSCRIBE_BATCH], "operation": "subscribe"}))
+                            for i in range(0, len(removed), SUBSCRIBE_BATCH):
+                                await ws.send(json.dumps({"assets_ids": removed[i:i + SUBSCRIBE_BATCH], "operation": "unsubscribe"}))
+                            universe = new_universe
+                            subscribed = sorted(universe)
+                            sink.upsert_meta(universe, now_iso)
+                            log.info("universe refresh: +%d -%d tokens (total %d)", len(added), len(removed), len(universe))
+                        last_universe = now_mono
         except (OSError, websockets.exceptions.WebSocketException, asyncio.IncompleteReadError) as exc:
             reconnects += 1
-            sink.write_health(now_iso=datetime.now(UTC).isoformat(), connected=False, subscribed=len(subscribed), msgs_per_min=0.0, reconnects=reconnects)
+            sink.write_health(
+                now_iso=datetime.now(UTC).isoformat(), connected=False, subscribed=len(subscribed), msgs_per_min=0.0,
+                reconnects=reconnects, dropped_uninitialised=stats["dropped_uninitialised"], db_bytes=sink.db_bytes(),
+            )
             delay = min(60.0, 2.0 * reconnects)
             log.warning("websocket dropped (%s); reconnect #%d in %.0f s", exc, reconnects, delay)
             await asyncio.sleep(delay)
@@ -439,9 +575,11 @@ async def run(args: argparse.Namespace) -> None:
         "rows_written": sink.rows_written,
         "msgs_per_min_last_window": len([t for t in msgs_window if time.monotonic() - t <= 60.0]),
         "steady_rows_per_day": None if rows_per_day is None else round(rows_per_day),
-        "steady_db_bytes_per_day": None if rows_per_day is None else round(rows_per_day * 180),
+        "db_bytes": sink.db_bytes(),
+        "dropped_uninitialised": stats["dropped_uninitialised"],
         "elapsed_s": round(time.monotonic() - t_start),
         "reconnects": reconnects,
+        "connection_epoch": epoch,
     }))
 
 
