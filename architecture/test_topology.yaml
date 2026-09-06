@@ -63,6 +63,7 @@ test_trust_policy:
     tests/engine/test_shift_bin_reactor_integration.py: {created: "2026-06-22", last_used: "2026-07-23", note: "Shift-bin close-before-open integration, including final pending-family reread before venue I/O and lease abort without an orphan ENTRY_SUBMITTED intent."}
     tests/engine/test_pre_venue_rejection_terminal.py: {created: "2026-06-01", last_used: "2026-09-01", note: "Executor-to-EDLI venue-boundary antibodies: explicit call and ACK facts outrank generic rejection status; local rejects release cap without attempt evidence, real venue rejects preserve their exact boundary tuple, and unknown post-call outcomes remain reconcile-required."}
     tests/engine/test_day0_extreme_book_capture.py: {created: "2026-08-25", last_used: "2026-08-25", note: "Crossing-instrumentation increment: DAY0_EXTREME_UPDATED fires a rate-bounded (60s/family), fail-soft, backgrounded book capture stamped DAY0_EXTREME_EVENT; source-level pin proves unconditional wiring into _submit_inner before any block/veto branch."}
+    tests/engine/test_day0_ask_repricing_wiring.py: {created: "2026-09-05", last_used: "2026-09-05", note: "Day0 held-ask repricing stamp: the HELD token's book is the one counted (NO for buy_no, never the YES leg), distinct PRICE LEVELS rather than rows, the window is [T-10min, T) so the sealed decision book at T is excluded, 'ABSENT' quotes are not price levels, and every fault (no token, no capture time, no rows, broken read) leaves the payload unstamped so the admission gate stays inert."}
     tests/engine/test_tier0_admission_wiring.py: {created: "2026-08-24", last_used: "2026-08-27", note: "Tier-0 fixed-proposal wiring: price/mode/cluster admission plus selection-time venue-minimum sizing and aggregate-open-loss headroom without changing the governed runtime Kelly multiplier; flag-off preserves allocator capacity."}
     tests/test_tier0_candidate_set_settlement.py: {created: "2026-08-27", last_used: "2026-08-27", note: "Tier-0 prospective selection evidence: only exact VERIFIED canonical settlements grade candidate sides through finite/open bin bounds; idempotent refold handles corrections and the post-trade daemon drains every five minutes."}
     tests/test_settlement_skill_attribution.py: {created: "2026-05-04", last_used: "2026-07-23", note: "Settlement skill attribution requires an exact decision-certificate lineage and refuses ambiguous ENTRY hashes or legacy fallback scoring."}
@@ -376,7 +377,7 @@ test_trust_policy:
     tests/test_center_buy_repair.py: {created: "2026-04-29", last_used: "2026-04-29"}
     tests/test_cross_module_invariants.py: {created: "2026-03-30", last_used: "2026-04-23"}
     tests/test_day0_exit_gate.py: {created: "2026-04-07", last_used: "2026-07-19"}
-    tests/test_day0_admission.py: {created: "2026-06-17", last_used: "2026-07-19", note: "Day0 live admission contracts, including strict quote-after-observation ordering, current source-health classification, final-localday no-entry geometry, one-bin stress, and maker-only routing."}
+    tests/test_day0_admission.py: {created: "2026-06-17", last_used: "2026-09-05", note: "Day0 live admission contracts, including strict quote-after-observation ordering, current source-health classification, final-localday no-entry geometry, one-bin stress, maker-only routing, the diurnal-residual nowcast veto, and the held-ask repricing veto (>= 2 distinct asks in the prior 10 min) with its gate ordering, inert-without-a-count default, and day0-only scope."}
     tests/test_day0_extreme_updated_materialization_bridge.py: {created: "2026-07-19", last_used: "2026-09-01", note: "Non-blocking coalesced Day0 posterior rematerialization bridge and bounded poll catch-up: a new observation reconditions the latest same-metric ENS-complete carrier even when deterministic manifests are one cycle ahead; current-money materialization remains second-scale while background cache drain follows the configured minute interval; scoped manifests, queue ownership, conditioning-identity liveness, typed zero-observation evidence, and burst coverage remain protected."}
     tests/test_day0_fast_obs_lane.py: {created: "2026-06-10", last_used: "2026-08-21", note: "Fast METAR publication persistence, duplicate-rendering canonicalization, Day0 hourly-vector cross-segment fairness, and measured same-station eligibility. Held capital keeps most critical-quota capacity while every active microbatch reserves independent discovery progress; a unit cursor over the longest segment prevents one failed provider or shorter held prefix from starving later cities. Beijing, Guangzhou, Wellington, Ankara, and Karachi/OPKC use bounded seven-day empirical zero-margin WU/METAR evidence instead of remaining excluded until the slower WU update."}
     tests/test_day0_obs_fastlane_optionbc.py: {created: "2026-06-12", last_used: "2026-07-24", note: "Day0 METAR/HKO source-clock scheduling, conditional HKO validator commit coupling, isolated executor lanes, bounded commit retry, commit-before-wake ordering, and exact-station monotone WU-context strengthening."}
@@ -872,6 +873,7 @@ categories:
     - tests/test_sigma_tau_calibration_serving_equivalence.py
     - tests/test_sigma_tau_calibration_lookup.py
     - tests/test_day0_admission.py
+    - tests/engine/test_day0_ask_repricing_wiring.py
     - tests/test_day0_extreme_updated_materialization_bridge.py
     - tests/test_day0_fast_obs_lane.py
     - tests/test_day0_obs_fastlane_optionbc.py
@@ -1825,7 +1827,21 @@ test_metadata:
       - docs/authority/zeus_current_architecture.md
     notes: >
       Protects current Day0 entry admission ordering, source health, local-day
-      runway, one-bin stress, and maker-only execution semantics.
+      runway, one-bin stress, and maker-only execution semantics, plus the two
+      evidence-fitted vetoes: the diurnal-residual nowcast (gate 9) and the
+      held-ask repricing cut (gate 10). Both must stay inert when their input is
+      absent and must never mask an earlier structural refusal.
+  tests/engine/test_day0_ask_repricing_wiring.py:
+    modules: [engine, state]
+    category: relationship_protection
+    blocks_commit: true
+    law_dependencies:
+      - docs/authority/zeus_current_architecture.md
+    notes: >
+      Proves the gate-10 stamp measures the book it claims to: the HELD token
+      (NO for buy_no), distinct price levels in [T-10min, T) with the sealed
+      decision book at T excluded, 'ABSENT' quotes skipped, and a fail-open
+      contract on every DB fault so a broken read can never block a submit.
   tests/test_day0_extreme_updated_materialization_bridge.py:
     modules: [data, events]
     category: core_law_antibody
