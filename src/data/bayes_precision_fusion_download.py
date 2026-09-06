@@ -360,6 +360,33 @@ SINGLE_RUNS_UNSERVABLE_MODELS: tuple[str, ...] = ("kma_gdps", "kma_ldps")
 # single-model kma_gdps calls in one day. A leg the provider cannot serve is not fetched.
 PREVIOUS_RUNS_UNSERVABLE_MODELS: tuple[str, ...] = ("kma_gdps", "kma_ldps")
 
+# 2026-09-06 (probed, quota root-cause round 5): previous-runs-api serves
+# temperature_2m_previous_dayN for a short-range model only up to that model's own forecast
+# horizon; past it the provider answers HTTP 200 with an all-null series (icon_d2, arome, dmi,
+# knmi, met_nordic, gfs_hrrr, gem_hrdps, ukmo_uk and nam at previous_day2; jma_msm and icon_2i
+# at previous_day3 — every one null for 2026-09-08 targets, every one served one lead lower).
+# Nothing persists from a null series, so the R4a immutable skip never matched and the same
+# batched request re-fired on every 60 s maintenance pass (13 keys, 155 attempts in 6 h).
+# A lead the provider cannot serve is not requested. Models absent here are unbounded.
+PREVIOUS_RUNS_MAX_LEAD_DAYS: dict[str, int] = {
+    "icon_d2": 1,
+    "meteofrance_arome_france_hd": 1,
+    "dmi_harmonie_europe": 1,
+    "knmi_harmonie_netherlands": 1,
+    "met_nordic": 1,
+    "gfs_hrrr": 1,
+    "gem_hrdps_continental": 1,
+    "ukmo_uk_deterministic_2km": 1,
+    "nam_conus": 1,
+    "jma_msm": 2,
+    "italiameteo_icon_2i": 2,
+}
+
+
+def _previous_runs_lead_servable(model: str, lead_days: int) -> bool:
+    cap = PREVIOUS_RUNS_MAX_LEAD_DAYS.get(model)
+    return cap is None or int(lead_days) <= cap
+
 # R3 — Per-model run cadence: the UTC init hours each provider actually publishes. Fetching a model
 # at a non-publishing cycle re-pulls the SAME underlying run under a wrong source_cycle_time.
 # Models not listed here default to all four {0,6,12,18}. NOTE (2026-06-17): jma_seamless and
@@ -2637,6 +2664,9 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                     elif model in PREVIOUS_RUNS_UNSERVABLE_MODELS:
                         dropped.append(f"{model}:previous_runs_unservable")
                         pv = None
+                    elif not _previous_runs_lead_servable(model, int(t.lead_days)):
+                        dropped.append(f"{model}:previous_runs_beyond_horizon")
+                        pv = None
                     elif (model, t.city, t.target_date, t.metric, "previous_runs") in persisted_keys:
                         pv = None
                     else:
@@ -2868,9 +2898,16 @@ def download_bayes_precision_fusion_extra_raw_inputs(
                 if model in PREVIOUS_RUNS_UNSERVABLE_MODELS:
                     dropped.append(f"{model}:previous_runs_unservable")
                     continue
-                # R4a: check both metrics already in immutable history AT THIS LEAD.
+                if not _previous_runs_lead_servable(model, int(ref.lead_days)):
+                    dropped.append(f"{model}:previous_runs_beyond_horizon")
+                    continue
+                # R4a: need is measured against the metrics THIS pass carries, at this lead.
+                # The write loop below only persists the pass's own targets, so a metric the
+                # pass does not carry (a city with only a HIGH market) can never be satisfied
+                # by it — checking a fixed ("high", "low") pair kept the scope permanently
+                # "needed" and re-issued the same request on every pass (2026-09-06).
                 metrics_needed = [
-                    met for met in ("high", "low")
+                    met for met in required_metrics
                     if (model, city, target_date, met, int(ref.lead_days)) not in prev_runs_done
                 ]
                 if metrics_needed:

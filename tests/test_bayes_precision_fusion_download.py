@@ -2578,3 +2578,148 @@ def test_single_runs_payload_cache_persists_across_process_restart(
 
     assert len(calls) == 1, "a restarted/second process must serve from the durable cache"
     assert second[0]["hourly"]["temperature_2m"] == _two_day_single_runs_payload()["hourly"]["temperature_2m"]
+
+
+# =====================================================================================
+# QUOTA round 5 (2026-09-06): previous_runs beyond a short-range model's horizon is
+# HTTP 200 + all-null, so nothing persists and the immutable skip re-fires forever.
+# =====================================================================================
+def _lead2_targets(metrics=("high", "low")):
+    from src.data.bayes_precision_fusion_download import BayesPrecisionFusionDownloadTarget
+    return [
+        BayesPrecisionFusionDownloadTarget(
+            city="Munich", metric=met, target_date="2026-09-08", lead_days=2,
+            latitude=48.354, longitude=11.788, timezone_name="Europe/Berlin",
+        )
+        for met in metrics
+    ]
+
+
+def test_previous_runs_beyond_model_horizon_is_not_requested_batched(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    seen_models: list[list[str]] = []
+
+    def _previous_batch(**kwargs):
+        seen_models.append(list(kwargs["models"]))
+        return {"ecmwf_ifs": (30.0, 20.0)}
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(dl, "_default_previous_runs_fetch_batched", _previous_batch)
+    monkeypatch.setattr(dl, "_default_live_fetch_batched", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 9, 6, 0, tzinfo=UTC),
+        targets=_lead2_targets(),
+        models=("icon_d2", "ecmwf_ifs"),
+        include_previous_runs=True,
+        prune_after=False,
+    )
+
+    assert seen_models == [["ecmwf_ifs"]]
+    assert "icon_d2:previous_runs_beyond_horizon" in report["dropped"]
+    assert _count(db, model="icon_d2", endpoint="previous_runs") == 0
+    assert _count(db, model="ecmwf_ifs", endpoint="previous_runs") == 2
+
+
+def test_previous_runs_leg_is_not_requested_for_a_beyond_horizon_only_basket(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        dl,
+        "_default_previous_runs_fetch_batched",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("previous_runs must not be requested beyond the model horizon")
+        ),
+    )
+    monkeypatch.setattr(dl, "_default_live_fetch_batched", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 9, 6, 0, tzinfo=UTC),
+        targets=_lead2_targets(),
+        models=("icon_d2", "gfs_hrrr"),
+        include_previous_runs=True,
+        prune_after=False,
+    )
+
+    assert report["written_row_count"] == 0
+    assert "icon_d2:previous_runs_beyond_horizon" in report["dropped"]
+    assert "gfs_hrrr:previous_runs_beyond_horizon" in report["dropped"]
+
+
+def test_previous_runs_need_is_measured_on_the_metrics_the_pass_carries(
+    tmp_path, monkeypatch
+) -> None:
+    """A city with only a HIGH market never carries a LOW target, so a fixed (high, low)
+    need-check could never be satisfied and re-issued the same request on every pass."""
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    calls: list[list[str]] = []
+
+    def _previous_batch(**kwargs):
+        calls.append(list(kwargs["models"]))
+        return {"ecmwf_ifs": (30.0, 20.0)}
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+    monkeypatch.setattr(dl, "_default_previous_runs_fetch_batched", _previous_batch)
+    monkeypatch.setattr(dl, "_default_live_fetch_batched", lambda **_kwargs: {})
+
+    kwargs = dict(
+        forecast_db=db,
+        cycle=datetime(2026, 9, 6, 0, tzinfo=UTC),
+        targets=_lead2_targets(metrics=("high",)),
+        models=("ecmwf_ifs",),
+        include_previous_runs=True,
+        prune_after=False,
+    )
+    dl.download_bayes_precision_fusion_extra_raw_inputs(**kwargs)
+    assert calls == [["ecmwf_ifs"]]
+    assert _count(db, model="ecmwf_ifs", endpoint="previous_runs", metric="high") == 1
+    assert _count(db, model="ecmwf_ifs", endpoint="previous_runs", metric="low") == 0
+
+    dl.download_bayes_precision_fusion_extra_raw_inputs(**kwargs)
+    assert calls == [["ecmwf_ifs"]], "second pass re-issued a satisfied previous_runs request"
+
+
+def test_previous_runs_beyond_model_horizon_is_not_requested_legacy(
+    tmp_path, monkeypatch
+) -> None:
+    import src.data.bayes_precision_fusion_download as dl
+
+    db = _forecast_db(tmp_path)
+    seen_models: list[str] = []
+
+    def _previous(*, model, **_kwargs):
+        seen_models.append(model)
+        return 19.5
+
+    monkeypatch.setattr(dl, "_model_in_domain", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dl, "_read_source_clock_single_runs_requests", lambda **_kwargs: {})
+
+    report = dl.download_bayes_precision_fusion_extra_raw_inputs(
+        forecast_db=db,
+        cycle=datetime(2026, 9, 6, 0, tzinfo=UTC),
+        targets=_lead2_targets(metrics=("high",)),
+        models=("icon_d2", "ecmwf_ifs"),
+        include_previous_runs=True,
+        prune_after=False,
+        single_runs_fetch=lambda **_kwargs: 20.0,
+        previous_runs_fetch=_previous,
+    )
+
+    assert seen_models == ["ecmwf_ifs"]
+    assert "icon_d2:previous_runs_beyond_horizon" in report["dropped"]
+    assert _count(db, model="icon_d2", endpoint="previous_runs") == 0
