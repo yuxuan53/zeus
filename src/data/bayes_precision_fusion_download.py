@@ -753,7 +753,13 @@ def _exact_run_memo_run_utc(run_iso: str) -> datetime | None:
 _SINGLE_RUNS_PAYLOAD_CACHE: dict[str, dict[str, object]] = {}
 _SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION = 1
 _SINGLE_RUNS_PAYLOAD_CACHE_LOAD_INTERVAL_SECONDS = 30.0
-_SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES = 1000
+# A run payload stops being useful once its run is superseded (a new cycle publishes
+# within hours), so the durable cache is bounded both by count and by age: every store
+# rewrites the WHOLE json file under flock (measured ~3.6KB for a 2-day hourly payload,
+# so 1000 entries would be a multi-MB rewrite on every fetch from two contending
+# daemons) -- keep the file small so that rewrite stays cheap.
+_SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES = 400
+_SINGLE_RUNS_PAYLOAD_CACHE_MAX_AGE_HOURS = 24.0
 _single_runs_payload_cache_state_path: Path | None = None
 _single_runs_payload_cache_last_loaded_monotonic: float = 0.0
 
@@ -831,6 +837,19 @@ def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
         _SINGLE_RUNS_PAYLOAD_CACHE.setdefault(str(key), raw_payload)
 
 
+def _payload_cache_entry_expired(entry: Mapping[str, object], age_floor: datetime) -> bool:
+    recorded_at = entry.get("recorded_at")
+    if not isinstance(recorded_at, str):
+        return True
+    try:
+        recorded = datetime.fromisoformat(recorded_at)
+    except ValueError:
+        return True
+    if recorded.tzinfo is None:
+        recorded = recorded.replace(tzinfo=UTC)
+    return recorded < age_floor
+
+
 def _store_single_runs_payload_cache(key: str, payload: Mapping[str, object]) -> None:
     """Cache one fetched payload in-process and, when enabled, durably."""
     stored = copy.deepcopy(dict(payload))
@@ -862,8 +881,18 @@ def _store_single_runs_payload_cache(key: str, payload: Mapping[str, object]) ->
                 if not isinstance(entries, dict):
                     entries = {}
                     on_disk["entries"] = entries
-                recorded_at = datetime.now(UTC).isoformat()
+                now_dt = datetime.now(UTC)
+                recorded_at = now_dt.isoformat()
                 entries[key] = {"payload": stored, "recorded_at": recorded_at}
+                # Age-based eviction first: a run payload older than the max age is
+                # long superseded and cannot serve a legitimate cache hit any more.
+                age_floor = now_dt - timedelta(hours=_SINGLE_RUNS_PAYLOAD_CACHE_MAX_AGE_HOURS)
+                for stale_key in [
+                    k
+                    for k, v in entries.items()
+                    if isinstance(v, dict) and _payload_cache_entry_expired(v, age_floor)
+                ]:
+                    entries.pop(stale_key, None)
                 if len(entries) > _SINGLE_RUNS_PAYLOAD_CACHE_MAX_ENTRIES:
                     ordered = sorted(
                         entries.items(),
