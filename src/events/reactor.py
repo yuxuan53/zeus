@@ -6000,7 +6000,16 @@ def _edli_day0_hourly_refresh_due_families(
                     continue
                 city_date = (city_name, target_date)
                 prior_window_start = window_starts.get(city_date)
-                if prior_window_start is None or observation_time < prior_window_start:
+                # The fetch gate's window is the NEWEST metric boundary. Each consumer
+                # proves its own metric's window on read (materializer:
+                # current_state.observed_at, live_health: the event's observation_time),
+                # so a bundle that covers only the newer boundary still serves that
+                # metric. Folding to the OLDEST boundary (2026-08-03 .. 2026-09-06) made
+                # the whole pass fail REMAINING_WINDOW_INCOMPLETE as soon as one metric's
+                # boundary aged past the request's past_hours -- both carriers discarded,
+                # the coverable metric dark, and the identical fetch re-issued every
+                # pass: 340 of 1,165 city-hours on 2026-09-05.
+                if prior_window_start is None or observation_time > prior_window_start:
                     window_starts[city_date] = observation_time
                 vectors = read_freshest_day0_hourly_vectors(
                     city=city_name,

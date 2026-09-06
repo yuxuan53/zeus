@@ -517,3 +517,56 @@ def test_complete_ensemble_bundle_persists_when_deterministic_bundle_is_unavaila
     assert ensemble_calls["n"] == 1, (
         "the next pass for the same run must reuse the persisted bundle, not re-fetch"
     )
+
+
+def test_priority_probe_window_start_is_the_newest_metric_boundary(monkeypatch) -> None:
+    """QUOTA (round 7, 2026-09-06): the probe folded the per-city window start to the
+    OLDEST metric boundary. Once one metric's boundary aged past the request's
+    past_hours (Los Angeles LOW frozen at 16:53 local while HIGH advanced hourly), no
+    fetch could cover it, the pass failed REMAINING_WINDOW_INCOMPLETE, both carriers
+    were discarded and re-fetched every pass, and the coverable metric went dark. The
+    gate's window is the newest boundary; consumers prove their own on read."""
+    import sqlite3
+    import src.config as config_module
+    import src.data.replacement_forecast_current_target_plan as target_plan
+    import src.events.reactor as reactor
+    import src.state.db as db_module
+
+    city = SimpleNamespace(
+        name="Los Angeles", timezone="America/Los_Angeles", lat=33.94, lon=-118.41
+    )
+    now = datetime(2026, 9, 6, 6, 25, 0, tzinfo=UTC)
+    target_date = now.astimezone(ZoneInfo(city.timezone)).date().isoformat()
+    newest = now - timedelta(minutes=32)
+    oldest = now - timedelta(hours=6, minutes=32)
+
+    class _Conn:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_module, "runtime_cities_by_name", lambda: {city.name: city})
+    monkeypatch.setattr(db_module, "get_world_connection_read_only", lambda: _Conn())
+    monkeypatch.setattr(db_module, "get_forecasts_connection_read_only", lambda: _Conn())
+    monkeypatch.setattr(
+        target_plan,
+        "_latest_authorized_day0_fact",
+        lambda *_args, temperature_metric, **_kwargs: {
+            "observation_time": (
+                newest if temperature_metric == "high" else oldest
+            ).isoformat()
+        },
+    )
+    monkeypatch.setattr(day0, "day0_hourly_models_for_city", lambda _city: ["ncep_nbm_conus"])
+    monkeypatch.setattr(day0, "read_freshest_day0_hourly_vectors", lambda **_kwargs: [])
+
+    probe = reactor._edli_day0_hourly_refresh_due_families(cities=[city], decision_time=now)
+
+    assert probe.proved is True
+    assert dict(
+        ((c, td), ws) for c, td, ws in probe.window_starts
+    ) == {(city.name, target_date): newest}, (
+        "the fetch gate's window start must be the newest metric boundary, not the oldest"
+    )
+    assert probe.refresh_due_families == frozenset(
+        {(city.name, target_date, "high"), (city.name, target_date, "low")}
+    )
