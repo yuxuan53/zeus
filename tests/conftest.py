@@ -430,6 +430,8 @@ _WLA_RESIDUAL_ALLOWLIST = frozenset({
     "scripts/promote_model_bias_ens.py",         # pending_track_a6: Zeus #64 FT-ship F3 promote CLI; --db override path only, not daemon src/
     "scripts/probe_full_live_path_to_submit.py", # pending_track_a6: standalone live-path probe script; operator diagnostic tool, not daemon src/
     "scripts/ops/health_probe.py",  # read_only liveness probe: connects mode=ro + PRAGMA query_only=ON, ZERO writes — cannot violate write-atomicity; standalone ops/cron diagnostic, not daemon src/ (authority: feedback_liveness_first_health_antibody)
+    "scripts/research/family_book_capture.py",  # read_only on live DBs (touches none); standalone research capture writing its OWN sqlite file under state/research/, not daemon src/
+    "scripts/research/family_book_coverage.py",  # read_only: connects mode=ro to the research capture DB only; standalone census CLI, not daemon src/
     "scripts/ops/orderable_bias_pass_candidates.py",  # pending_track_a6: read-only arm-review observability query (order-able ∩ bias-pass); standalone ops script, not daemon src/
     # backfill_bayes_precision_fusion_history_from_b0.py PROMOTED to the production allowlist
     # (db_writer_lock.SQLITE_CONNECT_ALLOWLIST, 2026-06-08): principled decision —
