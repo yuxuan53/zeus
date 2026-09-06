@@ -22348,6 +22348,142 @@ def stamp_day0_diurnal_nowcast(
     actionable_payload[DAY0_NOWCAST_FIT_DATE_KEY] = str(verdict.fit_date)
 
 
+DAY0_ASK_DISTINCT_10MIN_KEY = "_edli_day0_held_ask_distinct_10min"
+DAY0_ASK_WINDOW_START_KEY = "_edli_day0_held_ask_window_start_utc"
+DAY0_ASK_WINDOW_END_KEY = "_edli_day0_held_ask_window_end_utc"
+
+
+def stamp_day0_held_ask_repricing(
+    actionable_payload: dict[str, object],
+    *,
+    held_token_id: str | None,
+    book_captured_at: datetime | None,
+    trade_conn: sqlite3.Connection | None = None,
+) -> None:
+    """Stamp the held token's pre-decision ask-repricing count onto the payload IN PLACE.
+
+    Counts the DISTINCT ``orderbook_top_ask`` values that token showed in
+    [T - 10 min, T), T being the sealed book's capture instant — the same instant gate 5
+    reads as ``quote_time``. The window EXCLUDES T itself: the sealed book we are about
+    to price against is the decision, not evidence that the book moved before it, and
+    including it would score every candidate one distinct value higher.
+
+    ``held_token_id`` must be the token we would HOLD (the NO token for buy_no), because
+    that is the book whose ask we lift and the one the measurement scored. Reads the
+    trade DB through a bounded read-only connection and fails OPEN on every fault — no
+    token, no connection, no rows, any exception — leaving the keys absent, which is
+    what makes the admission gate inert.
+    """
+
+    if str(actionable_payload.get("event_type") or "").strip() != "DAY0_EXTREME_UPDATED":
+        return
+    token = str(held_token_id or "").strip()
+    if not token or book_captured_at is None:
+        return
+    try:
+        from src.engine.day0_admission import DAY0_ASK_REPRICING_WINDOW_MINUTES
+
+        window_end = book_captured_at.astimezone(UTC)
+        window_start = window_end - timedelta(
+            minutes=DAY0_ASK_REPRICING_WINDOW_MINUTES
+        )
+        count = _day0_held_ask_distinct_count(
+            token_id=token,
+            window_start=window_start,
+            window_end=window_end,
+            trade_conn=trade_conn,
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory gate; never blocks on its own fault
+        _log_day0_ask_repricing_fault(exc)
+        return
+    if count is None:
+        return
+    actionable_payload[DAY0_ASK_DISTINCT_10MIN_KEY] = int(count)
+    actionable_payload[DAY0_ASK_WINDOW_START_KEY] = window_start.isoformat()
+    actionable_payload[DAY0_ASK_WINDOW_END_KEY] = window_end.isoformat()
+
+
+def _day0_held_ask_distinct_count(
+    *,
+    token_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    trade_conn: sqlite3.Connection | None,
+) -> int | None:
+    """Distinct top-ask values for one token in [window_start, window_end), or None.
+
+    The covering index (selected_outcome_token_id, captured_at DESC) makes this a
+    range scan over one token's own rows. An already-open trade connection is reused
+    READ-ONLY rather than opening a second handle on the hot submit path; when there is
+    none, a short-deadline read-only connection is opened and closed here.
+    """
+
+    # The upper bound is EXCLUSIVE, and that is the measured semantics, not a
+    # deviation from it. The study's SQL reads `captured_at BETWEEN start AND T` —
+    # syntactically closed — but it formats its bounds with strftime('%...%f'), i.e.
+    # WITHOUT the '+00:00' the column actually stores. The row captured at exactly T
+    # therefore compares as '..628783+00:00' <= '..628783' = FALSE and never entered
+    # the count: the window was half-open in effect. Reproduced both ways against
+    # chain truth: [T-10min, T) gives the published n=95 / -$382.53 (test n=50 /
+    # -$179.12); a genuinely closed [T-10min, T] gives n=114 / -$419.41 (test n=55 /
+    # -$192.75). Closing the bound here would also be wrong on its own terms — the
+    # sealed book AT T is the decision we are about to make, not evidence that the
+    # book moved BEFORE it, so counting it scores every candidate one level higher.
+    sql = (
+        "SELECT orderbook_top_ask FROM executable_market_snapshots "
+        "WHERE selected_outcome_token_id = ? "
+        "AND captured_at >= ? AND captured_at < ?"
+    )
+    params = (token_id, window_start.isoformat(), window_end.isoformat())
+    if trade_conn is not None:
+        rows = trade_conn.execute(sql, params).fetchall()
+    else:
+        from src.state.db import get_trade_connection_read_only
+
+        conn = get_trade_connection_read_only(
+            deadline_monotonic=_time.monotonic()
+            + _DAY0_ASK_REPRICING_READ_DEADLINE_SECONDS
+        )
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+    if not rows:
+        # No book history for this token in the window is ABSENT evidence, not proof of
+        # a quiet book: the gate stays inert rather than admitting on a silent read.
+        return None
+    asks: set[float] = set()
+    for row in rows:
+        value = _optional_float(row[0])
+        if value is None:
+            # 'ABSENT'/NULL is a missing quote, not a distinct price level.
+            continue
+        asks.add(round(value, 6))
+    if not asks:
+        return None
+    return len(asks)
+
+
+_DAY0_ASK_REPRICING_READ_DEADLINE_SECONDS = 1.0
+_day0_ask_repricing_fault_logged_at: dict[str, float] = {}
+_day0_ask_repricing_fault_lock = threading.Lock()
+
+
+def _log_day0_ask_repricing_fault(exc: BaseException) -> None:
+    """WARN once per exception family per hour — same budget as the nowcast fault log."""
+
+    family = type(exc).__name__
+    now = _time.monotonic()
+    with _day0_ask_repricing_fault_lock:
+        last = _day0_ask_repricing_fault_logged_at.get(family)
+        if last is not None and now - last < _DAY0_NOWCAST_FAULT_LOG_INTERVAL_SECONDS:
+            return
+        _day0_ask_repricing_fault_logged_at[family] = now
+    logging.getLogger(__name__).warning(
+        "day0 held-ask repricing count unavailable (%s): %s", family, exc
+    )
+
+
 def _day0_diurnal_nowcast_verdict(
     *,
     actionable_payload: Mapping[str, object],
@@ -22582,6 +22718,9 @@ def _day0_live_submit_admission_rejection_reason(
             else None
         ),
         decision_price_held=_day0_held_token_decision_price(actionable_payload),
+        held_ask_distinct_count_10min=_optional_int(
+            actionable_payload.get(DAY0_ASK_DISTINCT_10MIN_KEY)
+        ),
         maker_only_required=not global_current_solve,
     )
     return day0_live_admission_rejection_reason(ctx)
@@ -22684,6 +22823,27 @@ def _build_live_execution_command_certificates(
             actionable_payload,
             event_payload=_payload(event),
             decision_time=decision_time,
+        )
+        # Same seal-before-hash discipline, same fail-open contract: count how many
+        # distinct asks the HELD token showed in the 10 minutes BEFORE the sealed book
+        # we are about to price against. The JIT snapshot is that sealed book — its
+        # captured_at is the exact instant gate 5 reads as quote_time, and its
+        # selected_outcome_token_id is the token we would hold (NO for buy_no) — so the
+        # window matches the measurement's by construction. No handoff, no stamp, gate
+        # inert.
+        _day0_sealed_snapshot = (
+            global_jit_handoff.authority.snapshot
+            if global_jit_handoff is not None
+            else None
+        )
+        stamp_day0_held_ask_repricing(
+            actionable_payload,
+            held_token_id=(
+                str(getattr(_day0_sealed_snapshot, "selected_outcome_token_id", "") or "")
+                or str(actionable_payload.get("token_id") or "")
+            ),
+            book_captured_at=getattr(_day0_sealed_snapshot, "captured_at", None),
+            trade_conn=trade_conn,
         )
         actionable = build_actionable_trade_certificate(
             payload=actionable_payload,

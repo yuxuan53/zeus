@@ -195,3 +195,102 @@ def test_nowcast_veto_reason_is_registered_in_the_k2_taxonomy() -> None:
     wrapped = f"DAY0_LIVE_ADMISSION_REJECTED:{reason}"
     assert is_registered_rejection_reason(wrapped)
     assert classify_rejection_reason(wrapped) is RejectionCategory.DESIGNED_GATE
+
+
+# ---------------------------------------------------------------------------
+# Gate 10 — the held-token ask-repricing veto (2026-09-05).
+#
+# Measured on window A (2026-07-20..09-04, chain truth, tx_hash-deduped fills):
+# day0 entries whose HELD token's ask took >= 2 distinct values in the prior 10
+# minutes are n=95 / net -$382.53 (net/cost -0.563, 7/7 ISO weeks negative), the
+# rest n=220 / -$106.57. Post-fill markout keeps falling for hours on the former
+# and is flat on the latter — we are lifting an ask the market is already walking
+# away from. The COUNT is the whole gate: absent count, inert gate.
+
+
+def test_ask_repricing_veto_fires_at_two_distinct_asks() -> None:
+    assert (
+        day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=2))
+        == "DAY0_ASK_REPRICING_VETO"
+    )
+
+
+def test_ask_repricing_veto_fires_above_the_threshold_too() -> None:
+    # The rule is "the book moved at all", so more movement cannot admit.
+    assert (
+        day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=7))
+        == "DAY0_ASK_REPRICING_VETO"
+    )
+
+
+def test_ask_repricing_veto_silent_on_a_quiet_book() -> None:
+    # One distinct ask means the book never repriced; zero means it was quoted
+    # but never priced. Neither is evidence of a market moving away from us.
+    assert day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=1)) is None
+    assert day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=0)) is None
+
+
+def test_ask_repricing_veto_inert_without_a_count() -> None:
+    # No trade-DB read, no token id, or no snapshots in the window: the stamp
+    # leaves the key absent and the gate must not invent a verdict from silence.
+    assert day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=None)) is None
+    assert day0_live_admission_rejection_reason(_ctx()) is None
+
+
+def test_ask_repricing_veto_runs_after_the_existing_gates() -> None:
+    # Additive, like gate 9: a structural refusal still reports itself.
+    assert (
+        day0_live_admission_rejection_reason(
+            _ctx(execution_mode="taker", held_ask_distinct_count_10min=5)
+        )
+        == "DAY0_TAKER_ENTRY_FORBIDDEN"
+    )
+    # And gate 9 still precedes gate 10 when both would fire.
+    assert (
+        day0_live_admission_rejection_reason(
+            _ctx(
+                nowcast_q_held=0.31,
+                decision_price_held=0.90,
+                held_ask_distinct_count_10min=5,
+            )
+        )
+        == "DAY0_DIURNAL_NOWCAST_VETO"
+    )
+
+
+def test_ask_repricing_veto_never_applies_off_the_day0_lane() -> None:
+    # The cut does NOT transfer: on forecast_qkernel_entry the same predicate
+    # removes an out-of-sample POSITIVE set. The event-type guard is what keeps
+    # this predicate day0-only, so it is a contract, not an accident.
+    assert (
+        day0_live_admission_rejection_reason(
+            _ctx(event_type="FORECAST_SNAPSHOT_READY", held_ask_distinct_count_10min=9)
+        )
+        is None
+    )
+
+
+def test_ask_repricing_veto_reason_is_registered_in_the_k2_taxonomy() -> None:
+    from src.contracts.rejection_reasons import (
+        RejectionCategory,
+        classify_rejection_reason,
+        is_registered_rejection_reason,
+    )
+
+    reason = day0_live_admission_rejection_reason(_ctx(held_ask_distinct_count_10min=2))
+    assert is_registered_rejection_reason(reason)
+    assert classify_rejection_reason(reason) is RejectionCategory.DESIGNED_GATE
+    # Terminal no-submit receipt, not a fail-open requeue, once wrapped.
+    wrapped = f"DAY0_LIVE_ADMISSION_REJECTED:{reason}"
+    assert is_registered_rejection_reason(wrapped)
+    assert classify_rejection_reason(wrapped) is RejectionCategory.DESIGNED_GATE
+
+
+def test_ask_repricing_threshold_and_window_are_the_measured_ones() -> None:
+    from src.engine.day0_admission import (
+        DAY0_ASK_REPRICING_MIN_DISTINCT,
+        DAY0_ASK_REPRICING_WINDOW_MINUTES,
+    )
+
+    assert DAY0_ASK_REPRICING_WINDOW_MINUTES == 10
+    assert DAY0_ASK_REPRICING_MIN_DISTINCT == 2

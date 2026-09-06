@@ -456,7 +456,7 @@ class RejectionReason(str, Enum):
         "DAY0_SOURCE_HEALTH_NOT_ADMISSIBLE, DAY0_QUOTE_TIME_MISSING, "
         "DAY0_QUOTE_STALE_VS_OBSERVATION, DAY0_ONE_BIN_EDGE_FRAGILE, "
         "DAY0_FINAL_LOCALDAY_NOENTRY, DAY0_TAKER_ENTRY_FORBIDDEN, "
-        "DAY0_DIURNAL_NOWCAST_VETO, "
+        "DAY0_DIURNAL_NOWCAST_VETO, DAY0_ASK_REPRICING_VETO, "
         "DAY0_SUBMIT_TIME_BIN_DEAD). A deliberate promotion circuit breaker, not a "
         "build failure — registered (2026-07-19 receipt-persistence fix, docs/evidence/"
         "capital_efficiency_2026_07_19/nosubmit_gates.md §5) so it classifies TERMINAL "
@@ -476,6 +476,23 @@ class RejectionReason(str, Enum):
         "HIGH and -0.043/unit LOW, negative in 6/6 walk-forward windows. Emitted as the "
         "detail of DAY0_LIVE_ADMISSION_REJECTED. A fitted-evidence refusal, not a cap: "
         "with no artifact installed the gate is inert.",
+    )
+    DAY0_ASK_REPRICING_VETO = (
+        "DAY0_ASK_REPRICING_VETO",
+        RejectionCategory.DESIGNED_GATE,
+        "The HELD token's best ask took 2 or more distinct values in the 10 minutes "
+        "before the sealed book was captured: we would be lifting an ask the market is "
+        "already walking away from. Measured on 2026-07-20..09-04 chain truth, the "
+        "day0_nowcast_entry lane splits into two populations — repriced n=95 net "
+        "-$382.53 (net/cost -0.563, 5% LCB -$646, 7/7 ISO weeks negative) vs quiet-book "
+        "n=220 net -$106.57 (-0.074); post-fill markout keeps falling for hours on the "
+        "repriced set (240 m -12.9c) and is flat on the quiet one, i.e. same-information "
+        "reaction rather than an edge we captured. Held out on W34-36 the removed set is "
+        "n=50 / -$179.12 and the kept set beats the full lane by +0.276 net/cost. Day0 "
+        "only by construction: on forecast_qkernel_entry the same cut removes a "
+        "positive out-of-sample set, and the DAY0_EXTREME_UPDATED guard is what keeps it "
+        "there. Emitted as the detail of DAY0_LIVE_ADMISSION_REJECTED. Evidence-based "
+        "refusal, not a cap: with no snapshots to count the gate is inert.",
     )
 
     # ----- ARTIFICIAL_SUSPECT ---------------------------------------------
