@@ -37,10 +37,13 @@ bayes_precision_fusion lane: convert at the consumption seam, never store mixed 
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -49,6 +52,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -677,6 +681,184 @@ class Day0ProviderRunHwm:
     run_availability_time: datetime
 
 
+# 2026-09-05 (quota root-cause, round 3): Open-Meteo serves
+# https://api.open-meteo.com/data/{model}/static/meta.json from more than one replica.
+# A direct probe of ecmwf_ifs during the 18Z rollout window caught two replicas
+# disagreeing: both named the SAME run (last_run_initialisation_time=2026-09-05T18:00Z,
+# same last_run_modification_time), but reported two different
+# last_run_availability_time values (00:27:39Z vs 00:54:11Z) -- and, earlier in the
+# rollout, ingest-side source_cycles logged the replicas disagreeing about which run is
+# current at all (12Z vs 18Z, five flips in 12 minutes). run_initialisation_time is the
+# immutable run identity; run_availability_time is freshness evidence for the +10min
+# public-usability wait, never part of identity. Pin the HWM monotone per model so a
+# stale replica's older run (or an earlier availability for the SAME run, which would
+# only relax the usability wait) is never accepted after a newer one has been seen --
+# durable across restarts/processes via the same lock-guarded state-file pattern as the
+# exact-run-gap memo, since both live daemons probe this endpoint independently.
+_DAY0_PROVIDER_RUN_HWM_PIN: dict[str, Day0ProviderRunHwm] = {}
+_DAY0_PROVIDER_RUN_HWM_PIN_SCHEMA_VERSION = 1
+_DAY0_PROVIDER_RUN_HWM_PIN_LOAD_INTERVAL_SECONDS = 15.0
+_day0_provider_run_hwm_pin_state_path: Path | None = None
+_day0_provider_run_hwm_pin_last_loaded_monotonic: float = 0.0
+
+
+def _day0_provider_run_hwm_pin_persistence_enabled() -> bool:
+    """Mirror bayes_precision_fusion_download's gap-memo gate: no file I/O under test."""
+    return not (
+        os.environ.get("ZEUS_TESTING") == "1" or "PYTEST_CURRENT_TEST" in os.environ
+    )
+
+
+def _day0_provider_run_hwm_pin_path() -> Path:
+    global _day0_provider_run_hwm_pin_state_path
+    if _day0_provider_run_hwm_pin_state_path is None:
+        from src.config import state_path
+
+        _day0_provider_run_hwm_pin_state_path = state_path(
+            "day0_provider_run_hwm_pin.json"
+        )
+    return _day0_provider_run_hwm_pin_state_path
+
+
+def _load_persisted_day0_provider_run_hwm_pin(*, force: bool = False) -> None:
+    if not _day0_provider_run_hwm_pin_persistence_enabled():
+        return
+    global _day0_provider_run_hwm_pin_last_loaded_monotonic
+    now = time.monotonic()
+    if (
+        not force
+        and (now - _day0_provider_run_hwm_pin_last_loaded_monotonic)
+        < _DAY0_PROVIDER_RUN_HWM_PIN_LOAD_INTERVAL_SECONDS
+    ):
+        return
+    _day0_provider_run_hwm_pin_last_loaded_monotonic = now
+    path = _day0_provider_run_hwm_pin_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, dict):
+        return
+    for model, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            run_initialisation_time = datetime.fromisoformat(
+                str(entry["run_initialisation_time"])
+            )
+            run_availability_time = datetime.fromisoformat(
+                str(entry["run_availability_time"])
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        disk_hwm = Day0ProviderRunHwm(
+            model=str(model),
+            run_initialisation_time=run_initialisation_time.astimezone(UTC),
+            run_availability_time=run_availability_time.astimezone(UTC),
+        )
+        current = _DAY0_PROVIDER_RUN_HWM_PIN.get(str(model))
+        if current is None or disk_hwm.run_initialisation_time > current.run_initialisation_time:
+            _DAY0_PROVIDER_RUN_HWM_PIN[str(model)] = disk_hwm
+
+
+def _persist_day0_provider_run_hwm_pin(hwm: Day0ProviderRunHwm) -> None:
+    if not _day0_provider_run_hwm_pin_persistence_enabled():
+        return
+    path = _day0_provider_run_hwm_pin_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if path.exists():
+                    try:
+                        on_disk = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        on_disk = {}
+                else:
+                    on_disk = {}
+                if not isinstance(on_disk, dict):
+                    on_disk = {}
+                if on_disk.get("schema_version") != _DAY0_PROVIDER_RUN_HWM_PIN_SCHEMA_VERSION:
+                    on_disk = {
+                        "schema_version": _DAY0_PROVIDER_RUN_HWM_PIN_SCHEMA_VERSION,
+                        "entries": {},
+                    }
+                entries = on_disk.get("entries")
+                if not isinstance(entries, dict):
+                    entries = {}
+                    on_disk["entries"] = entries
+                existing = entries.get(hwm.model)
+                if isinstance(existing, dict):
+                    try:
+                        existing_init = datetime.fromisoformat(
+                            str(existing["run_initialisation_time"])
+                        ).astimezone(UTC)
+                    except (KeyError, TypeError, ValueError):
+                        existing_init = None
+                    if existing_init is not None and existing_init >= hwm.run_initialisation_time:
+                        return
+                entries[hwm.model] = {
+                    "run_initialisation_time": hwm.run_initialisation_time.isoformat(),
+                    "run_availability_time": hwm.run_availability_time.isoformat(),
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                }
+                temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                try:
+                    temp.write_text(
+                        json.dumps(on_disk, sort_keys=True, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    os.replace(temp, path)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        temp.unlink()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        logger.debug(
+            "DAY0_HOURLY_VECTORS could not persist provider-run HWM pin", exc_info=True
+        )
+
+
+def _apply_day0_provider_run_hwm_pin(
+    probed: Mapping[str, Day0ProviderRunHwm],
+) -> dict[str, Day0ProviderRunHwm]:
+    """Clamp a freshly probed HWM to a monotone-per-model pin.
+
+    A stale metadata replica may report an OLDER run, or an earlier/later
+    ``run_availability_time`` for the SAME run, than one already accepted. Once a run
+    has been pinned for a model, an older run is never accepted again, and the run's
+    availability_time is fixed to the EARLIEST value observed for it (a later replica's
+    later timestamp must never push the +10min public-usability wait backwards in time
+    for a run already deemed usable).
+    """
+    _load_persisted_day0_provider_run_hwm_pin()
+    out: dict[str, Day0ProviderRunHwm] = {}
+    for model, probe in probed.items():
+        pinned = _DAY0_PROVIDER_RUN_HWM_PIN.get(model)
+        if pinned is None or probe.run_initialisation_time > pinned.run_initialisation_time:
+            out[model] = probe
+            _DAY0_PROVIDER_RUN_HWM_PIN[model] = probe
+            _persist_day0_provider_run_hwm_pin(probe)
+        elif probe.run_initialisation_time == pinned.run_initialisation_time:
+            out[model] = Day0ProviderRunHwm(
+                model=model,
+                run_initialisation_time=pinned.run_initialisation_time,
+                run_availability_time=min(
+                    pinned.run_availability_time, probe.run_availability_time
+                ),
+            )
+            _DAY0_PROVIDER_RUN_HWM_PIN[model] = out[model]
+        else:
+            # A stale replica reported a run older than the one already pinned --
+            # ignore it, the pinned run is authoritative.
+            out[model] = pinned
+    return out
+
+
 def in_domain_models_for_city(city: Any, *, models: Iterable[str] = DAY0_HOURLY_MODELS) -> list[str]:
     """Polygon-gated model list for a city (lead 0). Fail-soft to [] on gate errors."""
     try:
@@ -771,7 +953,11 @@ def probe_day0_provider_run_hwm(
             run_initialisation_time=update.last_run_initialisation_time.astimezone(UTC),
             run_availability_time=update.last_run_availability_time.astimezone(UTC),
         )
-    return out
+    # QUOTA (round 3): Open-Meteo's meta.json is served from more than one replica,
+    # and replicas have been observed disagreeing about which run is current. Pin
+    # monotone per model so a stale replica's older run never displaces an already-
+    # accepted newer one.
+    return _apply_day0_provider_run_hwm_pin(out)
 
 
 def _provider_run_identity_from_meta(
@@ -865,10 +1051,12 @@ def day0_hourly_release_due_city_dates(
                 if actual is None:
                     due.add((city_name, target_date))
                     break
-                if actual < (
-                    hwm.run_initialisation_time,
-                    hwm.run_availability_time,
-                ):
+                # QUOTA (round 3): identity is (model, run_initialisation_time) only --
+                # run_availability_time is freshness evidence, not identity, and Open-
+                # Meteo's meta.json replicas have been observed disagreeing on it for
+                # the SAME immutable run. Comparing the full pair made an already-
+                # current persisted run look "trailing" on every replica skew.
+                if actual[0] < hwm.run_initialisation_time:
                     due.add((city_name, target_date))
                     break
     finally:
@@ -897,7 +1085,9 @@ def _vectors_trailing_provider_hwm(
         if actual is None:
             trailing.append(model)
             continue
-        if actual < (hwm.run_initialisation_time, hwm.run_availability_time):
+        # QUOTA (round 3): identity is run_initialisation_time only; see the comment
+        # in day0_hourly_release_due_city_dates above.
+        if actual[0] < hwm.run_initialisation_time:
             trailing.append(model)
     return tuple(trailing)
 
@@ -952,10 +1142,17 @@ def _current_provider_bundle_already_persisted(
                         expected_model=model,
                     )
                     hwm = required_hwm[model]
-                    if actual != (
-                        hwm.run_initialisation_time.astimezone(UTC),
-                        hwm.run_availability_time.astimezone(UTC),
-                    ):
+                    if actual is None:
+                        return False
+                    # QUOTA (round 3): a persisted bundle proves the SAME run as the
+                    # current HWM by run_initialisation_time alone. Open-Meteo's
+                    # meta.json is served from more than one replica and replicas have
+                    # been observed disagreeing on run_availability_time for the exact
+                    # same immutable run (same initialisation_time, same
+                    # modification_time) -- comparing the full pair made an already-
+                    # persisted, still-current bundle fail this check on every replica
+                    # skew and re-fetch the whole city bundle for a run it already had.
+                    if actual[0] != hwm.run_initialisation_time.astimezone(UTC):
                         return False
             return True
         finally:
@@ -1252,13 +1449,20 @@ def fetch_day0_hourly_vectors(
 
 
 def _same_model_update(left: Any, right: Any) -> bool:
-    """Require the metadata bracket to name one immutable provider run."""
+    """Require the metadata bracket to name one immutable provider run.
+
+    QUOTA (round 3): run_initialisation_time and last_run_modification_time have been
+    directly confirmed identical across Open-Meteo meta.json replicas for the SAME run;
+    only run_availability_time differs by replica (a CDN-edge serving timestamp, not
+    provider-run identity). Comparing availability_time here made this torn-read guard
+    spuriously reject an in-flight fetch whenever the second meta.json probe happened to
+    land on a different replica than the first, discarding an otherwise-good fetch.
+    """
 
     return bool(
         left is not None
         and right is not None
         and left.last_run_initialisation_time == right.last_run_initialisation_time
-        and left.last_run_availability_time == right.last_run_availability_time
         and left.last_run_modification_time == right.last_run_modification_time
     )
 
