@@ -47,6 +47,8 @@ import uuid
 from src.config import settings, get_mode
 from src.contracts.global_auction_receipt import (
     CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION,
+    GlobalAuctionReceiptRef,
+    assert_global_auction_receipt_artifact,
 )
 from src.data.replacement_forecast_cycle_policy import (
     CURRENT_EVIDENCE_SEMANTICS_REVISION,
@@ -3812,6 +3814,244 @@ def _qkernel_live_realized_capital_curve(
     )
 
 
+def _validated_global_receipt(
+    conn: sqlite3.Connection,
+    raw_receipt: object,
+    *,
+    source: str,
+) -> GlobalAuctionReceiptRef:
+    """Re-read one receipt's decision_log row and require exact identity."""
+
+    try:
+        receipt = GlobalAuctionReceiptRef.from_payload(raw_receipt)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} global receipt invalid") from exc
+    if receipt.schema_version != 22:
+        raise ValueError(f"{source} global receipt is not schema 22")
+    row = conn.execute(
+        "SELECT mode,artifact_json FROM decision_log WHERE id=?",
+        (receipt.decision_log_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"{source} global receipt row missing")
+    assert_global_auction_receipt_artifact(
+        expected=receipt,
+        decision_log_id=receipt.decision_log_id,
+        decision_log_mode=str(row[0]),
+        artifact_json=row[1],
+    )
+    artifact = json.loads(str(row[1]))
+    if artifact["summary"].get("global_selection_revision") != (
+        CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+    ):
+        raise ValueError(f"{source} global receipt selection revision mismatch")
+    return receipt
+
+
+def _global_receipt_events_source(
+    conn: sqlite3.Connection,
+    events_conn: sqlite3.Connection | None,
+) -> tuple[sqlite3.Connection, str] | None:
+    """Resolve the AUTHORITATIVE EDLI event surface, or None if unavailable.
+
+    ``edli_live_order_events`` is owned by zeus-world.db; the same-named table
+    on zeus_trades.db is the drained 2026-05-25 split GHOST. RiskGuard's tick
+    connection has world ATTACHed, so an unqualified name silently reads the
+    ghost and binds nothing. Only the ``world.`` qualified table — or a caller's
+    dedicated world connection — may answer which receipt selected an entry.
+    """
+
+    if events_conn is not None:
+        return events_conn, "edli_live_order_events"
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM world.sqlite_master "
+            "WHERE type='table' AND name='edli_live_order_events' LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return (conn, "world.edli_live_order_events") if present else None
+
+
+def _command_global_receipt(
+    conn: sqlite3.Connection,
+    *,
+    execution_command_id: str,
+    events_conn: sqlite3.Connection | None = None,
+    events_table: str = "edli_live_order_events",
+) -> GlobalAuctionReceiptRef:
+    event_source = events_conn or conn
+    rows = event_source.execute(
+        f"SELECT pre.payload_json FROM {events_table} AS cmd "
+        f"JOIN {events_table} AS pre "
+        "ON pre.aggregate_id=cmd.aggregate_id "
+        "AND pre.event_type='PreSubmitRevalidated' "
+        "WHERE cmd.event_type='ExecutionCommandCreated' "
+        "AND json_extract(cmd.payload_json,'$.execution_command_id')=? "
+        "LIMIT 2",
+        (execution_command_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise ValueError("unique EDLI pre-submit receipt unavailable")
+    try:
+        payload = json.loads(str(rows[0][0] or ""))
+        raw_receipt = payload.get("global_auction_receipt")
+        if raw_receipt is None:
+            economics = payload.get("qkernel_execution_economics")
+            raw_receipt = (
+                economics.get("global_auction_receipt")
+                if isinstance(economics, Mapping)
+                else None
+            )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("EDLI global receipt invalid") from exc
+    return _validated_global_receipt(
+        conn,
+        raw_receipt,
+        source="EDLI",
+    )
+
+
+def _bind_live_curve_to_selection_revision(
+    conn: sqlite3.Connection,
+    curve: Mapping[str, object],
+    *,
+    events_conn: sqlite3.Connection | None = None,
+) -> dict[str, object]:
+    """Restrict a realized-capital curve to the CURRENT selection revision.
+
+    A probability revision outlives several selection laws, so the raw curve
+    mixes selectors. Each realized position is bound to the immutable global
+    auction receipt of its own ENTRY command; only positions whose receipt
+    carries ``CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION`` remain, and the
+    cohort economics are recomputed over exactly that subset.
+
+    An unbindable position is EXCLUDED evidence, not degraded truth: it is
+    counted in ``unbound_position_count`` and never inflates
+    ``blocked_position_count``, whose identity-failure semantics (and the
+    degraded status they imply) pass through untouched.
+
+    Without a usable receipt surface the curve is returned unbound, which is
+    exactly the pre-binding posture: no cohort, so no probation latch.
+    """
+
+    source = _global_receipt_events_source(conn, events_conn)
+    raw_rows = tuple(curve.get("curve") or ())
+    if source is None:
+        return {
+            **dict(curve),
+            "selection_revision_bound": False,
+            "selection_revision_binding_status": (
+                "global_receipt_events_unavailable"
+            ),
+        }
+    event_source, events_table = source
+
+    bound_rows: list[dict[str, object]] = []
+    unbound_reasons: dict[str, int] = {}
+    for raw in raw_rows:
+        row = dict(raw)
+        position_id = str(row.get("position_id") or "").strip()
+        commands = conn.execute(
+            "SELECT DISTINCT command_id,decision_id FROM venue_commands "
+            "WHERE position_id=? AND intent_kind='ENTRY' ORDER BY decision_id",
+            (position_id,),
+        ).fetchall()
+        try:
+            if not commands:
+                raise ValueError("entry command missing")
+            command_receipts = [
+                (
+                    str(command[0] or ""),
+                    str(command[1] or ""),
+                    _command_global_receipt(
+                        conn,
+                        execution_command_id=str(command[1] or ""),
+                        events_conn=event_source,
+                        events_table=events_table,
+                    ),
+                )
+                for command in commands
+            ]
+        except ValueError as exc:
+            reason = str(exc)
+            unbound_reasons[reason] = unbound_reasons.get(reason, 0) + 1
+            continue
+        receipts = [item[2] for item in command_receipts]
+        first_receipt = min(receipts, key=lambda item: item.decision_log_id)
+        epoch_identities = sorted(
+            {receipt.selection_epoch_identity for receipt in receipts}
+        )
+        bindings = [
+            {
+                "venue_command_id": command_id,
+                "execution_command_id": execution_command_id,
+                "global_auction_decision_log_id": receipt.decision_log_id,
+                "global_auction_receipt_hash": receipt.receipt_hash,
+                "global_selection_epoch_identity": (
+                    receipt.selection_epoch_identity
+                ),
+            }
+            for command_id, execution_command_id, receipt in command_receipts
+        ]
+        bound_rows.append(
+            {
+                **row,
+                "global_selection_revision": (
+                    CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+                ),
+                "global_auction_decision_log_id": first_receipt.decision_log_id,
+                "global_auction_receipt_hash": (
+                    first_receipt.receipt_hash if len(bindings) == 1 else None
+                ),
+                "global_selection_epoch_identity": (
+                    epoch_identities[0] if len(epoch_identities) == 1 else None
+                ),
+                "global_auction_receipt_count": len(bindings),
+                "global_selection_epoch_identities": epoch_identities,
+                "global_auction_receipts": bindings,
+            }
+        )
+
+    def total(field: str) -> float:
+        return sum(float(row.get(field) or 0.0) for row in bound_rows)
+
+    net_pnl = total("net_realized_pnl_usd")
+    capital = total("capital_committed_usd")
+    cumulative = 0.0
+    for row in bound_rows:
+        cumulative += float(row.get("net_realized_pnl_usd") or 0.0)
+        row["cumulative_net_realized_pnl_usd"] = round(cumulative, 6)
+
+    raw_status = str(curve.get("status") or "").strip()
+    if raw_status in {"capital_truth_degraded", "capital_truth_unavailable"}:
+        status = raw_status
+    elif bound_rows:
+        status = "positive" if net_pnl > 0.0 else "nonpositive"
+    elif raw_status == "awaiting_current_law_fills":
+        status = raw_status
+    else:
+        status = "probation_in_flight"
+
+    return {
+        **dict(curve),
+        "status": status,
+        "selection_revision_bound": True,
+        "global_selection_revision": CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION,
+        "realized_position_count": len(bound_rows),
+        "unbound_position_count": len(raw_rows) - len(bound_rows),
+        "unbound_reasons": dict(sorted(unbound_reasons.items())),
+        "realized_capital_committed_usd": round(capital, 6),
+        "gross_realized_pnl_usd": round(total("gross_realized_pnl_usd"), 6),
+        "fee_bound_usd": round(total("fee_bound_usd"), 6),
+        "net_realized_pnl_usd": round(net_pnl, 6),
+        "return_on_realized_capital": (
+            round(net_pnl / capital, 6) if capital > 0.0 else None
+        ),
+        "curve": bound_rows,
+    }
+
+
 _GLOBAL_CAPITAL_EVIDENCE_LAW = "executable_min_order_capital_gain_v2"
 
 
@@ -6093,10 +6333,13 @@ def _tick_once() -> RiskLevel:
             as_of=market_relative_alpha_as_of,
         )
         qkernel_live_realized_capital_curve = (
-            _qkernel_live_realized_capital_curve(
+            _bind_live_curve_to_selection_revision(
                 zeus_conn,
-                window_days=market_relative_alpha_window_days,
-                as_of=market_relative_alpha_as_of,
+                _qkernel_live_realized_capital_curve(
+                    zeus_conn,
+                    window_days=market_relative_alpha_window_days,
+                    as_of=market_relative_alpha_as_of,
+                ),
             )
         )
         (
@@ -6165,10 +6408,15 @@ def _tick_once() -> RiskLevel:
             window_days=market_relative_alpha_window_days,
             as_of=market_relative_alpha_as_of,
         )
-        day0_live_realized_capital_curve = _day0_live_realized_capital_curve(
-            zeus_conn,
-            window_days=market_relative_alpha_window_days,
-            as_of=market_relative_alpha_as_of,
+        day0_live_realized_capital_curve = (
+            _bind_live_curve_to_selection_revision(
+                zeus_conn,
+                _day0_live_realized_capital_curve(
+                    zeus_conn,
+                    window_days=market_relative_alpha_window_days,
+                    as_of=market_relative_alpha_as_of,
+                ),
+            )
         )
         (
             day0_actual_global_capital_rows,
