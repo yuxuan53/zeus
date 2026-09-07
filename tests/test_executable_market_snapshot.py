@@ -603,9 +603,11 @@ def test_discovery_capture_rotates_compact_rows_with_periodic_full_keyframes(
     assert conn.execute(
         "SELECT COUNT(*) FROM executable_market_snapshots"
     ).fetchone()[0] == 2
+    # DISCOVERY_SWEEP no longer persists to the reader-less compact table:
+    # compact_snapshot_id is derived, not written.
     assert conn.execute(
         "SELECT COUNT(*) FROM executable_market_snapshot_compact"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
     assert conn.execute(
         """
         SELECT snapshot_id
@@ -616,7 +618,13 @@ def test_discovery_capture_rotates_compact_rows_with_periodic_full_keyframes(
     ).fetchone()[0] == third["executable_snapshot_id"]
 
 
-def test_failed_compact_write_does_not_advance_keyframe_rotation(conn, monkeypatch):
+def test_discovery_sweep_writes_no_compact_rows_and_still_advances_rotation(
+    conn, monkeypatch
+):
+    """DISCOVERY_SWEEP captures never write executable_market_snapshot_compact
+    (it has no reader in src/), yet keyframe rotation and the derived
+    compact_snapshot_id behave exactly as they did when the row was
+    persisted."""
     market_scanner_module._discovery_captures_since_keyframe.clear()
     market_scanner_module._prev_orderbook_hash_by_market.clear()
     monkeypatch.setenv("ZEUS_SUBSTRATE_CAPTURE_KEYFRAME_INTERVAL_CYCLES", "2")
@@ -628,32 +636,21 @@ def test_failed_compact_write_does_not_advance_keyframe_rotation(conn, monkeypat
         "scan_authority": "VERIFIED",
         "capture_trigger": "DISCOVERY_SWEEP",
     }
-    capture_executable_market_snapshot(conn, **capture_args)
-    real_insert_compact = market_scanner_module.insert_compact_snapshot
+    first = capture_executable_market_snapshot(conn, **capture_args)
+    assert first["snapshot_persistence_tier"] == "full"
 
-    def fail_compact(*args, **kwargs):
-        raise sqlite3.OperationalError("disk full")
+    compact_capture = capture_executable_market_snapshot(conn, **capture_args)
+    assert compact_capture["snapshot_persistence_tier"] == "compact"
+    assert compact_capture["compact_snapshot_id"].startswith("emc2-")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM executable_market_snapshot_compact"
+    ).fetchone()[0] == 0
 
-    monkeypatch.setattr(
-        market_scanner_module,
-        "insert_compact_snapshot",
-        fail_compact,
-    )
-
-    with pytest.raises(sqlite3.OperationalError, match="disk full"):
-        capture_executable_market_snapshot(conn, **capture_args)
-    assert market_scanner_module._discovery_captures_since_keyframe == {}
-
-    monkeypatch.setattr(
-        market_scanner_module,
-        "insert_compact_snapshot",
-        real_insert_compact,
-    )
-    after_failure = capture_executable_market_snapshot(conn, **capture_args)
     next_capture = capture_executable_market_snapshot(conn, **capture_args)
-
-    assert after_failure["snapshot_persistence_tier"] == "compact"
     assert next_capture["capture_trigger"] == "KEYFRAME"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM executable_market_snapshot_compact"
+    ).fetchone()[0] == 0
 
 
 def test_discovery_capture_staleness_does_not_override_keyframe_interval(

@@ -490,6 +490,28 @@ def insert_snapshot(
     _inline_expire_executable_market_snapshots(conn)
 
 
+def compact_snapshot_id(snapshot: ExecutableMarketSnapshot) -> str:
+    """Deterministic ``emc2-`` id a compact row for ``snapshot`` would carry.
+
+    Pure function of snapshot identity/hash fields — no DB access, no
+    row written. Lets callers surface the id a compact write would have
+    produced without persisting the row (see ``insert_compact_snapshot``,
+    which uses the same derivation for the rows it does write).
+    """
+
+    return "emc2-" + hashlib.sha256(
+        "|".join(
+            (
+                snapshot.condition_id,
+                str(snapshot.selected_outcome_token_id or ""),
+                _dt(snapshot.captured_at),
+                snapshot.raw_orderbook_hash,
+                snapshot.snapshot_id,
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:40]
+
+
 def insert_compact_snapshot(
     conn: sqlite3.Connection,
     snapshot: ExecutableMarketSnapshot,
@@ -522,17 +544,7 @@ def insert_compact_snapshot(
     spread_usd: str | None = None
     if top_bid is not None and top_ask is not None:
         spread_usd = str(Decimal(top_ask) - Decimal(top_bid))
-    compact_id = "emc2-" + hashlib.sha256(
-        "|".join(
-            (
-                snapshot.condition_id,
-                str(snapshot.selected_outcome_token_id or ""),
-                _dt(snapshot.captured_at),
-                snapshot.raw_orderbook_hash,
-                snapshot.snapshot_id,
-            )
-        ).encode("utf-8")
-    ).hexdigest()[:40]
+    compact_id = compact_snapshot_id(snapshot)
     conn.execute(
         """
         INSERT INTO executable_market_snapshot_compact (

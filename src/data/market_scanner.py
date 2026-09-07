@@ -48,7 +48,7 @@ from src.contracts.executable_market_snapshot import (
     canonicalize_fee_details,
     fee_details_from_gamma_fee_schedule,
 )
-from src.state.snapshot_repo import insert_compact_snapshot, insert_snapshot
+from src.state.snapshot_repo import compact_snapshot_id, insert_snapshot
 from src.types import Bin
 from src.types.market import BinTopologyError, validate_bin_topology
 
@@ -3104,6 +3104,18 @@ def capture_executable_market_snapshot(
     NEVER tradeable at submission (assert_snapshot_executable rejects no-ask BUY).
     The trade-execution callers leave this False: a no-ask bin must abort capture
     on the order path, preserving the strict submit contract.
+
+    DISCOVERY_SWEEP branch: no row is written to
+    ``executable_market_snapshot_compact`` (it has no reader in ``src/``
+    and grows unbounded with no retention). The daemon-facing observables
+    that branch used to source from that table are instead derived live:
+    ``compact_snapshot_id`` is the same deterministic ``emc2-`` id
+    ``insert_compact_snapshot`` would have computed and stored,
+    ``prev_hash``/``hash_delta_ms`` come from the in-memory
+    ``_prev_orderbook_hash_by_market`` map, and keyframe rotation state
+    comes from ``executable_market_snapshot_latest`` via
+    ``_capture_policy_trigger`` — none of them ever depended on the
+    compact table.
     """
 
     side = str(execution_side or "BUY").strip().upper()
@@ -3401,13 +3413,18 @@ def capture_executable_market_snapshot(
     with persist_context as write_lease:
         try:
             if resolved_capture_trigger == "DISCOVERY_SWEEP":
-                persisted_id = insert_compact_snapshot(
-                    conn,
-                    snapshot,
-                    capture_trigger=resolved_capture_trigger,
-                    prev_hash=prior_hash,
-                    hash_delta_ms=hash_delta_ms,
-                )
+                # Discovery sweeps no longer persist a compact row: the
+                # table has no reader in src/ (only a growth-audit report
+                # script) and accumulates unbounded (~62k rows/day, no
+                # retention). Every observable this branch used to expose
+                # is derived without the write: the id is the same
+                # deterministic `emc2-` hash `insert_compact_snapshot`
+                # would have stored, and prev_hash/hash_delta_ms already
+                # come from the in-memory `_prev_orderbook_hash_by_market`
+                # map (independent of this table), and rotation state from
+                # `executable_market_snapshot_latest` via
+                # `_capture_policy_trigger`. No row is written.
+                persisted_id = compact_snapshot_id(snapshot)
                 persistence_tier = "compact"
             else:
                 insert_snapshot(
@@ -4998,6 +5015,9 @@ def refresh_executable_market_substrate_snapshots(
         condition_id = str(raw_condition_id or "").strip()
         if condition_id and condition_id not in priority_condition_rank:
             priority_condition_rank[condition_id] = len(priority_condition_rank)
+    # compact_inserted: kept as-is (consumed by callers/tests as a summary
+    # dict key); DISCOVERY_SWEEP captures no longer write a compact row, so
+    # this now counts compact-tier captures OBSERVED, not rows inserted.
     attempted = inserted = compact_inserted = skipped = failed = 0
     # cap_truncated counts outcomes dropped by per-city cap or budget (true
     # truncation).  skipped counts all filtered-out outcomes (missing cid,
