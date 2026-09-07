@@ -493,7 +493,7 @@ async def run(args: argparse.Namespace) -> None:
         subscribed = sorted(universe)
         try:
             async with websockets.connect(
-                WS_ENDPOINT, ping_interval=20, ping_timeout=None, max_size=16 * 1024 * 1024,
+                WS_ENDPOINT, ping_interval=20, ping_timeout=None, max_size=16 * 1024 * 1024, max_queue=512,
                 additional_headers={"User-Agent": USER_AGENT},
             ) as ws:
                 epoch += 1
