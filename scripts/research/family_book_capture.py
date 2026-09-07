@@ -493,7 +493,7 @@ async def run(args: argparse.Namespace) -> None:
         subscribed = sorted(universe)
         try:
             async with websockets.connect(
-                WS_ENDPOINT, ping_interval=30, ping_timeout=90, max_size=16 * 1024 * 1024,
+                WS_ENDPOINT, ping_interval=20, ping_timeout=None, max_size=16 * 1024 * 1024,
                 additional_headers={"User-Agent": USER_AGENT},
             ) as ws:
                 epoch += 1
@@ -508,6 +508,7 @@ async def run(args: argparse.Namespace) -> None:
                 connected_at_mono = time.monotonic()
                 last_health = connected_at_mono
                 last_ping = connected_at_mono
+                last_depth_sweep = connected_at_mono
                 steady_t0, steady_rows_at = None, None
                 quiet_ticks = 0
                 while stop_at is None or time.monotonic() < stop_at:
@@ -545,7 +546,9 @@ async def run(args: argparse.Namespace) -> None:
                     if now_mono - last_ping >= PING_INTERVAL_S:
                         await ws.send("PING")
                         last_ping = now_mono
-                    sink.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=now_mono, epoch=epoch)
+                    if now_mono - last_depth_sweep >= 1.0:
+                        sink.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=now_mono, epoch=epoch)
+                        last_depth_sweep = now_mono
                     if steady_t0 is None and now_mono - connected_at_mono >= 60.0:
                         steady_t0, steady_rows_at = now_mono, sink.rows_written  # after the subscribe snapshot burst
                     if now_mono - last_health >= HEALTH_INTERVAL_S:
