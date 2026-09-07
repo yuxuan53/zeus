@@ -33,6 +33,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from ingest_grib_to_snapshots import (  # type: ignore  # noqa: E402
     LOW_LOCAL_DAY_MIN_INTERVAL_EVIDENCE_REVISION,
     SourceRunContext,
+    _canonical_json_sha256,
     _low_local_day_min_interval_evidence,
     ingest_json_file,
     ingest_track,
@@ -403,7 +404,16 @@ def test_minority_low_boundary_normalizes_into_current_evidence_shape(tmp_path: 
     assert sum(value is None for value in persisted_members) == 2
     assert persisted_members[2] == 28.02
     provenance = json.loads(row["provenance_json"])
-    normalization = provenance["boundary_normalization"]
+    assert "boundary_normalization" not in provenance
+    assert "low_local_day_min_interval_evidence" not in provenance
+
+    # boundary_normalization and low_local_day_min_interval_evidence are no longer
+    # persisted as full blobs (reader-inert, ~9.7 KB/row combined); provenance_json
+    # carries only their content fingerprints. Recompute the full evidence in-memory
+    # from the same raw payload the ingester consumed and assert content there,
+    # then assert the persisted fingerprints match that computation.
+    normalized = normalize_low_boundary_evidence(payload)
+    normalization = normalized["boundary_normalization"]
     assert normalization["semantics_revision"] == LOW_BOUNDARY_SEMANTICS_REVISION
     assert normalization["artifact_manifest_sha256"] == "2" * 64
     assert len(normalization["raw_evidence_sha256"]) == 64
@@ -418,7 +428,12 @@ def test_minority_low_boundary_normalizes_into_current_evidence_shape(tmp_path: 
         "decision": "quarantined",
         "reason": "quarantined_boundary_strictly_lower",
     }
-    interval_evidence = provenance["low_local_day_min_interval_evidence"]
+    assert provenance["boundary_normalization_sha256"] == _canonical_json_sha256(
+        normalization
+    )
+
+    interval_evidence = _low_local_day_min_interval_evidence(normalized)
+    assert interval_evidence is not None
     assert interval_evidence["semantics_revision"] == (
         LOW_LOCAL_DAY_MIN_INTERVAL_EVIDENCE_REVISION
     )
@@ -444,6 +459,14 @@ def test_minority_low_boundary_normalizes_into_current_evidence_shape(tmp_path: 
     assert interval_evidence["member_records"][2]["lower_native_unit"] == 28.02
     assert interval_evidence["member_records"][2]["upper_native_unit"] == 28.02
     assert len(interval_evidence["identity_sha256"]) == 64
+    assert (
+        provenance["low_local_day_min_interval_evidence_sha256"]
+        == interval_evidence["identity_sha256"]
+    )
+    assert (
+        provenance["low_local_day_min_interval_member_count"]
+        == interval_evidence["member_count"]
+    )
 
     from src.data.replacement_forecast_materializer import _read_current_evidence_shape
 
@@ -573,7 +596,11 @@ def test_invalid_low_boundary_member_fails_closed_end_to_end(tmp_path: Path) -> 
     assert persisted_members[48] is None
     assert persisted_members[49] is None
     assert persisted_members[50] is None
-    normalization = json.loads(row["provenance_json"])["boundary_normalization"]
+    provenance = json.loads(row["provenance_json"])
+    assert "boundary_normalization" not in provenance
+    assert "low_local_day_min_interval_evidence" not in provenance
+    normalized = normalize_low_boundary_evidence(payload)
+    normalization = normalized["boundary_normalization"]
     assert normalization["invalid_member_ids"] == [48, 49, 50]
     assert normalization["member_decisions"][48] == {
         "member": 48,
@@ -590,9 +617,20 @@ def test_invalid_low_boundary_member_fails_closed_end_to_end(tmp_path: Path) -> 
         "decision": "invalid",
         "reason": "invalid_nonfinite_inner_min",
     }
-    interval_evidence = json.loads(row["provenance_json"])[
-        "low_local_day_min_interval_evidence"
-    ]
+    assert provenance["boundary_normalization_sha256"] == _canonical_json_sha256(
+        normalization
+    )
+
+    interval_evidence = _low_local_day_min_interval_evidence(normalized)
+    assert interval_evidence is not None
+    assert (
+        provenance["low_local_day_min_interval_evidence_sha256"]
+        == interval_evidence["identity_sha256"]
+    )
+    assert (
+        provenance["low_local_day_min_interval_member_count"]
+        == interval_evidence["member_count"]
+    )
     for member_id in (48, 49, 50):
         record = interval_evidence["member_records"][member_id]
         assert record["lower_native_unit"] is None
@@ -634,11 +672,9 @@ def test_exact_low_boundary_majority_fails_closed_end_to_end(tmp_path: Path) -> 
     """The canonical 26/51 threshold blocks DB contribution and selection."""
 
     conn = _conn()
+    payload = _low_boundary_payload(ambiguous_count=26)
     path = tmp_path / "majority_low_snapshot.json"
-    path.write_text(
-        json.dumps(_low_boundary_payload(ambiguous_count=26)),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
     status = ingest_json_file(
         conn,
@@ -661,11 +697,22 @@ def test_exact_low_boundary_majority_fails_closed_end_to_end(tmp_path: Path) -> 
     assert row["contributes_to_target_extrema"] == 0
     persisted_members = json.loads(row["members_json"])
     assert sum(value is None for value in persisted_members) == 26
-    interval_evidence = json.loads(row["provenance_json"])[
-        "low_local_day_min_interval_evidence"
-    ]
+    provenance = json.loads(row["provenance_json"])
+    assert "low_local_day_min_interval_evidence" not in provenance
+    interval_evidence = _low_local_day_min_interval_evidence(
+        normalize_low_boundary_evidence(payload)
+    )
+    assert interval_evidence is not None
     assert len(interval_evidence["member_records"]) == 51
     assert sum(record["status"] == "INTERVAL" for record in interval_evidence["member_records"]) == 26
+    assert (
+        provenance["low_local_day_min_interval_evidence_sha256"]
+        == interval_evidence["identity_sha256"]
+    )
+    assert (
+        provenance["low_local_day_min_interval_member_count"]
+        == interval_evidence["member_count"]
+    )
     assert row["training_allowed"] == 0
     assert row["causality_status"] == "REJECTED_BOUNDARY_AMBIGUOUS"
 
@@ -742,11 +789,20 @@ def test_low_ingest_uses_metric_and_selected_range_fallback_for_interval_evidenc
 
     assert status == "written"
     row = conn.execute("SELECT provenance_json FROM ensemble_snapshots").fetchone()
-    evidence = json.loads(row["provenance_json"])[
-        "low_local_day_min_interval_evidence"
-    ]
+    provenance = json.loads(row["provenance_json"])
+    assert "low_local_day_min_interval_evidence" not in provenance
+    evidence = _low_local_day_min_interval_evidence(
+        normalize_low_boundary_evidence({**payload, "temperature_metric": "low"}),
+        temperature_metric="low",
+    )
+    assert evidence is not None
     assert evidence["selected_step_ranges_inner"] == ["54-60"]
     assert evidence["member_count"] == 51
+    assert (
+        provenance["low_local_day_min_interval_evidence_sha256"]
+        == evidence["identity_sha256"]
+    )
+    assert provenance["low_local_day_min_interval_member_count"] == evidence["member_count"]
 
 
 def test_low_ingest_canonicalizes_missing_metric_before_no_boundary_normalization(
@@ -779,14 +835,24 @@ def test_low_ingest_canonicalizes_missing_metric_before_no_boundary_normalizatio
 
     assert status == "written"
     row = conn.execute("SELECT provenance_json FROM ensemble_snapshots").fetchone()
-    records = json.loads(row["provenance_json"])[
-        "low_local_day_min_interval_evidence"
-    ]["member_records"]
+    provenance = json.loads(row["provenance_json"])
+    assert "low_local_day_min_interval_evidence" not in provenance
+    evidence = _low_local_day_min_interval_evidence(
+        normalize_low_boundary_evidence({**payload, "temperature_metric": "low"}),
+        temperature_metric="low",
+    )
+    assert evidence is not None
+    records = evidence["member_records"]
     assert len(records) == 51
     assert {record["status"] for record in records} == {"EXACT"}
     assert {record["reason"] for record in records} == {
         "accepted_no_boundary_window"
     }
+    assert (
+        provenance["low_local_day_min_interval_evidence_sha256"]
+        == evidence["identity_sha256"]
+    )
+    assert provenance["low_local_day_min_interval_member_count"] == evidence["member_count"]
 
 
 def test_low_interval_provenance_identity_is_json_deterministic() -> None:
