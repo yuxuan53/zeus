@@ -2581,6 +2581,294 @@ def test_single_runs_payload_cache_persists_across_process_restart(
 
 
 # =====================================================================================
+# QUOTA round 3 follow-up (2026-09-06): the exact cache key is keyed on
+# (om_ids, run, lat, lon, tz, forecast_hours, past_hours), so day0's forecast_hours=72,
+# past_hours=1 request and the BPF extra-raw-inputs forecast_hours=120, past_hours=0
+# request for the SAME (model, run, location) never hit each other's cache entry --
+# 227 + 167 of ~800 daily calls on this label were this exact pair (measured
+# 2026-09-06). These two real payloads (from the live single-runs payload cache file,
+# public Open-Meteo weather data) are a genuine identity pair: same model, run, and
+# location -- one fetched with forecast_hours=72, the other with forecast_hours=120 --
+# so the 72-h payload is byte-identical to the correct slice of the 120-h payload,
+# which is the equality proof the superset rule must satisfy.
+# =====================================================================================
+import json as _json  # noqa: E402
+
+_KOLKATA_120H_PAYLOAD = _json.loads(
+    '{"elevation": 123.0, "generationtime_ms": 0.08666515350341797, "hourly": '
+    '{"temperature_2m": [24.8, 24.6, 25.3, 26.6, 27.9, 28.2, 29.4, 29.8, 30.3, 26.6, '
+    '26.1, 27.0, 26.7, 26.1, 26.0, 26.0, 26.0, 25.9, 25.8, 25.7, 25.8, 25.6, 25.4, '
+    '25.1, 24.6, 24.5, 25.0, 25.8, 26.5, 28.2, 29.1, 30.1, 31.0, 31.1, 30.8, 30.3, '
+    '29.1, 27.7, 27.1, 26.7, 26.5, 26.1, 25.7, 25.6, 25.2, 25.3, 25.2, 25.1, 25.1, '
+    '25.4, 25.5, 26.6, 28.5, 29.5, 30.4, 30.6, 31.0, 31.0, 30.7, 26.7, 27.2, 27.0, '
+    '26.8, 26.8, 26.5, 25.5, 25.3, 24.8, 24.8, 24.5, 24.4, 24.3, 24.2, 24.5, 25.4, '
+    '26.7, 27.9, 29.1, 30.2, 30.4, 30.2, 28.0, 26.9, 27.0, 26.0, 25.5, 25.6, 25.7, '
+    '25.6, 25.4, 25.4, 25.4, 25.4, 25.5, 25.4, 25.3, 25.4, 25.5, 25.8, 26.4, 27.4, '
+    '28.6, 29.6, 30.2, 30.5, 30.5, 29.9, 28.9, 28.1, 27.7, 27.4, 27.1, 26.6, 26.2, '
+    '25.8, 25.4, 25.1, 25.0, 25.0, 25.2], "time": ["2026-09-07T05:30", '
+    '"2026-09-07T06:30", "2026-09-07T07:30", "2026-09-07T08:30", "2026-09-07T09:30", '
+    '"2026-09-07T10:30", "2026-09-07T11:30", "2026-09-07T12:30", "2026-09-07T13:30", '
+    '"2026-09-07T14:30", "2026-09-07T15:30", "2026-09-07T16:30", "2026-09-07T17:30", '
+    '"2026-09-07T18:30", "2026-09-07T19:30", "2026-09-07T20:30", "2026-09-07T21:30", '
+    '"2026-09-07T22:30", "2026-09-07T23:30", "2026-09-08T00:30", "2026-09-08T01:30", '
+    '"2026-09-08T02:30", "2026-09-08T03:30", "2026-09-08T04:30", "2026-09-08T05:30", '
+    '"2026-09-08T06:30", "2026-09-08T07:30", "2026-09-08T08:30", "2026-09-08T09:30", '
+    '"2026-09-08T10:30", "2026-09-08T11:30", "2026-09-08T12:30", "2026-09-08T13:30", '
+    '"2026-09-08T14:30", "2026-09-08T15:30", "2026-09-08T16:30", "2026-09-08T17:30", '
+    '"2026-09-08T18:30", "2026-09-08T19:30", "2026-09-08T20:30", "2026-09-08T21:30", '
+    '"2026-09-08T22:30", "2026-09-08T23:30", "2026-09-09T00:30", "2026-09-09T01:30", '
+    '"2026-09-09T02:30", "2026-09-09T03:30", "2026-09-09T04:30", "2026-09-09T05:30", '
+    '"2026-09-09T06:30", "2026-09-09T07:30", "2026-09-09T08:30", "2026-09-09T09:30", '
+    '"2026-09-09T10:30", "2026-09-09T11:30", "2026-09-09T12:30", "2026-09-09T13:30", '
+    '"2026-09-09T14:30", "2026-09-09T15:30", "2026-09-09T16:30", "2026-09-09T17:30", '
+    '"2026-09-09T18:30", "2026-09-09T19:30", "2026-09-09T20:30", "2026-09-09T21:30", '
+    '"2026-09-09T22:30", "2026-09-09T23:30", "2026-09-10T00:30", "2026-09-10T01:30", '
+    '"2026-09-10T02:30", "2026-09-10T03:30", "2026-09-10T04:30", "2026-09-10T05:30", '
+    '"2026-09-10T06:30", "2026-09-10T07:30", "2026-09-10T08:30", "2026-09-10T09:30", '
+    '"2026-09-10T10:30", "2026-09-10T11:30", "2026-09-10T12:30", "2026-09-10T13:30", '
+    '"2026-09-10T14:30", "2026-09-10T15:30", "2026-09-10T16:30", "2026-09-10T17:30", '
+    '"2026-09-10T18:30", "2026-09-10T19:30", "2026-09-10T20:30", "2026-09-10T21:30", '
+    '"2026-09-10T22:30", "2026-09-10T23:30", "2026-09-11T00:30", "2026-09-11T01:30", '
+    '"2026-09-11T02:30", "2026-09-11T03:30", "2026-09-11T04:30", "2026-09-11T05:30", '
+    '"2026-09-11T06:30", "2026-09-11T07:30", "2026-09-11T08:30", "2026-09-11T09:30", '
+    '"2026-09-11T10:30", "2026-09-11T11:30", "2026-09-11T12:30", "2026-09-11T13:30", '
+    '"2026-09-11T14:30", "2026-09-11T15:30", "2026-09-11T16:30", "2026-09-11T17:30", '
+    '"2026-09-11T18:30", "2026-09-11T19:30", "2026-09-11T20:30", "2026-09-11T21:30", '
+    '"2026-09-11T22:30", "2026-09-11T23:30", "2026-09-12T00:30", "2026-09-12T01:30", '
+    '"2026-09-12T02:30", "2026-09-12T03:30", "2026-09-12T04:30"]}, "hourly_units": '
+    '{"temperature_2m": "\\u00b0C", "time": "iso8601"}, "latitude": 26.74868, '
+    '"longitude": 80.840706, "timezone": "Asia/Kolkata", "timezone_abbreviation": '
+    '"GMT+5:30", "utc_offset_seconds": 19800}'
+)
+
+# The native 72-h payload for the SAME (model, run, location) -- fetched separately by
+# day0's own request shape. Differs from a slice of the 120-h payload above in exactly
+# one field: generationtime_ms (server-side per-request processing time, never a
+# function of the request's own parameters -- present on every Open-Meteo response and
+# never reused across two genuinely separate HTTP responses for the same identity).
+_KOLKATA_72H_PAYLOAD = _json.loads(
+    '{"elevation": 123.0, "generationtime_ms": 0.8851289749145508, "hourly": '
+    '{"temperature_2m": [24.8, 24.6, 25.3, 26.6, 27.9, 28.2, 29.4, 29.8, 30.3, 26.6, '
+    '26.1, 27.0, 26.7, 26.1, 26.0, 26.0, 26.0, 25.9, 25.8, 25.7, 25.8, 25.6, 25.4, '
+    '25.1, 24.6, 24.5, 25.0, 25.8, 26.5, 28.2, 29.1, 30.1, 31.0, 31.1, 30.8, 30.3, '
+    '29.1, 27.7, 27.1, 26.7, 26.5, 26.1, 25.7, 25.6, 25.2, 25.3, 25.2, 25.1, 25.1, '
+    '25.4, 25.5, 26.6, 28.5, 29.5, 30.4, 30.6, 31.0, 31.0, 30.7, 26.7, 27.2, 27.0, '
+    '26.8, 26.8, 26.5, 25.5, 25.3, 24.8, 24.8, 24.5, 24.4, 24.3], "time": '
+    '["2026-09-07T05:30", "2026-09-07T06:30", "2026-09-07T07:30", "2026-09-07T08:30", '
+    '"2026-09-07T09:30", "2026-09-07T10:30", "2026-09-07T11:30", "2026-09-07T12:30", '
+    '"2026-09-07T13:30", "2026-09-07T14:30", "2026-09-07T15:30", "2026-09-07T16:30", '
+    '"2026-09-07T17:30", "2026-09-07T18:30", "2026-09-07T19:30", "2026-09-07T20:30", '
+    '"2026-09-07T21:30", "2026-09-07T22:30", "2026-09-07T23:30", "2026-09-08T00:30", '
+    '"2026-09-08T01:30", "2026-09-08T02:30", "2026-09-08T03:30", "2026-09-08T04:30", '
+    '"2026-09-08T05:30", "2026-09-08T06:30", "2026-09-08T07:30", "2026-09-08T08:30", '
+    '"2026-09-08T09:30", "2026-09-08T10:30", "2026-09-08T11:30", "2026-09-08T12:30", '
+    '"2026-09-08T13:30", "2026-09-08T14:30", "2026-09-08T15:30", "2026-09-08T16:30", '
+    '"2026-09-08T17:30", "2026-09-08T18:30", "2026-09-08T19:30", "2026-09-08T20:30", '
+    '"2026-09-08T21:30", "2026-09-08T22:30", "2026-09-08T23:30", "2026-09-09T00:30", '
+    '"2026-09-09T01:30", "2026-09-09T02:30", "2026-09-09T03:30", "2026-09-09T04:30", '
+    '"2026-09-09T05:30", "2026-09-09T06:30", "2026-09-09T07:30", "2026-09-09T08:30", '
+    '"2026-09-09T09:30", "2026-09-09T10:30", "2026-09-09T11:30", "2026-09-09T12:30", '
+    '"2026-09-09T13:30", "2026-09-09T14:30", "2026-09-09T15:30", "2026-09-09T16:30", '
+    '"2026-09-09T17:30", "2026-09-09T18:30", "2026-09-09T19:30", "2026-09-09T20:30", '
+    '"2026-09-09T21:30", "2026-09-09T22:30", "2026-09-09T23:30", "2026-09-10T00:30", '
+    '"2026-09-10T01:30", "2026-09-10T02:30", "2026-09-10T03:30", "2026-09-10T04:30"]}, '
+    '"hourly_units": {"temperature_2m": "\\u00b0C", "time": "iso8601"}, "latitude": '
+    '26.74868, "longitude": 80.840706, "timezone": "Asia/Kolkata", '
+    '"timezone_abbreviation": "GMT+5:30", "utc_offset_seconds": 19800}'
+)
+
+# Both real payloads' first hourly row is run+0h local ("2026-09-07T05:30" local,
+# utc_offset_seconds=19800 => run = 2026-09-07T00:00 UTC) even though the 72-h payload
+# came from a past_hours=1 request -- the requested past hour is never present in the
+# stored time axis. This is the live confirmation of the past_hours evidence: the
+# superset rule is forecast_hours-only.
+_KOLKATA_RUN = datetime(2026, 9, 7, 0, 0, tzinfo=UTC)
+_KOLKATA_LOCATION = (26.74868, 80.840706, "Asia/Kolkata", (date(2026, 9, 8),))
+
+
+def test_single_runs_superset_slice_is_byte_identical_to_native_small_payload(
+    monkeypatch,
+) -> None:
+    """(equality proof) A cached forecast_hours=120 payload must serve a
+    forecast_hours=72, past_hours=1 request with a slice that is byte-identical, field
+    by field, to the REAL 72-h payload fetched independently for the same identity --
+    except the one field that legitimately differs between any two separate HTTP
+    responses: generationtime_ms."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _KOLKATA_120H_PAYLOAD
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    # Warm the cache with the 120-h superset (the BPF extra-raw-inputs shape).
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"],
+        locations=[_KOLKATA_LOCATION],
+        run=_KOLKATA_RUN,
+        forecast_hours=120,
+    )
+    assert len(calls) == 1
+
+    # day0's shape: forecast_hours=72, past_hours=1, same model/run/location. Must be
+    # served from the superset -- zero further HTTP calls.
+    (sliced,) = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"],
+        locations=[_KOLKATA_LOCATION],
+        run=_KOLKATA_RUN,
+        forecast_hours=72,
+        past_hours=1,
+    )
+
+    assert len(calls) == 1, "the 72-h request must be a superset hit, not a second HTTP GET"
+
+    expected = _KOLKATA_72H_PAYLOAD
+    all_keys = set(sliced) | set(expected)
+    differing_fields = {k for k in all_keys if sliced.get(k) != expected.get(k)}
+    assert differing_fields == {"generationtime_ms"}, (
+        f"unexpected field differences between the superset slice and the native "
+        f"72-h payload: {differing_fields}"
+    )
+    assert sliced["hourly"]["time"] == expected["hourly"]["time"]
+    assert sliced["hourly"]["temperature_2m"] == expected["hourly"]["temperature_2m"]
+    assert sliced["hourly_units"] == expected["hourly_units"]
+    for field in ("latitude", "longitude", "timezone", "timezone_abbreviation", "elevation", "utc_offset_seconds"):
+        assert sliced[field] == expected[field]
+
+
+def test_single_runs_superset_never_served_from_a_smaller_cached_window(
+    monkeypatch,
+) -> None:
+    """(b) A cached forecast_hours=72 payload must NOT serve a forecast_hours=120
+    request -- a smaller cached window is not a superset of a larger request."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        if int(params.get("forecast_hours", 0)) == 72:
+            return _KOLKATA_72H_PAYLOAD
+        return _KOLKATA_120H_PAYLOAD
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"],
+        locations=[_KOLKATA_LOCATION],
+        run=_KOLKATA_RUN,
+        forecast_hours=72,
+        past_hours=1,
+    )
+    assert len(calls) == 1
+
+    (payload_120,) = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"],
+        locations=[_KOLKATA_LOCATION],
+        run=_KOLKATA_RUN,
+        forecast_hours=120,
+    )
+
+    assert len(calls) == 2, "a smaller cached window must not serve the larger request"
+    assert len(payload_120["hourly"]["time"]) == 120
+
+
+def test_single_runs_superset_hit_does_not_create_a_new_cache_entry(monkeypatch) -> None:
+    """The FIX spec requires one immutable superset per identity: a superset-derived
+    slice must never be stored as its own cache entry."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    monkeypatch.setattr(client, "fetch", lambda *_a, **_k: _KOLKATA_120H_PAYLOAD)
+
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_KOLKATA_LOCATION], run=_KOLKATA_RUN, forecast_hours=120,
+    )
+    before = set(dl._SINGLE_RUNS_PAYLOAD_CACHE)
+
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_KOLKATA_LOCATION], run=_KOLKATA_RUN,
+        forecast_hours=72, past_hours=1,
+    )
+    after = set(dl._SINGLE_RUNS_PAYLOAD_CACHE)
+
+    assert after == before, "a superset slice must not be persisted as a new cache entry"
+
+
+def test_single_runs_payload_cache_persisted_format_unchanged_by_superset(
+    monkeypatch, tmp_path,
+) -> None:
+    """(c) The superset index is process-local bookkeeping only -- the durable JSON
+    format (schema_version, entries{key: {payload, recorded_at}}) must be unchanged."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    cache_path = tmp_path / "single_runs_payload_cache.json"
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_path", lambda: cache_path)
+
+    monkeypatch.setattr(client, "fetch", lambda *_a, **_k: _KOLKATA_120H_PAYLOAD)
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_KOLKATA_LOCATION], run=_KOLKATA_RUN, forecast_hours=120,
+    )
+
+    on_disk = _json.loads(cache_path.read_text(encoding="utf-8"))
+    assert set(on_disk) == {"schema_version", "entries"}
+    assert on_disk["schema_version"] == dl._SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION
+    assert len(on_disk["entries"]) == 1
+    (entry,) = on_disk["entries"].values()
+    assert set(entry) == {"payload", "recorded_at"}
+    assert entry["payload"] == _KOLKATA_120H_PAYLOAD
+
+
+def test_single_runs_payload_cache_superset_index_rebuilt_on_load(
+    monkeypatch, tmp_path,
+) -> None:
+    """(d) A second process (fresh in-memory index) must rebuild the superset index
+    purely from a reload of the persisted file, and serve a smaller request from the
+    previously-persisted larger payload with zero HTTP calls."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    cache_path = tmp_path / "single_runs_payload_cache.json"
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_path", lambda: cache_path)
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _KOLKATA_120H_PAYLOAD
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_KOLKATA_LOCATION], run=_KOLKATA_RUN, forecast_hours=120,
+    )
+    assert len(calls) == 1
+
+    # Simulate a fresh process: clear every in-memory structure, keep only the file.
+    dl._SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.clear()
+    dl._load_persisted_single_runs_payload_cache(force=True)
+
+    assert dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX, "the index must be rebuilt from the loaded file"
+
+    (sliced,) = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_KOLKATA_LOCATION], run=_KOLKATA_RUN,
+        forecast_hours=72, past_hours=1,
+    )
+
+    assert len(calls) == 1, "the rebuilt index must serve the smaller request without HTTP"
+    assert sliced["hourly"]["time"] == _KOLKATA_72H_PAYLOAD["hourly"]["time"]
+
+
+# =====================================================================================
 # QUOTA round 5 (2026-09-06): previous_runs beyond a short-range model's horizon is
 # HTTP 200 + all-null, so nothing persists and the immutable skip re-fires forever.
 # =====================================================================================

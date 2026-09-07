@@ -790,6 +790,25 @@ _SINGLE_RUNS_PAYLOAD_CACHE_MAX_AGE_HOURS = 24.0
 _single_runs_payload_cache_state_path: Path | None = None
 _single_runs_payload_cache_last_loaded_monotonic: float = 0.0
 
+# 2026-09-06 (quota round 3 follow-up): a payload fetched with a LARGER forecast_hours
+# window is a superset of the identical (om_ids, run, lat, lon, tz) request with a
+# smaller forecast_hours -- the smaller request's rows are the superset's leading rows
+# (see _fetch_single_runs_hourly_payloads_batched's docstring for the past_hours
+# evidence). This index lets a smaller request find a cached larger payload without
+# scanning the whole cache: identity_key (om_ids-agnostic: run/lat/lon/tz only) ->
+# [(forecast_hours, past_hours, cache_key), ...]. om_ids is deliberately excluded from
+# the identity key because a single-model payload's own bytes never name the model
+# (bare "temperature_2m", no om_id suffix) -- entries recovered from a persisted file
+# written by a sibling process cannot recover om_ids from the payload alone. Safety
+# does not depend on recovering it: a candidate is only ever served after recomputing
+# _single_runs_payload_cache_key with the REQUESTER's own om_ids and confirming it
+# equals the candidate's actual cache key (a SHA-256 match), so a wrong-model candidate
+# can never be served -- it just fails verification and falls through to a normal fetch.
+_SINGLE_RUNS_PAYLOAD_CACHE_INDEX: dict[str, list[tuple[int, int, str]]] = {}
+# Cache keys already folded into the index above, so repeated 30s reloads of the
+# persisted file don't append duplicate tuples for the same entry.
+_SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS: set[str] = set()
+
 
 def _single_runs_payload_cache_persistence_enabled() -> bool:
     """Mirror _exact_run_gap_memo_persistence_enabled: no file I/O under test."""
@@ -831,6 +850,87 @@ def _single_runs_payload_cache_key(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
+def _single_runs_payload_identity_key(
+    *,
+    run_iso: str,
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+) -> str:
+    """The om_ids-agnostic half of the cache key -- see the superset index comment."""
+    canonical = "|".join((
+        run_iso,
+        f"{float(latitude):.6f}",
+        f"{float(longitude):.6f}",
+        timezone_name,
+    ))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _index_single_runs_payload_cache_entry(
+    key: str,
+    *,
+    identity_key: str,
+    forecast_hours: int,
+    past_hours: int,
+) -> None:
+    if key in _SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS:
+        return
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEX.setdefault(identity_key, []).append(
+        (int(forecast_hours), int(past_hours), key)
+    )
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.add(key)
+
+
+def _recover_single_runs_payload_identity(
+    payload: Mapping[str, object],
+) -> tuple[str, int] | None:
+    """Recover (identity_key, forecast_hours) from a persisted payload's own bytes.
+
+    om_ids cannot be recovered this way (see the index comment) and is not attempted
+    here; the caller-side hash-verification step is what makes that safe. past_hours
+    also cannot be recovered (never visible in the returned time axis -- see
+    _fetch_single_runs_hourly_payloads_batched) so callers must treat it as 0, which is
+    the true value for every payload large enough to ever serve as a superset donor in
+    this codebase (forecast_hours=120, past_hours=0).
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, Mapping):
+        return None
+    time_list = hourly.get("time")
+    if not isinstance(time_list, list) or not time_list:
+        return None
+    latitude = payload.get("latitude")
+    longitude = payload.get("longitude")
+    timezone_name = payload.get("timezone")
+    utc_offset_seconds = payload.get("utc_offset_seconds")
+    if (
+        not isinstance(latitude, (int, float))
+        or not isinstance(longitude, (int, float))
+        or not isinstance(timezone_name, str)
+        or not isinstance(utc_offset_seconds, (int, float))
+    ):
+        return None
+    try:
+        first_local = datetime.strptime(str(time_list[0]), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+    # local = UTC + offset, and the first hourly row is run+0h (see the past_hours
+    # evidence in _fetch_single_runs_hourly_payloads_batched's docstring), so this
+    # recovers the exact run_iso string the original request used.
+    run_utc = first_local - timedelta(seconds=float(utc_offset_seconds))
+    run_iso = run_utc.strftime("%Y-%m-%dT%H:%M")
+    identity_key = _single_runs_payload_identity_key(
+        run_iso=run_iso,
+        latitude=latitude,
+        longitude=longitude,
+        timezone_name=timezone_name,
+    )
+    return identity_key, len(time_list)
+
+
 def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
     """Merge durably-cached payloads from disk into the in-process cache.
 
@@ -861,7 +961,18 @@ def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
         raw_payload = entry.get("payload")
         if not isinstance(raw_payload, dict):
             continue
-        _SINGLE_RUNS_PAYLOAD_CACHE.setdefault(str(key), raw_payload)
+        str_key = str(key)
+        _SINGLE_RUNS_PAYLOAD_CACHE.setdefault(str_key, raw_payload)
+        # Fold this entry into the superset index using only what its own bytes prove
+        # (run/lat/lon/tz/forecast_hours) -- see _recover_single_runs_payload_identity
+        # and the index comment for why om_ids is not, and does not need to be, part
+        # of this recovery.
+        recovered = _recover_single_runs_payload_identity(raw_payload)
+        if recovered is not None:
+            identity_key, forecast_hours = recovered
+            _index_single_runs_payload_cache_entry(
+                str_key, identity_key=identity_key, forecast_hours=forecast_hours, past_hours=0
+            )
 
 
 def _payload_cache_entry_expired(entry: Mapping[str, object], age_floor: datetime) -> bool:
@@ -877,10 +988,27 @@ def _payload_cache_entry_expired(entry: Mapping[str, object], age_floor: datetim
     return recorded < age_floor
 
 
-def _store_single_runs_payload_cache(key: str, payload: Mapping[str, object]) -> None:
-    """Cache one fetched payload in-process and, when enabled, durably."""
+def _store_single_runs_payload_cache(
+    key: str,
+    payload: Mapping[str, object],
+    *,
+    identity_key: str | None = None,
+    forecast_hours: int | None = None,
+    past_hours: int | None = None,
+) -> None:
+    """Cache one fetched payload in-process and, when enabled, durably.
+
+    identity_key/forecast_hours/past_hours are optional: only the caller that already
+    knows the full request identity (_fetch_single_runs_hourly_payloads_batched) passes
+    them, to fold this entry into the superset index immediately rather than waiting
+    for a later reload to recover it from disk.
+    """
     stored = copy.deepcopy(dict(payload))
     _SINGLE_RUNS_PAYLOAD_CACHE[key] = stored
+    if identity_key is not None and forecast_hours is not None and past_hours is not None:
+        _index_single_runs_payload_cache_entry(
+            key, identity_key=identity_key, forecast_hours=forecast_hours, past_hours=past_hours
+        )
     if not _single_runs_payload_cache_persistence_enabled():
         return
     path = _single_runs_payload_cache_path()
@@ -1584,6 +1712,88 @@ def _default_live_fetch_locations_batched(
         ]
 
 
+def _slice_single_runs_payload(
+    payload: Mapping[str, object], *, forecast_hours: int
+) -> dict[str, object]:
+    """Derive the payload a forecast_hours=`forecast_hours` request would have returned
+    from a cached payload for a LARGER forecast_hours at the same identity.
+
+    Every hourly array (the time axis and every per-model temperature series) is
+    front-aligned on the run: the superset's row 0 is run+0h, same as the smaller
+    request's row 0 (see the past_hours evidence in the caller's docstring), so the
+    requested window is exactly the superset's first `forecast_hours` rows. Non-hourly
+    metadata (elevation, generationtime_ms, latitude, longitude, timezone,
+    timezone_abbreviation, utc_offset_seconds, hourly_units) is carried over verbatim --
+    none of those fields echo the request window in the payloads this cache has ever
+    stored. Defensively drops forecast_hours/past_hours keys if a payload ever does
+    carry a request echo, since a sliced payload must not claim the superset's window.
+    """
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, Mapping):
+        raise ValueError("BAYES_PRECISION_FUSION superset payload missing hourly")
+    time_list = hourly.get("time")
+    if not isinstance(time_list, list) or len(time_list) < forecast_hours:
+        raise ValueError("BAYES_PRECISION_FUSION superset payload shorter than requested window")
+    sliced: dict[str, object] = copy.deepcopy(
+        {k: v for k, v in payload.items() if k != "hourly"}
+    )
+    sliced.pop("forecast_hours", None)
+    sliced.pop("past_hours", None)
+    sliced["hourly"] = {
+        variable: (list(values[:forecast_hours]) if isinstance(values, list) else copy.deepcopy(values))
+        for variable, values in hourly.items()
+    }
+    return sliced
+
+
+def _lookup_single_runs_superset_payload(
+    *,
+    om_ids: tuple[str, ...],
+    run_iso: str,
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+    forecast_hours: int,
+    past_hours: int,
+    identity_key: str,
+) -> dict[str, object] | None:
+    """Find a cached payload for a >= forecast_hours window at the same identity.
+
+    Candidates come from the om_ids-agnostic index, so a candidate is only trusted
+    after recomputing _single_runs_payload_cache_key with THIS request's own om_ids and
+    the candidate's (forecast_hours, past_hours) and confirming it equals the
+    candidate's real cache key -- see the index comment for why that check, not
+    recovered om_ids, is what makes this safe.
+    """
+    candidates = _SINGLE_RUNS_PAYLOAD_CACHE_INDEX.get(identity_key)
+    if not candidates:
+        return None
+    for cand_forecast_hours, cand_past_hours, cand_key in sorted(candidates, key=lambda c: c[0]):
+        if cand_forecast_hours < forecast_hours:
+            continue
+        verify_key = _single_runs_payload_cache_key(
+            om_ids=om_ids,
+            run_iso=run_iso,
+            latitude=latitude,
+            longitude=longitude,
+            timezone_name=timezone_name,
+            forecast_hours=cand_forecast_hours,
+            past_hours=cand_past_hours,
+        )
+        if verify_key != cand_key:
+            continue
+        donor = _SINGLE_RUNS_PAYLOAD_CACHE.get(cand_key)
+        if donor is None:
+            continue
+        if cand_forecast_hours == forecast_hours:
+            return copy.deepcopy(donor)
+        try:
+            return _slice_single_runs_payload(donor, forecast_hours=forecast_hours)
+        except ValueError:
+            continue
+    return None
+
+
 def _fetch_single_runs_hourly_payloads_batched(
     *,
     models: Sequence[str],
@@ -1605,6 +1815,26 @@ def _fetch_single_runs_hourly_payloads_batched(
     succeeded) at zero HTTP cost. Locations not already cached are fetched together in
     ONE reduced multi-location call, preserving the exact request/response shape of the
     uncached transport below.
+
+    SUPERSET CACHE (2026-09-06, quota round 3 follow-up): day0 requests
+    forecast_hours=72, past_hours=1; the BPF extra-raw-inputs path requests
+    forecast_hours=120, past_hours=0. Both are otherwise the same (model-set, run,
+    location) request, but the exact cache key differs on forecast_hours/past_hours, so
+    neither caller's fetch was ever a hit for the other's -- 227 + 167 of ~800 daily
+    calls on this label were this exact pair (measured 2026-09-06).
+
+    PAST_HOURS EVIDENCE: cached 72-h payloads (day0's request shape) and 120-h
+    payloads (the extra-raw request shape) for the same run/location START AT THE SAME
+    FIRST TIMESTAMP -- the requested past_hours=1 hour is never present in the returned
+    time axis. Open-Meteo's documented past_hours behaviour prepends hours before the
+    run for endpoints with a rolling "now" anchor; this is the pinned-run endpoint
+    (SINGLE_RUNS_FORECAST_URL with an explicit `run=`), where the provider evidently
+    ignores past_hours and always starts the response at the run itself. Because of
+    that, the superset rule below is forecast_hours-ONLY: a cached payload qualifies as
+    a donor whenever its forecast_hours is >= the request's forecast_hours, regardless
+    of either side's past_hours (see _lookup_single_runs_superset_payload for the
+    hash-verified match and _slice_single_runs_payload for the derivation, which is
+    byte-identical to a native fetch of the smaller window row-for-row).
     """
     if not models or not locations:
         return ()
@@ -1623,7 +1853,31 @@ def _fetch_single_runs_hourly_payloads_batched(
         )
         for latitude, longitude, timezone_name, _dates in locations
     ]
-    cached = [_SINGLE_RUNS_PAYLOAD_CACHE.get(key) for key in cache_keys]
+    identity_keys = [
+        _single_runs_payload_identity_key(
+            run_iso=run_iso,
+            latitude=latitude,
+            longitude=longitude,
+            timezone_name=timezone_name,
+        )
+        for latitude, longitude, timezone_name, _dates in locations
+    ]
+    cached: list[Mapping[str, object] | None] = []
+    for index, key in enumerate(cache_keys):
+        entry = _SINGLE_RUNS_PAYLOAD_CACHE.get(key)
+        if entry is None:
+            latitude, longitude, timezone_name, _dates = locations[index]
+            entry = _lookup_single_runs_superset_payload(
+                om_ids=om_ids,
+                run_iso=run_iso,
+                latitude=latitude,
+                longitude=longitude,
+                timezone_name=timezone_name,
+                forecast_hours=forecast_hours,
+                past_hours=past_hours,
+                identity_key=identity_keys[index],
+            )
+        cached.append(entry)
     missing_positions = [index for index, entry in enumerate(cached) if entry is None]
     if missing_positions:
         missing_locations = [locations[index] for index in missing_positions]
@@ -1637,7 +1891,13 @@ def _fetch_single_runs_hourly_payloads_batched(
         )
         for index, payload in zip(missing_positions, fetched, strict=True):
             cached[index] = payload
-            _store_single_runs_payload_cache(cache_keys[index], payload)
+            _store_single_runs_payload_cache(
+                cache_keys[index],
+                payload,
+                identity_key=identity_keys[index],
+                forecast_hours=forecast_hours,
+                past_hours=past_hours,
+            )
     return tuple(copy.deepcopy(entry) for entry in cached)
 
 
