@@ -176,12 +176,31 @@ def _raw_endpoint_for_provenance(value: object) -> object:
     return "Infinity" if numeric > 0 else "-Infinity"
 
 
+def _canonical_json_sha256(value: dict) -> str:
+    """sha256 of the canonical (sorted, compact) JSON encoding of ``value``."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _low_local_day_min_interval_evidence(
     payload: dict,
     *,
     temperature_metric: str | None = None,
 ) -> dict[str, Any] | None:
-    """Build LOW-only, reader-inert interval evidence from normalized members."""
+    """Build LOW-only interval evidence from normalized members.
+
+    Only this dict's ``identity_sha256`` and ``member_count`` are persisted into
+    provenance_json (see ``_provenance_json``); the full evidence is reader-inert
+    per-row and is reproducible on demand from ``members_json`` plus the ingest
+    contract (``src/contracts/snapshot_ingest_contract.py``).
+    """
     metric_name = temperature_metric or payload.get("temperature_metric")
     if str(metric_name or "").strip().lower() != "low":
         return None
@@ -319,15 +338,7 @@ def _low_local_day_min_interval_evidence(
         "selected_step_ranges_boundary": boundary_ranges,
         "member_records": records,
     }
-    identity_sha256 = hashlib.sha256(
-        json.dumps(
-            identity_material,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    identity_sha256 = _canonical_json_sha256(identity_material)
     return {
         **identity_material,
         "unit_semantics": "raw extrema and interval endpoints remain in native unit",
@@ -342,6 +353,15 @@ def _provenance_json(
     *,
     contract_evidence: dict[str, Any] | None = None,
 ) -> str:
+    """Build the persisted provenance_json for one snapshot row.
+
+    ``boundary_normalization`` and ``low_local_day_min_interval_evidence`` are
+    reader-inert full blobs computed by the ingest contract and by
+    ``_low_local_day_min_interval_evidence`` respectively; only their identity
+    fingerprints (sha256 + member_count) are persisted here. If the full
+    evidence is ever needed it is reproducible from ``members_json`` plus the
+    ingest contract (``src/contracts/snapshot_ingest_contract.py``).
+    """
     prov = {
         "data_version": payload.get("data_version"),
         "physical_quantity": payload.get("physical_quantity"),
@@ -389,14 +409,16 @@ def _provenance_json(
             "forecast_window_block_reasons_json",
         }
     }
-    if isinstance(payload.get("boundary_normalization"), dict):
-        prov["boundary_normalization"] = payload["boundary_normalization"]
+    boundary_normalization = payload.get("boundary_normalization")
+    if isinstance(boundary_normalization, dict):
+        prov["boundary_normalization_sha256"] = _canonical_json_sha256(boundary_normalization)
     interval_evidence = _low_local_day_min_interval_evidence(
         payload,
         temperature_metric=metric.temperature_metric,
     )
     if interval_evidence is not None:
-        prov["low_local_day_min_interval_evidence"] = interval_evidence
+        prov["low_local_day_min_interval_evidence_sha256"] = interval_evidence["identity_sha256"]
+        prov["low_local_day_min_interval_member_count"] = interval_evidence["member_count"]
     return json.dumps(prov, ensure_ascii=False)
 
 
