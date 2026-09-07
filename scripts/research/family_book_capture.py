@@ -35,6 +35,7 @@ SLUG_PREFIXES = ("highest-temperature-in-{city}-on-{date}", "lowest-temperature-
 SUBSCRIBE_BATCH = 500  # Polymarket: at most 500 asset ids per subscribe message
 UNIVERSE_REFRESH_S = 30 * 60
 DEPTH_MIN_INTERVAL_S = 60.0
+SIZE_ONLY_MIN_INTERVAL_S = 10.0  # size-only top-of-book rows per token, at most one per interval
 HEALTH_INTERVAL_S = 60.0
 RETENTION_TICK_S = 3600.0
 PING_INTERVAL_S = 10.0  # Polymarket market channel: client must send text frame "PING" every 10 s
@@ -339,6 +340,7 @@ class Sink:
         self.last_top: dict[str, dict] = {}
         self.last_depth_at: dict[str, float] = {}
         self.last_depth_hash: dict[str, str] = {}
+        self.last_size_only_at: dict[str, float] = {}
         self.rows_written = 0
 
     def upsert_meta(self, universe: dict[str, dict], now_iso: str) -> None:
@@ -363,6 +365,13 @@ class Sink:
         h = top_hash(update["best_bid"], update["best_ask"], update["bid_size"], update["ask_size"])
         prior = self.last_top.get(token)
         changed = prior is None or prior["hash"] != h
+        if changed and prior is not None and (update["best_bid"], update["best_ask"]) == (prior["best_bid"], prior["best_ask"]):
+            # size-only change at an unchanged top price: ~2/3 of all rows (measured 2026-09-07) and
+            # 11 GB/day; keep at most one per token per SIZE_ONLY_MIN_INTERVAL_S. Price changes and
+            # depth checkpoints are never gated, so the ladder history stays exact.
+            if now_mono - self.last_size_only_at.get(token, -1e9) < SIZE_ONLY_MIN_INTERVAL_S:
+                return False
+            self.last_size_only_at[token] = now_mono
         if changed:
             self.conn.execute(
                 """INSERT INTO book_top(token_id, condition_id, event_slug, outcome_label, received_at_utc,

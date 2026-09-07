@@ -266,3 +266,15 @@ def test_coverage_validity_drops_on_disconnect_and_zero_row_family_stays_in_deno
     assert 0.0 < fam["all_fresh_fraction"] < 1.0  # the disconnected interval drags coverage below 1.0
     ghost = out["per_family"]["ghost-fam"]
     assert ghost["tokens"] == 1 and ghost["tokens_with_rows"] == 0 and ghost["all_fresh_fraction"] == 0.0
+
+
+def test_size_only_top_changes_are_rate_limited_but_price_changes_are_not(tmp_path):
+    s = cap.Sink(tmp_path / "x.db", retain_days=1)
+    base = {"token_id": "t1", "exchange_ts": None, "best_bid": 0.4, "best_ask": 0.5, "bid_size": 10.0, "ask_size": 5.0, "book_hash": "", "levels": None}
+    now = "2026-09-07T00:00:00+00:00"
+    assert s.write_top(dict(base), None, now_iso=now, now_mono=0.0, epoch=1) is True
+    assert s.write_top({**base, "bid_size": 9.0}, None, now_iso=now, now_mono=1.0, epoch=1) is True   # first size-only row
+    assert s.write_top({**base, "bid_size": 8.0}, None, now_iso=now, now_mono=2.0, epoch=1) is False  # inside the interval: dropped
+    assert s.write_top({**base, "best_bid": 0.41, "bid_size": 8.0}, None, now_iso=now, now_mono=3.0, epoch=1) is True  # price change: never gated
+    assert s.write_top({**base, "best_bid": 0.41, "bid_size": 7.0}, None, now_iso=now, now_mono=14.0, epoch=1) is True  # interval elapsed
+    assert s.conn.execute("SELECT COUNT(*) FROM book_top").fetchone()[0] == 4
