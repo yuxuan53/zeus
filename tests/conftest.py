@@ -165,11 +165,19 @@ def _single_runs_payload_cache_test_isolation():
     ``fetch`` go uncalled -- a cache hit from the first test's payload, not the
     behavior the second test is asserting.
     """
-    from src.data.bayes_precision_fusion_download import _SINGLE_RUNS_PAYLOAD_CACHE
+    from src.data.bayes_precision_fusion_download import (
+        _SINGLE_RUNS_PAYLOAD_CACHE,
+        _SINGLE_RUNS_PAYLOAD_CACHE_INDEX,
+        _SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS,
+    )
 
     _SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEX.clear()
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.clear()
     yield
     _SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEX.clear()
+    _SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.clear()
 
 
 @pytest.fixture(autouse=True)
