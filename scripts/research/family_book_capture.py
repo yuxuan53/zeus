@@ -483,8 +483,13 @@ async def run(args: argparse.Namespace) -> None:
                 additional_headers={"User-Agent": USER_AGENT},
             ) as ws:
                 epoch += 1
+                # A second {"type": "market"} message REPLACES the subscription (probed 2026-09-07:
+                # batch B received nothing); only {"operation": "subscribe"} ADDS. First batch opens
+                # the channel, every further batch is an additive update.
                 for i in range(0, len(subscribed), SUBSCRIBE_BATCH):
-                    await ws.send(json.dumps({"assets_ids": subscribed[i:i + SUBSCRIBE_BATCH], "type": "market"}))
+                    batch = subscribed[i:i + SUBSCRIBE_BATCH]
+                    msg = {"assets_ids": batch, "type": "market"} if i == 0 else {"assets_ids": batch, "operation": "subscribe"}
+                    await ws.send(json.dumps(msg))
                 log.info("connected (epoch %d); subscribed %d tokens in %d message(s)", epoch, len(subscribed), (len(subscribed) + SUBSCRIBE_BATCH - 1) // SUBSCRIBE_BATCH)
                 connected_at_mono = time.monotonic()
                 last_health = connected_at_mono
