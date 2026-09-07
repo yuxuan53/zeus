@@ -6478,6 +6478,350 @@ class TestQkernelMarketRelativeAlphaEvidence:
 
         assert reason == (None, ())
 
+    @staticmethod
+    def _selection_binder_fixture(conn, events_conn, *, positions):
+        """Seed venue_commands + decision_log + EDLI receipts for the binder.
+
+        ``positions`` maps position_id -> the summary's global_selection_revision.
+        """
+
+        from src.contracts.global_auction_receipt import (
+            GlobalAuctionReceiptRef,
+            global_auction_artifact_summary_hash,
+            global_auction_execution_binding_hash,
+        )
+
+        conn.executescript(
+            "CREATE TABLE venue_commands (command_id TEXT,position_id TEXT,"
+            "intent_kind TEXT,decision_id TEXT);"
+            "CREATE TABLE decision_log (id INTEGER PRIMARY KEY,mode TEXT,"
+            "artifact_json TEXT);"
+        )
+        events_conn.execute(
+            "CREATE TABLE edli_live_order_events "
+            "(aggregate_id TEXT,event_type TEXT,payload_json TEXT)"
+        )
+        for index, (position_id, revision) in enumerate(positions.items(), start=1):
+            summary = {
+                "schema_version": 22,
+                "selection_epoch_identity": f"epoch-{index}",
+                "selection_cut_at_utc": "2026-09-01T00:00:00+00:00",
+                "decision_at_utc": "2026-09-01T00:00:01+00:00",
+                "full_scope_identity": "scope",
+                "book_epoch_identity": "book",
+                "wealth_witness_identity": "wealth",
+                "wealth_economic_identity": "economics",
+                "winner_event_id": f"event-{index}",
+                "winner_candidate_id": f"candidate-{index}",
+                "winner_actuation_identity": f"actuation-{index}",
+                "payload_identity": "1" * 64,
+                "decision_payload_identity": "2" * 64,
+                "audit_context_sha256": "3" * 64,
+                "book_native_side_states_sha256": "4" * 64,
+                "candidate_evaluations_sha256": "5" * 64,
+                "buy_minimum_marketable_repairs_sha256": "6" * 64,
+                "holding_auction_coverage_sha256": "7" * 64,
+                "global_selection_revision": revision,
+                "portfolio_wealth": {
+                    "ledger_snapshot_id": "ledger",
+                    "position_set_hash": "positions",
+                    "wealth_floor_usd": "18",
+                    "wealth_ceiling_usd": "22",
+                    "spendable_cash_usd": "10",
+                    "reservations_usd": "2",
+                    "collateral_authority": "CHAIN",
+                },
+                "receipt_hash": "a" * 64,
+            }
+            summary["execution_binding_hash"] = (
+                global_auction_execution_binding_hash(summary)
+            )
+            summary["artifact_summary_hash"] = (
+                global_auction_artifact_summary_hash(summary)
+            )
+            conn.execute(
+                "INSERT INTO decision_log VALUES (?,?,?)",
+                (
+                    index,
+                    "global_single_order_auction",
+                    json.dumps({"summary": summary}),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO venue_commands VALUES (?,?,?,?)",
+                (f"venue-cmd-{index}", position_id, "ENTRY", f"cmd-{index}"),
+            )
+            receipt = GlobalAuctionReceiptRef(
+                decision_log_id=index,
+                decision_log_mode="global_single_order_auction",
+                receipt_hash=summary["receipt_hash"],
+                execution_binding_hash=summary["execution_binding_hash"],
+                artifact_summary_hash=summary["artifact_summary_hash"],
+                schema_version=22,
+                winner_event_id=summary["winner_event_id"],
+                winner_candidate_id=summary["winner_candidate_id"],
+                winner_actuation_identity=summary["winner_actuation_identity"],
+                selection_epoch_identity=summary["selection_epoch_identity"],
+            )
+            events_conn.execute(
+                "INSERT INTO edli_live_order_events VALUES (?,?,?)",
+                (
+                    f"aggregate-{index}",
+                    "ExecutionCommandCreated",
+                    json.dumps({"execution_command_id": f"cmd-{index}"}),
+                ),
+            )
+            events_conn.execute(
+                "INSERT INTO edli_live_order_events VALUES (?,?,?)",
+                (
+                    f"aggregate-{index}",
+                    "PreSubmitRevalidated",
+                    json.dumps({"global_auction_receipt": receipt.as_payload()}),
+                ),
+            )
+
+    def test_binder_keeps_current_revision_and_excludes_superseded(self):
+        """3 current-revision positions bind; 1 superseded becomes unbound."""
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        events_conn = sqlite3.connect(":memory:")
+        events_conn.row_factory = sqlite3.Row
+        current = riskguard_module.CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+        self._selection_binder_fixture(
+            conn,
+            events_conn,
+            positions={
+                "position-1": current,
+                "position-2": current,
+                "position-3": current,
+                "position-4": "superseded_selector_v2",
+            },
+        )
+
+        bound = riskguard_module._bind_live_curve_to_selection_revision(
+            conn,
+            {
+                "status": "nonpositive",
+                "realized_position_count": 4,
+                "blocked_position_count": 0,
+                "curve": [
+                    {
+                        "position_id": "position-1",
+                        "capital_committed_usd": 4.0,
+                        "gross_realized_pnl_usd": -0.5,
+                        "fee_bound_usd": 0.1,
+                        "net_realized_pnl_usd": -0.6,
+                    },
+                    {
+                        "position_id": "position-2",
+                        "capital_committed_usd": 4.0,
+                        "gross_realized_pnl_usd": -0.5,
+                        "fee_bound_usd": 0.1,
+                        "net_realized_pnl_usd": -0.6,
+                    },
+                    {
+                        "position_id": "position-3",
+                        "capital_committed_usd": 4.0,
+                        "gross_realized_pnl_usd": -0.5,
+                        "fee_bound_usd": 0.1,
+                        "net_realized_pnl_usd": -0.6,
+                    },
+                    {
+                        "position_id": "position-4",
+                        "capital_committed_usd": 4.0,
+                        "gross_realized_pnl_usd": -50.0,
+                        "fee_bound_usd": 0.1,
+                        "net_realized_pnl_usd": -50.1,
+                    },
+                ],
+            },
+            events_conn=events_conn,
+        )
+
+        assert bound["selection_revision_bound"] is True
+        assert bound["global_selection_revision"] == current
+        assert bound["realized_position_count"] == 3
+        assert bound["unbound_position_count"] == 1
+        # The superseded position's -50.1 must not reach the cohort economics.
+        assert bound["net_realized_pnl_usd"] == pytest.approx(-1.8)
+        assert bound["realized_capital_committed_usd"] == pytest.approx(12.0)
+        # Excluded, never "blocked": identity-degradation semantics are untouched.
+        assert bound["blocked_position_count"] == 0
+        assert bound["status"] == "nonpositive"
+        assert [row["position_id"] for row in bound["curve"]] == [
+            "position-1",
+            "position-2",
+            "position-3",
+        ]
+        assert bound["curve"][0]["global_auction_decision_log_id"] == 1
+        conn.close()
+        events_conn.close()
+
+    def test_binder_reads_world_owned_events_not_the_trade_ghost(self):
+        """edli_live_order_events on the trade DB is the drained split ghost.
+
+        RiskGuard's tick connection has world ATTACHed, so an unqualified read
+        silently hits the ghost and binds nothing. The binder must qualify it.
+        """
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        world = sqlite3.connect(":memory:")
+        world.row_factory = sqlite3.Row
+        self._selection_binder_fixture(
+            conn,
+            world,
+            positions={
+                "position-1": (
+                    riskguard_module.CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+                )
+            },
+        )
+        # Drained ghost of the same name on the trade DB, plus world ATTACHed.
+        conn.execute(
+            "CREATE TABLE edli_live_order_events "
+            "(aggregate_id TEXT,event_type TEXT,payload_json TEXT)"
+        )
+        world.commit()
+        conn.execute("ATTACH DATABASE ? AS world", (":memory:",))
+        conn.execute(
+            "CREATE TABLE world.edli_live_order_events "
+            "(aggregate_id TEXT,event_type TEXT,payload_json TEXT)"
+        )
+        for row in world.execute("SELECT * FROM edli_live_order_events"):
+            conn.execute(
+                "INSERT INTO world.edli_live_order_events VALUES (?,?,?)",
+                tuple(row),
+            )
+
+        curve = {
+            "status": "nonpositive",
+            "curve": [
+                {
+                    "position_id": "position-1",
+                    "capital_committed_usd": 4.0,
+                    "net_realized_pnl_usd": -0.6,
+                }
+            ],
+        }
+        bound = riskguard_module._bind_live_curve_to_selection_revision(conn, curve)
+
+        assert bound["selection_revision_bound"] is True
+        assert bound["realized_position_count"] == 1
+        assert bound["unbound_position_count"] == 0
+        conn.close()
+        world.close()
+
+    def test_binder_without_world_events_stays_unbound_and_cannot_gate(self):
+        """No receipt surface = excluded evidence, never a latch on raw truth."""
+
+        from src.events.day0_authority import DAY0_PROBABILITY_SEMANTICS_REVISION
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE venue_commands (command_id TEXT,position_id TEXT,"
+            "intent_kind TEXT,decision_id TEXT)"
+        )
+
+        bound = riskguard_module._bind_live_curve_to_selection_revision(
+            conn,
+            {
+                "status": "nonpositive",
+                "probability_semantics_revision": (
+                    DAY0_PROBABILITY_SEMANTICS_REVISION
+                ),
+                "realized_position_count": 24,
+                "blocked_position_count": 0,
+                "net_realized_pnl_usd": -9.55237,
+                "curve": [{"position_id": "position-1"}],
+            },
+        )
+
+        assert bound["selection_revision_bound"] is False
+        assert bound["selection_revision_binding_status"] == (
+            "global_receipt_events_unavailable"
+        )
+        assert riskguard_module._day0_revision_probation_gate_reason(
+            {
+                "status": "ok",
+                "current_revision": DAY0_PROBABILITY_SEMANTICS_REVISION,
+            },
+            {"cohorts": []},
+            bound,
+        ) == (None, ())
+        conn.close()
+
+    def test_bound_current_revision_nonpositive_cohort_gates_day0_entry(self):
+        """The 6e507819b precondition, once actually satisfied, must latch.
+
+        Regression: no producer in src/ ever set selection_revision_bound, so
+        this branch was unreachable and day0 probation was structurally dead.
+        """
+
+        from src.events.day0_authority import DAY0_PROBABILITY_SEMANTICS_REVISION
+
+        reason, revisions = riskguard_module._day0_revision_probation_gate_reason(
+            {
+                "status": "ok",
+                "current_revision": DAY0_PROBABILITY_SEMANTICS_REVISION,
+            },
+            {"cohorts": []},
+            {
+                "status": "nonpositive",
+                "probability_semantics_revision": (
+                    DAY0_PROBABILITY_SEMANTICS_REVISION
+                ),
+                "global_selection_revision": (
+                    riskguard_module.CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+                ),
+                "selection_revision_bound": True,
+                "open_position_count": 8,
+                "realized_position_count": 24,
+                "unbound_position_count": 0,
+                "blocked_position_count": 0,
+                "net_realized_pnl_usd": -9.55237,
+            },
+        )
+
+        assert reason == (
+            "day0_revision_probation_nonpositive("
+            "realized=24,net_pnl_usd=-9.552370,"
+            f"revision={DAY0_PROBABILITY_SEMANTICS_REVISION})"
+        )
+        assert revisions == (DAY0_PROBABILITY_SEMANTICS_REVISION,)
+
+    def test_superseded_selection_positions_are_excluded_not_gating(self):
+        """Old-selector losses leave the cohort; they never gate the current one."""
+
+        from src.events.day0_authority import DAY0_PROBABILITY_SEMANTICS_REVISION
+
+        # The binder dropped 24 superseded-selector losses; 2 current-revision
+        # closes remain — below the minimum sample, so no latch.
+        assert riskguard_module._day0_revision_probation_gate_reason(
+            {
+                "status": "ok",
+                "current_revision": DAY0_PROBABILITY_SEMANTICS_REVISION,
+            },
+            {"cohorts": []},
+            {
+                "status": "nonpositive",
+                "probability_semantics_revision": (
+                    DAY0_PROBABILITY_SEMANTICS_REVISION
+                ),
+                "global_selection_revision": (
+                    riskguard_module.CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+                ),
+                "selection_revision_bound": True,
+                "open_position_count": 0,
+                "realized_position_count": 2,
+                "unbound_position_count": 24,
+                "blocked_position_count": 0,
+                "net_realized_pnl_usd": -9.55237,
+            },
+        ) == (None, ())
+
     def test_validated_day0_revision_removes_probation_bound(self):
         from src.events.day0_authority import DAY0_PROBABILITY_SEMANTICS_REVISION
 
@@ -7604,6 +7948,95 @@ class TestStrategyPolicyResolver:
             "gate": True,
             "probability_semantics_revisions": [revision],
         }
+        conn.close()
+
+    def test_bound_nonpositive_cohort_emits_day0_gate_row_end_to_end(
+        self,
+        monkeypatch,
+    ):
+        """Binder -> probation reason -> durable risk_actions gate row.
+
+        Before the selection binding was wired into the tick, this chain broke
+        at the first link: no producer set selection_revision_bound, so the
+        probation reason was always None and no row was ever emitted.
+        """
+
+        from src.events.day0_authority import DAY0_PROBABILITY_SEMANTICS_REVISION
+
+        _neutralize_hard_safety(monkeypatch)
+        revision = DAY0_PROBABILITY_SEMANTICS_REVISION
+        current = riskguard_module.CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
+        trades = sqlite3.connect(":memory:")
+        trades.row_factory = sqlite3.Row
+        events_conn = sqlite3.connect(":memory:")
+        events_conn.row_factory = sqlite3.Row
+        TestQkernelMarketRelativeAlphaEvidence._selection_binder_fixture(
+            trades,
+            events_conn,
+            positions={
+                "position-1": current,
+                "position-2": current,
+                "position-3": current,
+            },
+        )
+
+        bound = riskguard_module._bind_live_curve_to_selection_revision(
+            trades,
+            {
+                "status": "nonpositive",
+                "probability_semantics_revision": revision,
+                "open_position_count": 0,
+                "blocked_position_count": 0,
+                "curve": [
+                    {
+                        "position_id": f"position-{index}",
+                        "capital_committed_usd": 4.0,
+                        "net_realized_pnl_usd": -0.6,
+                    }
+                    for index in (1, 2, 3)
+                ],
+            },
+            events_conn=events_conn,
+        )
+        reason, revisions = riskguard_module._day0_revision_probation_gate_reason(
+            {"status": "ok", "current_revision": revision},
+            {"cohorts": []},
+            bound,
+        )
+
+        assert bound["selection_revision_bound"] is True
+        assert reason == (
+            "day0_revision_probation_nonpositive("
+            f"realized=3,net_pnl_usd=-1.800000,revision={revision})"
+        )
+
+        conn = _policy_conn()
+        status = riskguard_module._sync_riskguard_strategy_gate_actions(
+            conn,
+            {"day0_nowcast_entry": [reason]},
+            probability_semantics_scopes={
+                "day0_nowcast_entry": set(revisions)
+            },
+            issued_at="2026-09-06T05:50:00+00:00",
+        )
+        row = conn.execute(
+            "SELECT value FROM risk_actions WHERE action_id = ?",
+            ("riskguard:gate:day0_nowcast_entry",),
+        ).fetchone()
+
+        assert status["emitted_count"] == 1
+        assert json.loads(row["value"]) == {
+            "gate": True,
+            "probability_semantics_revisions": [revision],
+        }
+        assert policy_module.resolve_strategy_policy(
+            conn,
+            "day0_nowcast_entry",
+            datetime(2026, 9, 6, 6, 0, tzinfo=timezone.utc),
+            probability_semantics_revision=revision,
+        ).gated is True
+        trades.close()
+        events_conn.close()
         conn.close()
 
     def test_riskguard_emits_revision_scoped_qkernel_probation_gate(self):
