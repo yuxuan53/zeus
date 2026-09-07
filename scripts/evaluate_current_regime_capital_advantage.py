@@ -52,6 +52,13 @@ from src.events.day0_authority import (  # noqa: E402
     DAY0_PROBABILITY_SEMANTICS_REVISION,
 )
 from src.riskguard import riskguard as rg  # noqa: E402
+
+# Single implementation: the selection-revision binder is RiskGuard law (it
+# decides the live probation cohort), so it lives there and this evaluator
+# reads the same code rather than a drifting second copy.
+_validated_global_receipt = rg._validated_global_receipt
+_command_global_receipt = rg._command_global_receipt
+_bind_live_curve_to_global_revision = rg._bind_live_curve_to_selection_revision
 from src.state.db import (  # noqa: E402
     get_forecasts_connection_read_only,
     get_trade_connection_read_only,
@@ -933,185 +940,6 @@ def _realized_curve_with_deadline(
         }
     finally:
         conn.set_progress_handler(None, 0)
-
-
-def _validated_global_receipt(
-    conn: sqlite3.Connection,
-    raw_receipt: object,
-    *,
-    source: str,
-) -> GlobalAuctionReceiptRef:
-    try:
-        receipt = GlobalAuctionReceiptRef.from_payload(raw_receipt)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{source} global receipt invalid") from exc
-    if receipt.schema_version != 22:
-        raise ValueError(f"{source} global receipt is not schema 22")
-    row = conn.execute(
-        "SELECT mode,artifact_json FROM decision_log WHERE id=?",
-        (receipt.decision_log_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"{source} global receipt row missing")
-    assert_global_auction_receipt_artifact(
-        expected=receipt,
-        decision_log_id=receipt.decision_log_id,
-        decision_log_mode=str(row[0]),
-        artifact_json=row[1],
-    )
-    artifact = json.loads(str(row[1]))
-    if artifact["summary"].get("global_selection_revision") != (
-        CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
-    ):
-        raise ValueError(f"{source} global receipt selection revision mismatch")
-    return receipt
-
-
-def _command_global_receipt(
-    conn: sqlite3.Connection,
-    *,
-    execution_command_id: str,
-    events_conn: sqlite3.Connection | None = None,
-) -> GlobalAuctionReceiptRef:
-    event_source = events_conn or conn
-    rows = event_source.execute(
-        "SELECT pre.payload_json FROM edli_live_order_events AS cmd "
-        "JOIN edli_live_order_events AS pre "
-        "ON pre.aggregate_id=cmd.aggregate_id "
-        "AND pre.event_type='PreSubmitRevalidated' "
-        "WHERE cmd.event_type='ExecutionCommandCreated' "
-        "AND json_extract(cmd.payload_json,'$.execution_command_id')=? "
-        "LIMIT 2",
-        (execution_command_id,),
-    ).fetchall()
-    if len(rows) != 1:
-        raise ValueError("unique EDLI pre-submit receipt unavailable")
-    try:
-        payload = json.loads(str(rows[0][0] or ""))
-        raw_receipt = payload.get("global_auction_receipt")
-        if raw_receipt is None:
-            economics = payload.get("qkernel_execution_economics")
-            raw_receipt = (
-                economics.get("global_auction_receipt")
-                if isinstance(economics, Mapping)
-                else None
-            )
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("EDLI global receipt invalid") from exc
-    return _validated_global_receipt(
-        conn,
-        raw_receipt,
-        source="EDLI",
-    )
-
-
-def _bind_live_curve_to_global_revision(
-    conn: sqlite3.Connection,
-    curve: Mapping[str, object],
-    *,
-    events_conn: sqlite3.Connection | None = None,
-) -> dict[str, object]:
-    exact_rows: list[dict[str, object]] = []
-    unbound_reasons: dict[str, int] = {}
-    for raw in tuple(curve.get("curve") or ()):
-        row = dict(raw)
-        position_id = str(row.get("position_id") or "").strip()
-        commands = conn.execute(
-            "SELECT DISTINCT command_id,decision_id FROM venue_commands "
-            "WHERE position_id=? AND intent_kind='ENTRY' ORDER BY decision_id",
-            (position_id,),
-        ).fetchall()
-        try:
-            if not commands:
-                raise ValueError("entry command missing")
-            command_receipts = [
-                (
-                    str(command[0] or ""),
-                    str(command[1] or ""),
-                    _command_global_receipt(
-                    conn,
-                        execution_command_id=str(command[1] or ""),
-                        events_conn=events_conn,
-                    ),
-                )
-                for command in commands
-            ]
-        except ValueError as exc:
-            reason = str(exc)
-            unbound_reasons[reason] = unbound_reasons.get(reason, 0) + 1
-            continue
-        receipts = [item[2] for item in command_receipts]
-        first_receipt = min(receipts, key=lambda item: item.decision_log_id)
-        epoch_identities = sorted(
-            {receipt.selection_epoch_identity for receipt in receipts}
-        )
-        bindings = [
-            {
-                "venue_command_id": command_id,
-                "execution_command_id": execution_command_id,
-                "global_auction_decision_log_id": receipt.decision_log_id,
-                "global_auction_receipt_hash": receipt.receipt_hash,
-                "global_selection_epoch_identity": (
-                    receipt.selection_epoch_identity
-                ),
-            }
-            for command_id, execution_command_id, receipt in command_receipts
-        ]
-        exact_rows.append(
-            {
-                **row,
-                "global_selection_revision": (
-                    CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
-                ),
-                "global_auction_decision_log_id": (
-                    first_receipt.decision_log_id
-                ),
-                "global_auction_receipt_hash": (
-                    first_receipt.receipt_hash
-                    if len(bindings) == 1
-                    else None
-                ),
-                "global_selection_epoch_identity": (
-                    epoch_identities[0]
-                    if len(epoch_identities) == 1
-                    else None
-                ),
-                "global_auction_receipt_count": len(bindings),
-                "global_selection_epoch_identities": epoch_identities,
-                "global_auction_receipts": bindings,
-            }
-        )
-    net_pnl = sum(
-        float(row.get("net_realized_pnl_usd") or 0.0) for row in exact_rows
-    )
-    capital = sum(
-        float(row.get("capital_committed_usd") or 0.0) for row in exact_rows
-    )
-    return {
-        "status": (
-            "positive"
-            if exact_rows and net_pnl > 0.0
-            else "nonpositive"
-            if exact_rows
-            else "awaiting_exact_selection_revision_fills"
-        ),
-        "selection_revision_bound": True,
-        "global_selection_revision": (
-            CURRENT_GLOBAL_CAPITAL_SELECTION_REVISION
-        ),
-        "realized_position_count": len(exact_rows),
-        "unbound_current_semantics_position_count": (
-            len(tuple(curve.get("curve") or ())) - len(exact_rows)
-        ),
-        "unbound_reasons": dict(sorted(unbound_reasons.items())),
-        "realized_capital_committed_usd": round(capital, 6),
-        "net_realized_pnl_usd": round(net_pnl, 6),
-        "return_on_realized_capital": (
-            round(net_pnl / capital, 6) if capital > 0.0 else None
-        ),
-        "curve": exact_rows,
-        "all_current_probability_semantics": dict(curve),
-    }
 
 
 def _executable_bid_vwap(depth_json: object, shares: object) -> float | None:
