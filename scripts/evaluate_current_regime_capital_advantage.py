@@ -27,7 +27,10 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+# collections.abc, not typing: isinstance(x, Mapping) is called tens of
+# thousands of times per evaluate() run; typing's generic-alias
+# __instancecheck__ wrapper costs ~2us/call more than the ABC's native one.
+from collections.abc import Callable, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -219,14 +222,24 @@ def _audit_context_for_summary(
     summary: Mapping[str, object],
     *,
     seen: frozenset[int] = frozenset(),
+    cache: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Rehydrate and verify compact schema-22 audit context from its chain."""
+    """Rehydrate and verify compact schema-22 audit context from its chain.
+
+    ``audit_context_sha256`` is a verified content hash: a cache hit under an
+    identical hash is proof-equal to a fresh reconstruction, so a per-call
+    ``cache`` (never persisted, never shared across ``evaluate()`` calls) may
+    short-circuit repeated reconstructions of the same base chain without
+    weakening the fail-closed guarantee.
+    """
 
     if decision_log_id in seen or len(seen) >= 16:
         raise ValueError("audit context reference cycle/depth invalid")
     expected_sha = str(summary.get("audit_context_sha256") or "")
     if len(expected_sha) != 64:
         raise ValueError("audit context hash unavailable")
+    if cache is not None and expected_sha in cache:
+        return cache[expected_sha]
 
     inline = summary.get("audit_context_zlib_b64")
     if inline is not None:
@@ -241,6 +254,8 @@ def _audit_context_for_summary(
             != expected_sha
         ):
             raise ValueError("audit context inline hash mismatch")
+        if cache is not None:
+            cache[expected_sha] = context
         return context
 
     if summary.get("audit_context_reference_decision_log_id") is not None:
@@ -306,8 +321,11 @@ def _audit_context_for_summary(
         base_id,
         base_summary,
         seen=seen | {decision_log_id},
+        cache=cache,
     )
     if delta is None:
+        if cache is not None:
+            cache[expected_sha] = base
         return base
     replacements = delta.get("replacements")
     removed = delta.get("removed_keys")
@@ -319,6 +337,8 @@ def _audit_context_for_summary(
     context.update((str(key), value) for key, value in replacements.items())
     if hashlib.sha256(_canonical_json_bytes(context)).hexdigest() != expected_sha:
         raise ValueError("audit context reconstructed hash mismatch")
+    if cache is not None:
+        cache[expected_sha] = context
     return context
 
 
@@ -326,6 +346,8 @@ def _summary_proof(
     conn: sqlite3.Connection,
     decision_log_id: int,
     summary: Mapping[str, object],
+    *,
+    audit_context_cache: dict[str, dict[str, object]] | None = None,
 ) -> Mapping[str, object]:
     assert_global_auction_summary_integrity(summary)
     if summary.get("schema_version") != 22:
@@ -365,6 +387,7 @@ def _summary_proof(
         conn,
         decision_log_id,
         summary,
+        cache=audit_context_cache,
     )
     for field in (
         "selection_epoch_identity",
@@ -526,8 +549,14 @@ def _realized_proof_sample(
     *,
     decision_log_id: int,
     summary: Mapping[str, object],
+    audit_context_cache: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    proof = _summary_proof(trades, decision_log_id, summary)
+    proof = _summary_proof(
+        trades,
+        decision_log_id,
+        summary,
+        audit_context_cache=audit_context_cache,
+    )
     winner = proof.get("winner")
     if not isinstance(winner, Mapping) or winner.get("action") != "BUY":
         raise ValueError("proof winner is not a statistical BUY")
@@ -654,6 +683,7 @@ def _proof_registry_entry(
     *,
     decision_log_id: int,
     summary: Mapping[str, object],
+    audit_context_cache: dict[str, dict[str, object]] | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     """Return one causal proof ref and its settlement grade when available."""
 
@@ -663,11 +693,17 @@ def _proof_registry_entry(
             forecasts,
             decision_log_id=decision_log_id,
             summary=summary,
+            audit_context_cache=audit_context_cache,
         )
     except ValueError as exc:
         if str(exc) != "unique VERIFIED settlement unavailable":
             raise
-        proof = _summary_proof(trades, decision_log_id, summary)
+        proof = _summary_proof(
+            trades,
+            decision_log_id,
+            summary,
+            audit_context_cache=audit_context_cache,
+        )
         winner = proof.get("winner")
         if not isinstance(winner, Mapping):
             raise ValueError("proof winner unavailable") from exc
@@ -696,8 +732,15 @@ def _settled_global_counterfactual_evidence(
     *,
     as_of: datetime,
     prior_proof_registry: Sequence[Mapping[str, object]] = (),
+    prior_realized_proof_samples: Mapping[int, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     cutoff = (as_of - timedelta(days=WINDOW_DAYS)).isoformat()
+    # Reconstructing the same audit_context_sha256 twice always yields the
+    # same verified content (the hash proves it); this cache is fresh per
+    # call and never persisted, so it only removes redundant recomputation
+    # within one evaluate() run and cannot change any admitted value.
+    audit_context_cache: dict[str, dict[str, object]] = {}
+    prior_samples_by_decision_log_id = prior_realized_proof_samples or {}
     rows = trades.execute(
         "SELECT id,artifact_json FROM decision_log "
         "WHERE mode IN (?,?,?) AND completed_at>=? AND completed_at<=? "
@@ -713,6 +756,21 @@ def _settled_global_counterfactual_evidence(
     def reject(reason: str) -> None:
         rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
+    def register(
+        ref: Mapping[str, object],
+        sample: Mapping[str, object] | None,
+    ) -> None:
+        decision_at = _parse_aware(ref["decision_at_utc"])
+        if not _parse_aware(cutoff) <= decision_at <= as_of:
+            raise ValueError("proof decision outside current evidence window")
+        target_date = str(ref["independence_key"])
+        if target_date in registry_by_target_date:
+            reject("duplicate_target_date")
+            return
+        registry_by_target_date[target_date] = dict(ref)
+        if sample is not None:
+            samples.append(dict(sample))
+
     def admit(
         *,
         decision_log_id: int,
@@ -724,6 +782,7 @@ def _settled_global_counterfactual_evidence(
             forecasts,
             decision_log_id=decision_log_id,
             summary=summary,
+            audit_context_cache=audit_context_cache,
         )
         if expected_ref is not None and any(
             str(expected_ref.get(field) or "") != str(ref[field])
@@ -735,16 +794,7 @@ def _settled_global_counterfactual_evidence(
             )
         ):
             raise ValueError("retained proof registry identity mismatch")
-        decision_at = _parse_aware(ref["decision_at_utc"])
-        if not _parse_aware(cutoff) <= decision_at <= as_of:
-            raise ValueError("proof decision outside current evidence window")
-        target_date = str(ref["independence_key"])
-        if target_date in registry_by_target_date:
-            reject("duplicate_target_date")
-            return
-        registry_by_target_date[target_date] = ref
-        if sample is not None:
-            samples.append(sample)
+        register(ref, sample)
 
     def retained_order(item: Mapping[str, object]) -> int:
         try:
@@ -770,11 +820,38 @@ def _settled_global_counterfactual_evidence(
             summary = artifact["summary"]
             if not isinstance(summary, Mapping):
                 raise ValueError("retained proof summary invalid")
-            admit(
-                decision_log_id=decision_log_id,
-                summary=summary,
-                expected_ref=raw_ref,
+            # A prior run's fully realized sample is reusable without
+            # redoing the expensive audit-context/settlement derivation
+            # only when the decision_log row's own (unhashed, directly
+            # stored) proof_counterfactual_sha256 still matches both the
+            # retained ref and the cached sample it was derived from --
+            # i.e. nothing about this row or its previously proven
+            # settlement outcome has changed since it was cached.
+            current_sha = str(summary.get("proof_counterfactual_sha256") or "")
+            cached_sample = prior_samples_by_decision_log_id.get(decision_log_id)
+            reusable = (
+                cached_sample is not None
+                and current_sha
+                and current_sha == str(raw_ref.get("proof_counterfactual_sha256") or "")
+                and current_sha == str(cached_sample.get("proof_counterfactual_sha256") or "")
+                and str(raw_ref.get("independence_key") or "")
+                == str(cached_sample.get("independence_key") or "")
+                and int(cached_sample.get("decision_log_id") or -1) == decision_log_id
             )
+            if reusable:
+                ref = {
+                    "decision_log_id": decision_log_id,
+                    "proof_counterfactual_sha256": current_sha,
+                    "independence_key": str(raw_ref["independence_key"]),
+                    "decision_at_utc": str(raw_ref["decision_at_utc"]),
+                }
+                register(ref, cached_sample)
+            else:
+                admit(
+                    decision_log_id=decision_log_id,
+                    summary=summary,
+                    expected_ref=raw_ref,
+                )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             reject(str(exc) or type(exc).__name__)
 
@@ -2384,6 +2461,7 @@ def evaluate(
     as_of: datetime,
     prior_proof_registry: Sequence[Mapping[str, object]] = (),
     prior_portfolio_observations: Sequence[Mapping[str, object]] = (),
+    prior_realized_proof_samples: Mapping[int, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     trades = _read_only(
         trades_path,
@@ -2428,6 +2506,7 @@ def evaluate(
                     forecasts,
                     as_of=as_of,
                     prior_proof_registry=prior_proof_registry,
+                    prior_realized_proof_samples=prior_realized_proof_samples,
                 )
             )
         }
@@ -2599,6 +2678,37 @@ def _prior_proof_registry(path: Path) -> tuple[Mapping[str, object], ...]:
     return tuple(registry)
 
 
+def _prior_realized_proof_samples(path: Path) -> dict[int, Mapping[str, object]]:
+    """Load fully realized samples from the prior artifact, by decision_log_id.
+
+    A settled sample is immutable once produced (settlement cannot un-settle);
+    ``_settled_global_counterfactual_evidence`` only reuses one of these when
+    the owning decision_log row's own stored ``proof_counterfactual_sha256``
+    still matches both the retained ref and this cached sample, so a stale or
+    tampered row still falls back to full canonical revalidation.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        samples = payload["settled_counterfactuals"][
+            "combined_current_global_selection"
+        ]["samples"]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(samples, list):
+        return {}
+    by_decision_log_id: dict[int, Mapping[str, object]] = {}
+    for row in samples:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            decision_log_id = int(row["decision_log_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_decision_log_id[decision_log_id] = row
+    return by_decision_log_id
+
+
 def _prior_portfolio_observations(
     path: Path,
 ) -> tuple[Mapping[str, object], ...]:
@@ -2625,6 +2735,7 @@ def main() -> int:
     as_of = datetime.now(timezone.utc)
     prior_proof_registry = _prior_proof_registry(args.artifact)
     prior_portfolio_observations = _prior_portfolio_observations(args.artifact)
+    prior_realized_proof_samples = _prior_realized_proof_samples(args.artifact)
     try:
         artifact = evaluate(
             world_path=world,
@@ -2633,6 +2744,7 @@ def main() -> int:
             as_of=as_of,
             prior_proof_registry=prior_proof_registry,
             prior_portfolio_observations=prior_portfolio_observations,
+            prior_realized_proof_samples=prior_realized_proof_samples,
         )
     except (OSError, sqlite3.Error, ValueError) as exc:
         artifact = {
