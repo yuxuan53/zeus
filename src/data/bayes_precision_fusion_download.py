@@ -804,6 +804,16 @@ _single_runs_payload_cache_last_loaded_monotonic: float = 0.0
 # _single_runs_payload_cache_key with the REQUESTER's own om_ids and confirming it
 # equals the candidate's actual cache key (a SHA-256 match), so a wrong-model candidate
 # can never be served -- it just fails verification and falls through to a normal fetch.
+#
+# 2026-09-07 (identity fix): the index is populated at STORE time (the caller that
+# fetched the payload knows its own request identity exactly) and that same identity is
+# persisted onto the durable entry so a fresh load in another process indexes it
+# verbatim -- never by recovering identity_key from the payload's own echoed
+# latitude/longitude, which Open-Meteo grid-snaps to the nearest model cell and so never
+# equals the request's coordinates (verified on the live 400-entry cache: every prior
+# load-time recovery produced a phantom identity, 0 correct). A persisted file written
+# before this fix has no identity_key field and is loaded into the payload cache but
+# left OUT of this index -- see _load_persisted_single_runs_payload_cache.
 _SINGLE_RUNS_PAYLOAD_CACHE_INDEX: dict[str, list[tuple[int, int, str]]] = {}
 # Cache keys already folded into the index above, so repeated 30s reloads of the
 # persisted file don't append duplicate tuples for the same entry.
@@ -887,6 +897,20 @@ def _recover_single_runs_payload_identity(
 ) -> tuple[str, int] | None:
     """Recover (identity_key, forecast_hours) from a persisted payload's own bytes.
 
+    UNSAFE FOR INDEXING, NOT CALLED BY THE LOAD PATH (2026-09-07 identity fix): the
+    latitude/longitude this recovers are the payload's ECHOED coordinates, and
+    Open-Meteo grid-snaps those to the nearest model cell (e.g. request
+    30.558257,103.945966 -> echo 30.544815,103.97647). The recovered identity_key is
+    therefore never equal to the identity_key a live request computes from its own
+    (unsnapped) coordinates -- every entry the old load path indexed this way landed
+    under a phantom identity that no request could ever look up (verified on the live
+    400-entry cache: 0 correct). _load_persisted_single_runs_payload_cache now prefers
+    the identity_key/forecast_hours/past_hours _store_single_runs_payload_cache persists
+    onto each entry, and deliberately leaves a legacy entry without those fields
+    unindexed rather than calling this function. Kept only as documentation of that
+    defect (and for any caller that genuinely has no other source of the identity and
+    accepts an approximate, non-indexable recovery).
+
     om_ids cannot be recovered this way (see the index comment) and is not attempted
     here; the caller-side hash-verification step is what makes that safe. past_hours
     also cannot be recovered (never visible in the returned time axis -- see
@@ -934,7 +958,15 @@ def _recover_single_runs_payload_identity(
 def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
     """Merge durably-cached payloads from disk into the in-process cache.
 
-    Cheap-refreshed like the exact-run-gap memo rather than reloaded on every call.
+    Cheap-refreshed like the exact-run-gap memo rather than reloaded on every call. Each
+    entry is also folded into the superset index using the identity_key/forecast_hours/
+    past_hours _store_single_runs_payload_cache persisted alongside it -- an entry
+    written before that field existed (a legacy entry) is loaded into the payload cache
+    (still servable by an exact cache-key hit) but is left OUT of the index: the payload
+    itself only ever proves the provider's grid-SNAPPED echoed coordinates, never the
+    request's own, so indexing it would put it under an identity no live request could
+    ever compute. An unindexed legacy entry is only ever a missed superset hit (falls
+    through to a normal fetch) -- it can never be served under the wrong identity.
     """
     if not _single_runs_payload_cache_persistence_enabled():
         return
@@ -963,15 +995,37 @@ def _load_persisted_single_runs_payload_cache(*, force: bool = False) -> None:
             continue
         str_key = str(key)
         _SINGLE_RUNS_PAYLOAD_CACHE.setdefault(str_key, raw_payload)
-        # Fold this entry into the superset index using only what its own bytes prove
-        # (run/lat/lon/tz/forecast_hours) -- see _recover_single_runs_payload_identity
-        # and the index comment for why om_ids is not, and does not need to be, part
-        # of this recovery.
-        recovered = _recover_single_runs_payload_identity(raw_payload)
-        if recovered is not None:
-            identity_key, forecast_hours = recovered
+        # 2026-09-07 (identity fix): prefer the identity _store_single_runs_payload_cache
+        # persisted alongside this entry -- the REQUEST's own (run, lat, lon, tz) -- over
+        # any recovery from the payload's own bytes. Recovery (_recover_single_runs_
+        # payload_identity) reads latitude/longitude back out of the payload, but
+        # Open-Meteo echoes GRID-SNAPPED coordinates (e.g. request 30.558257,103.945966
+        # -> echo 30.544815,103.97647), so a recovered identity never equals the identity
+        # a live request computes -- every entry loaded this way landed under a phantom
+        # identity and no cross-process superset lookup ever hit (verified on the live
+        # 400-entry cache: 0 correct). Only a legacy entry stored before this fix lacks
+        # the persisted fields; it is deliberately left UNINDEXED rather than indexed
+        # from its echoed coordinates -- an unindexed entry only costs a missed superset
+        # hit (falls through to a normal fetch), whereas indexing it under a phantom
+        # identity is a silent no-op that looks like it works. Either way the payload
+        # itself is still loaded into _SINGLE_RUNS_PAYLOAD_CACHE above and can still be
+        # served by an exact cache-key hit.
+        identity_key = entry.get("identity_key")
+        forecast_hours = entry.get("forecast_hours")
+        past_hours = entry.get("past_hours")
+        if (
+            isinstance(identity_key, str)
+            and identity_key
+            and isinstance(forecast_hours, int)
+            and not isinstance(forecast_hours, bool)
+            and isinstance(past_hours, int)
+            and not isinstance(past_hours, bool)
+        ):
             _index_single_runs_payload_cache_entry(
-                str_key, identity_key=identity_key, forecast_hours=forecast_hours, past_hours=0
+                str_key,
+                identity_key=identity_key,
+                forecast_hours=forecast_hours,
+                past_hours=past_hours,
             )
 
 
@@ -1001,7 +1055,13 @@ def _store_single_runs_payload_cache(
     identity_key/forecast_hours/past_hours are optional: only the caller that already
     knows the full request identity (_fetch_single_runs_hourly_payloads_batched) passes
     them, to fold this entry into the superset index immediately rather than waiting
-    for a later reload to recover it from disk.
+    for a later reload to recover it from disk. When present, they are ALSO persisted
+    onto the durable entry (see the "entries[key] = ..." line below) so a fresh load in
+    another process indexes this entry under the true request identity instead of
+    recovering it from the payload's echoed latitude/longitude -- Open-Meteo snaps the
+    echoed coordinates to the nearest model grid cell (e.g. request 30.558257,103.945966
+    -> echo 30.544815,103.97647), so recovery from the payload never reproduces the
+    identity a live request will compute (see _recover_single_runs_payload_identity).
     """
     stored = copy.deepcopy(dict(payload))
     _SINGLE_RUNS_PAYLOAD_CACHE[key] = stored
@@ -1038,7 +1098,12 @@ def _store_single_runs_payload_cache(
                     on_disk["entries"] = entries
                 now_dt = datetime.now(UTC)
                 recorded_at = now_dt.isoformat()
-                entries[key] = {"payload": stored, "recorded_at": recorded_at}
+                entry_record: dict[str, object] = {"payload": stored, "recorded_at": recorded_at}
+                if identity_key is not None and forecast_hours is not None and past_hours is not None:
+                    entry_record["identity_key"] = identity_key
+                    entry_record["forecast_hours"] = int(forecast_hours)
+                    entry_record["past_hours"] = int(past_hours)
+                entries[key] = entry_record
                 # Age-based eviction first: a run payload older than the max age is
                 # long superseded and cannot serve a legitimate cache hit any more.
                 age_floor = now_dt - timedelta(hours=_SINGLE_RUNS_PAYLOAD_CACHE_MAX_AGE_HOURS)
@@ -1834,7 +1899,14 @@ def _fetch_single_runs_hourly_payloads_batched(
     a donor whenever its forecast_hours is >= the request's forecast_hours, regardless
     of either side's past_hours (see _lookup_single_runs_superset_payload for the
     hash-verified match and _slice_single_runs_payload for the derivation, which is
-    byte-identical to a native fetch of the smaller window row-for-row).
+    byte-identical to a native fetch of the smaller window row-for-row). Confirmed
+    directly on the live cache (2026-09-07): of 177 (72-h, 120-h) payload pairs sharing a
+    run/location, 172 have byte-identical first-24-hour series, and the Chengdu/
+    ecmwf_ifs pair used in
+    test_single_runs_payload_cache_serves_cross_process_superset_hit_from_persisted_identity
+    is byte-identical in full (every field but generationtime_ms) between the real
+    (72,1) payload and the first 72 rows of the real (120,0) payload for the same
+    identity.
     """
     if not models or not locations:
         return ()

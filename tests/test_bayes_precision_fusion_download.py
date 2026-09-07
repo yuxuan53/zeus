@@ -2803,8 +2803,11 @@ def test_single_runs_superset_hit_does_not_create_a_new_cache_entry(monkeypatch)
 def test_single_runs_payload_cache_persisted_format_unchanged_by_superset(
     monkeypatch, tmp_path,
 ) -> None:
-    """(c) The superset index is process-local bookkeeping only -- the durable JSON
-    format (schema_version, entries{key: {payload, recorded_at}}) must be unchanged."""
+    """(c) The durable JSON format (schema_version, entries{key: {...}}) keeps its
+    original fields -- payload/recorded_at -- and ADDITIVELY carries the request
+    identity (identity_key/forecast_hours/past_hours) so a fresh load in another
+    process can index this entry without recovering it from the payload's echoed,
+    grid-snapped coordinates (2026-09-07 identity fix)."""
     import src.data.bayes_precision_fusion_download as dl
     import src.data.openmeteo_client as client
 
@@ -2822,16 +2825,27 @@ def test_single_runs_payload_cache_persisted_format_unchanged_by_superset(
     assert on_disk["schema_version"] == dl._SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION
     assert len(on_disk["entries"]) == 1
     (entry,) = on_disk["entries"].values()
-    assert set(entry) == {"payload", "recorded_at"}
+    assert {"payload", "recorded_at"} <= set(entry), "original fields must survive unchanged"
+    assert set(entry) == {"payload", "recorded_at", "identity_key", "forecast_hours", "past_hours"}
     assert entry["payload"] == _KOLKATA_120H_PAYLOAD
+    assert entry["forecast_hours"] == 120
+    assert entry["past_hours"] == 0
+    lat, lon, tz, _dates = _KOLKATA_LOCATION
+    run_iso = _KOLKATA_RUN.strftime("%Y-%m-%dT%H:%M")
+    assert entry["identity_key"] == dl._single_runs_payload_identity_key(
+        run_iso=run_iso, latitude=lat, longitude=lon, timezone_name=tz,
+    )
 
 
 def test_single_runs_payload_cache_superset_index_rebuilt_on_load(
     monkeypatch, tmp_path,
 ) -> None:
     """(d) A second process (fresh in-memory index) must rebuild the superset index
-    purely from a reload of the persisted file, and serve a smaller request from the
-    previously-persisted larger payload with zero HTTP calls."""
+    purely from a reload of the persisted file -- using the identity_key/forecast_hours/
+    past_hours fields _store_single_runs_payload_cache persisted onto the entry, not
+    recovered from the payload's echoed coordinates (2026-09-07 identity fix) -- and
+    serve a smaller request from the previously-persisted larger payload with zero HTTP
+    calls."""
     import src.data.bayes_precision_fusion_download as dl
     import src.data.openmeteo_client as client
 
@@ -2866,6 +2880,232 @@ def test_single_runs_payload_cache_superset_index_rebuilt_on_load(
 
     assert len(calls) == 1, "the rebuilt index must serve the smaller request without HTTP"
     assert sliced["hourly"]["time"] == _KOLKATA_72H_PAYLOAD["hourly"]["time"]
+
+
+# =====================================================================================
+# Identity fix (2026-09-07): the superset index was populated at LOAD time by recovering
+# identity_key from the payload's own echoed latitude/longitude
+# (_recover_single_runs_payload_identity), but Open-Meteo echoes GRID-SNAPPED
+# coordinates -- never the request's own -- so every entry loaded from a persisted file
+# written by a sibling process landed under a phantom identity and the cross-process
+# case (an ingest daemon stores a 120-h payload, a live daemon asks for 72 h) never hit.
+# Verified on the live 400-entry cache: 0 correct recoveries. These two real payloads
+# (from the live single-runs payload cache file, public Open-Meteo weather data) are the
+# genuine Chengdu/ecmwf_ifs identity pair the defect was found on: the request used
+# latitude=30.558257, longitude=103.945966, but both payloads echo the grid-snapped
+# 30.544815, 103.97647 -- proving the echoed-coordinate mismatch is real, not
+# hypothetical.
+# =====================================================================================
+_CHENGDU_120H_PAYLOAD = _json.loads(
+    '{"elevation": 492.0, "generationtime_ms": 0.07033348083496094, "hourly": {"t'
+    'emperature_2m": [25.5, 25.5, 26.6, 28.0, 28.7, 30.1, 32.1, 33.2, 33.5, 33.3,'
+    ' 32.3, 31.3, 30.4, 29.7, 28.9, 28.2, 28.0, 27.9, 27.7, 27.0, 26.3, 25.5, 24.'
+    '8, 24.4, 24.7, 26.2, 27.6, 29.3, 30.3, 31.1, 32.1, 33.2, 33.5, 33.7, 33.0, 3'
+    '1.3, 30.3, 29.7, 29.3, 28.6, 27.6, 26.2, 25.3, 25.3, 23.8, 23.4, 23.1, 23.0,'
+    ' 22.9, 23.0, 22.8, 22.8, 24.0, 24.6, 25.3, 24.6, 23.7, 23.2, 21.6, 21.0, 20.'
+    '6, 21.0, 20.7, 20.4, 20.1, 20.0, 20.0, 19.7, 19.5, 19.4, 19.4, 19.4, 19.5, 1'
+    '9.8, 20.5, 20.7, 21.1, 21.7, 22.0, 22.4, 22.1, 21.7, 21.4, 20.8, 20.5, 20.3,'
+    ' 20.2, 20.1, 19.9, 19.8, 19.5, 19.2, 18.9, 18.7, 18.5, 18.4, 18.7, 19.6, 20.'
+    '8, 22.1, 23.2, 24.3, 25.0, 25.2, 25.1, 24.8, 24.1, 23.1, 22.3, 21.4, 20.7, 2'
+    '0.1, 19.6, 19.4, 19.2, 19.2, 19.3, 19.5, 19.4, 19.4], "time": ["2026-09-07T0'
+    '8:00", "2026-09-07T09:00", "2026-09-07T10:00", "2026-09-07T11:00", "2026-09-'
+    '07T12:00", "2026-09-07T13:00", "2026-09-07T14:00", "2026-09-07T15:00", "2026'
+    '-09-07T16:00", "2026-09-07T17:00", "2026-09-07T18:00", "2026-09-07T19:00", "'
+    '2026-09-07T20:00", "2026-09-07T21:00", "2026-09-07T22:00", "2026-09-07T23:00'
+    '", "2026-09-08T00:00", "2026-09-08T01:00", "2026-09-08T02:00", "2026-09-08T0'
+    '3:00", "2026-09-08T04:00", "2026-09-08T05:00", "2026-09-08T06:00", "2026-09-'
+    '08T07:00", "2026-09-08T08:00", "2026-09-08T09:00", "2026-09-08T10:00", "2026'
+    '-09-08T11:00", "2026-09-08T12:00", "2026-09-08T13:00", "2026-09-08T14:00", "'
+    '2026-09-08T15:00", "2026-09-08T16:00", "2026-09-08T17:00", "2026-09-08T18:00'
+    '", "2026-09-08T19:00", "2026-09-08T20:00", "2026-09-08T21:00", "2026-09-08T2'
+    '2:00", "2026-09-08T23:00", "2026-09-09T00:00", "2026-09-09T01:00", "2026-09-'
+    '09T02:00", "2026-09-09T03:00", "2026-09-09T04:00", "2026-09-09T05:00", "2026'
+    '-09-09T06:00", "2026-09-09T07:00", "2026-09-09T08:00", "2026-09-09T09:00", "'
+    '2026-09-09T10:00", "2026-09-09T11:00", "2026-09-09T12:00", "2026-09-09T13:00'
+    '", "2026-09-09T14:00", "2026-09-09T15:00", "2026-09-09T16:00", "2026-09-09T1'
+    '7:00", "2026-09-09T18:00", "2026-09-09T19:00", "2026-09-09T20:00", "2026-09-'
+    '09T21:00", "2026-09-09T22:00", "2026-09-09T23:00", "2026-09-10T00:00", "2026'
+    '-09-10T01:00", "2026-09-10T02:00", "2026-09-10T03:00", "2026-09-10T04:00", "'
+    '2026-09-10T05:00", "2026-09-10T06:00", "2026-09-10T07:00", "2026-09-10T08:00'
+    '", "2026-09-10T09:00", "2026-09-10T10:00", "2026-09-10T11:00", "2026-09-10T1'
+    '2:00", "2026-09-10T13:00", "2026-09-10T14:00", "2026-09-10T15:00", "2026-09-'
+    '10T16:00", "2026-09-10T17:00", "2026-09-10T18:00", "2026-09-10T19:00", "2026'
+    '-09-10T20:00", "2026-09-10T21:00", "2026-09-10T22:00", "2026-09-10T23:00", "'
+    '2026-09-11T00:00", "2026-09-11T01:00", "2026-09-11T02:00", "2026-09-11T03:00'
+    '", "2026-09-11T04:00", "2026-09-11T05:00", "2026-09-11T06:00", "2026-09-11T0'
+    '7:00", "2026-09-11T08:00", "2026-09-11T09:00", "2026-09-11T10:00", "2026-09-'
+    '11T11:00", "2026-09-11T12:00", "2026-09-11T13:00", "2026-09-11T14:00", "2026'
+    '-09-11T15:00", "2026-09-11T16:00", "2026-09-11T17:00", "2026-09-11T18:00", "'
+    '2026-09-11T19:00", "2026-09-11T20:00", "2026-09-11T21:00", "2026-09-11T22:00'
+    '", "2026-09-11T23:00", "2026-09-12T00:00", "2026-09-12T01:00", "2026-09-12T0'
+    '2:00", "2026-09-12T03:00", "2026-09-12T04:00", "2026-09-12T05:00", "2026-09-'
+    '12T06:00", "2026-09-12T07:00"]}, "hourly_units": {"temperature_2m": "\\u00b0C'
+    '", "time": "iso8601"}, "latitude": 30.544815, "longitude": 103.97647, "timez'
+    'one": "Asia/Shanghai", "timezone_abbreviation": "GMT+8", "utc_offset_seconds'
+    '": 28800}'
+)
+
+# The native 72-h payload for the SAME (model, run, location) -- a genuinely separate
+# HTTP fetch (day0's own request shape, with the REQUEST's own past_hours=1, which --
+# per the past_hours evidence above -- never appears in the returned time axis). Differs
+# from the first 72 hours of the 120-h payload above in exactly one field:
+# generationtime_ms.
+_CHENGDU_72H_PAYLOAD = _json.loads(
+    '{"elevation": 492.0, "generationtime_ms": 1.2230873107910156, "hourly": {"te'
+    'mperature_2m": [25.5, 25.5, 26.6, 28.0, 28.7, 30.1, 32.1, 33.2, 33.5, 33.3, '
+    '32.3, 31.3, 30.4, 29.7, 28.9, 28.2, 28.0, 27.9, 27.7, 27.0, 26.3, 25.5, 24.8'
+    ', 24.4, 24.7, 26.2, 27.6, 29.3, 30.3, 31.1, 32.1, 33.2, 33.5, 33.7, 33.0, 31'
+    '.3, 30.3, 29.7, 29.3, 28.6, 27.6, 26.2, 25.3, 25.3, 23.8, 23.4, 23.1, 23.0, '
+    '22.9, 23.0, 22.8, 22.8, 24.0, 24.6, 25.3, 24.6, 23.7, 23.2, 21.6, 21.0, 20.6'
+    ', 21.0, 20.7, 20.4, 20.1, 20.0, 20.0, 19.7, 19.5, 19.4, 19.4, 19.4], "time":'
+    ' ["2026-09-07T08:00", "2026-09-07T09:00", "2026-09-07T10:00", "2026-09-07T11'
+    ':00", "2026-09-07T12:00", "2026-09-07T13:00", "2026-09-07T14:00", "2026-09-0'
+    '7T15:00", "2026-09-07T16:00", "2026-09-07T17:00", "2026-09-07T18:00", "2026-'
+    '09-07T19:00", "2026-09-07T20:00", "2026-09-07T21:00", "2026-09-07T22:00", "2'
+    '026-09-07T23:00", "2026-09-08T00:00", "2026-09-08T01:00", "2026-09-08T02:00"'
+    ', "2026-09-08T03:00", "2026-09-08T04:00", "2026-09-08T05:00", "2026-09-08T06'
+    ':00", "2026-09-08T07:00", "2026-09-08T08:00", "2026-09-08T09:00", "2026-09-0'
+    '8T10:00", "2026-09-08T11:00", "2026-09-08T12:00", "2026-09-08T13:00", "2026-'
+    '09-08T14:00", "2026-09-08T15:00", "2026-09-08T16:00", "2026-09-08T17:00", "2'
+    '026-09-08T18:00", "2026-09-08T19:00", "2026-09-08T20:00", "2026-09-08T21:00"'
+    ', "2026-09-08T22:00", "2026-09-08T23:00", "2026-09-09T00:00", "2026-09-09T01'
+    ':00", "2026-09-09T02:00", "2026-09-09T03:00", "2026-09-09T04:00", "2026-09-0'
+    '9T05:00", "2026-09-09T06:00", "2026-09-09T07:00", "2026-09-09T08:00", "2026-'
+    '09-09T09:00", "2026-09-09T10:00", "2026-09-09T11:00", "2026-09-09T12:00", "2'
+    '026-09-09T13:00", "2026-09-09T14:00", "2026-09-09T15:00", "2026-09-09T16:00"'
+    ', "2026-09-09T17:00", "2026-09-09T18:00", "2026-09-09T19:00", "2026-09-09T20'
+    ':00", "2026-09-09T21:00", "2026-09-09T22:00", "2026-09-09T23:00", "2026-09-1'
+    '0T00:00", "2026-09-10T01:00", "2026-09-10T02:00", "2026-09-10T03:00", "2026-'
+    '09-10T04:00", "2026-09-10T05:00", "2026-09-10T06:00", "2026-09-10T07:00"]}, '
+    '"hourly_units": {"temperature_2m": "\\u00b0C", "time": "iso8601"}, "latitude"'
+    ': 30.544815, "longitude": 103.97647, "timezone": "Asia/Shanghai", "timezone_'
+    'abbreviation": "GMT+8", "utc_offset_seconds": 28800}'
+)
+
+# The REQUEST's own coordinates -- distinct from the echoed, grid-snapped coordinates
+# baked into both payloads above. A defect that recovers identity from echoed
+# coordinates can never reconstruct this request identity; the fix persists it directly.
+_CHENGDU_REQUEST_LATITUDE = 30.558257
+_CHENGDU_REQUEST_LONGITUDE = 103.945966
+_CHENGDU_RUN_ISO = "2026-09-07T00:00"
+_CHENGDU_RUN = datetime(2026, 9, 7, 0, 0, tzinfo=UTC)
+_CHENGDU_TIMEZONE = "Asia/Shanghai"
+_CHENGDU_LOCATION = (
+    _CHENGDU_REQUEST_LATITUDE,
+    _CHENGDU_REQUEST_LONGITUDE,
+    _CHENGDU_TIMEZONE,
+    (date(2026, 9, 8),),
+)
+
+
+def test_single_runs_payload_cache_serves_cross_process_superset_hit_from_persisted_identity(
+    monkeypatch, tmp_path,
+) -> None:
+    """(a) The defect this fix closes: a payload persisted by one process (a 120-h
+    donor) must serve a smaller (72,1) request in a DIFFERENT process with ZERO
+    uncached fetches, using the identity _store_single_runs_payload_cache persisted
+    onto the entry -- never the payload's echoed, grid-snapped coordinates, which never
+    equal the request's own (see _CHENGDU_120H_PAYLOAD's echoed 30.544815,103.97647 vs
+    the request's real 30.558257,103.945966)."""
+    import src.data.bayes_precision_fusion_download as dl
+    import src.data.openmeteo_client as client
+
+    cache_path = tmp_path / "single_runs_payload_cache.json"
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_path", lambda: cache_path)
+
+    calls: list[dict] = []
+
+    def _fetch(_url, params, **kwargs):
+        calls.append(dict(params))
+        return _CHENGDU_120H_PAYLOAD
+
+    monkeypatch.setattr(client, "fetch", _fetch)
+
+    # Process 1 (e.g. the ingest daemon): fetches and durably persists the 120-h donor.
+    dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_CHENGDU_LOCATION], run=_CHENGDU_RUN, forecast_hours=120,
+    )
+    assert len(calls) == 1
+
+    # Process 2 (e.g. the live daemon): fresh in-memory state, only the persisted file
+    # survives -- exactly the cross-process case the defect broke.
+    dl._SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.clear()
+    dl._load_persisted_single_runs_payload_cache(force=True)
+
+    expected_identity = dl._single_runs_payload_identity_key(
+        run_iso=_CHENGDU_RUN_ISO,
+        latitude=_CHENGDU_REQUEST_LATITUDE,
+        longitude=_CHENGDU_REQUEST_LONGITUDE,
+        timezone_name=_CHENGDU_TIMEZONE,
+    )
+    assert expected_identity in dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX, (
+        "the request identity (not the payload's echoed, grid-snapped coordinates) "
+        "must be recoverable from the persisted file after a fresh load"
+    )
+
+    (sliced,) = dl._fetch_single_runs_hourly_payloads_batched(
+        models=["ecmwf_ifs"], locations=[_CHENGDU_LOCATION], run=_CHENGDU_RUN,
+        forecast_hours=72, past_hours=1,
+    )
+
+    assert len(calls) == 1, (
+        "the cross-process (72,1) request must be served from the persisted (120,0) "
+        "donor with ZERO uncached fetches"
+    )
+    assert sliced["hourly"]["time"] == _CHENGDU_72H_PAYLOAD["hourly"]["time"]
+    assert sliced["hourly"]["temperature_2m"] == _CHENGDU_72H_PAYLOAD["hourly"]["temperature_2m"]
+
+
+def test_single_runs_payload_cache_legacy_entry_loaded_but_not_indexed(
+    monkeypatch, tmp_path,
+) -> None:
+    """(b) An entry persisted before this fix (no identity_key/forecast_hours/
+    past_hours fields) is loaded into the payload cache -- still servable by an exact
+    cache-key hit -- but must NOT be indexed for superset lookups: its only
+    identity-recovery path relies on the payload's echoed, grid-snapped coordinates,
+    which never equal a live request's own (an unindexed entry only costs a missed
+    superset hit, never a wrong one)."""
+    import json as json_module
+
+    import src.data.bayes_precision_fusion_download as dl
+
+    cache_path = tmp_path / "single_runs_payload_cache.json"
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_persistence_enabled", lambda: True)
+    monkeypatch.setattr(dl, "_single_runs_payload_cache_path", lambda: cache_path)
+
+    legacy_key = "legacy0123456789"
+    cache_path.write_text(
+        json_module.dumps({
+            "schema_version": dl._SINGLE_RUNS_PAYLOAD_CACHE_SCHEMA_VERSION,
+            "entries": {
+                legacy_key: {
+                    "payload": _CHENGDU_120H_PAYLOAD,
+                    "recorded_at": "2026-09-06T00:00:00+00:00",
+                    # deliberately no identity_key/forecast_hours/past_hours -- this is
+                    # the pre-fix, on-disk shape.
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    dl._SINGLE_RUNS_PAYLOAD_CACHE.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX.clear()
+    dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS.clear()
+    dl._load_persisted_single_runs_payload_cache(force=True)
+
+    assert legacy_key in dl._SINGLE_RUNS_PAYLOAD_CACHE, (
+        "a legacy entry must still be loaded into the payload cache"
+    )
+    assert dl._SINGLE_RUNS_PAYLOAD_CACHE[legacy_key] == _CHENGDU_120H_PAYLOAD
+    assert not dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEX, (
+        "a legacy entry without a persisted identity must not be indexed for "
+        "superset lookups"
+    )
+    assert legacy_key not in dl._SINGLE_RUNS_PAYLOAD_CACHE_INDEXED_KEYS
 
 
 # =====================================================================================
