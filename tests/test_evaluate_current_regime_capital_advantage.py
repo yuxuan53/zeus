@@ -827,6 +827,141 @@ def test_retained_proof_registry_cannot_outlive_current_evidence_window():
     ] == 1
 
 
+def test_scan_floor_excludes_unretained_row_below_floor():
+    forecasts = _settlement_db()
+    forecasts.execute(
+        "INSERT INTO market_events VALUES (?,?,?,?,?,?)",
+        ("condition-1", "Chicago", "2026-08-13", "high", 80, 81),
+    )
+    forecasts.execute(
+        "INSERT INTO settlement_outcomes VALUES (1,?,?,?,?,?,?,?,?)",
+        (
+            "Chicago",
+            "2026-08-13",
+            "high",
+            81,
+            "F",
+            "2026-08-13T20:00:00+00:00",
+            "2026-08-13T20:01:00+00:00",
+            "VERIFIED",
+        ),
+    )
+    forecasts.execute(
+        "INSERT INTO market_events VALUES (?,?,?,?,?,?)",
+        ("condition-2", "New York", "2026-08-15", "high", 82, 83),
+    )
+    forecasts.execute(
+        "INSERT INTO settlement_outcomes VALUES (2,?,?,?,?,?,?,?,?)",
+        (
+            "New York",
+            "2026-08-15",
+            "high",
+            83,
+            "F",
+            "2026-08-15T20:00:00+00:00",
+            "2026-08-15T20:01:00+00:00",
+            "VERIFIED",
+        ),
+    )
+    trades = sqlite3.connect(":memory:")
+    trades.row_factory = sqlite3.Row
+    trades.execute(
+        "CREATE TABLE decision_log (id INTEGER PRIMARY KEY,mode TEXT,"
+        "completed_at TEXT,artifact_json TEXT)"
+    )
+    below_floor = _proof_summary(
+        city="Chicago",
+        target_date="2026-08-13",
+        condition_id="condition-1",
+    )
+    above_floor = _proof_summary(
+        city="New York",
+        target_date="2026-08-15",
+        condition_id="condition-2",
+    )
+    trades.execute(
+        "INSERT INTO decision_log VALUES (1,?,?,?)",
+        (
+            "global_single_order_auction",
+            "2026-08-12T00:00:02+00:00",
+            json.dumps({"summary": below_floor}),
+        ),
+    )
+    trades.execute(
+        "INSERT INTO decision_log VALUES (2,?,?,?)",
+        (
+            "global_single_order_auction",
+            "2026-08-12T00:00:03+00:00",
+            json.dumps({"summary": above_floor}),
+        ),
+    )
+
+    # Floored: decision_log id=1 is below scan_floor_decision_log_id=1 and is
+    # not present in prior_proof_registry, so it must not be re-read -- only
+    # id=2 is admitted.
+    floored = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=evaluator.datetime.fromisoformat("2026-08-16T00:00:00+00:00"),
+        scan_floor_decision_log_id=1,
+    )
+    assert {row["decision_log_id"] for row in floored["samples"]} == {2}
+    assert floored["independent_target_date_count"] == 1
+    assert floored["scanned_max_decision_log_id"] == 2
+
+    # Unfloored (today's default): both rows are read and admitted.
+    full_scan = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=evaluator.datetime.fromisoformat("2026-08-16T00:00:00+00:00"),
+        scan_floor_decision_log_id=0,
+    )
+    assert {row["decision_log_id"] for row in full_scan["samples"]} == {1, 2}
+    assert full_scan["scanned_max_decision_log_id"] == 2
+
+
+def test_prior_scan_floor_missing_or_invalid_artifact_means_full_scan(tmp_path):
+    missing = tmp_path / "missing.json"
+    assert evaluator._prior_scan_floor(missing) == 0
+
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text(
+        json.dumps({"settled_counterfactuals": {}}), encoding="utf-8"
+    )
+    assert evaluator._prior_scan_floor(invalid) == 0
+
+    negative = tmp_path / "negative.json"
+    negative.write_text(
+        json.dumps(
+            {
+                "settled_counterfactuals": {
+                    "combined_current_global_selection": {
+                        "scanned_max_decision_log_id": -5,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert evaluator._prior_scan_floor(negative) == 0
+
+
+def test_scan_floor_round_trips_through_persisted_artifact(tmp_path):
+    artifact_path = tmp_path / "capital.json"
+    payload = {
+        "evaluated_at": "2026-09-01T00:00:00+00:00",
+        "verdict": "FAIL",
+        "settled_counterfactuals": {
+            "combined_current_global_selection": {
+                "scanned_max_decision_log_id": 42,
+            }
+        },
+    }
+
+    assert evaluator._atomic_write(artifact_path, payload) is True
+    assert evaluator._prior_scan_floor(artifact_path) == 42
+
+
 def test_live_curve_requires_exact_schema_22_edli_receipt_binding():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

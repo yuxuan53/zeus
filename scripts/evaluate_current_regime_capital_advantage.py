@@ -740,7 +740,47 @@ def _settled_global_counterfactual_evidence(
     as_of: datetime,
     prior_proof_registry: Sequence[Mapping[str, object]] = (),
     prior_realized_proof_samples: Mapping[int, Mapping[str, object]] | None = None,
+    scan_floor_decision_log_id: int = 0,
 ) -> dict[str, object]:
+    """Scan decision_log for settled proof_counterfactual evidence.
+
+    ``scan_floor_decision_log_id`` bounds the window query to
+    ``id > max(scan_floor_decision_log_id, MAX(id)-10000)`` instead of always
+    re-reading the full 10k-id tail (5,559 rows / 1.5 GB of artifact_json
+    warm, ~39s on the live DB). Advancing the floor to a prior run's
+    ``scanned_max_decision_log_id`` is safe -- byte-identical admitted
+    evidence for the same inputs -- because every row with
+    ``id <= scan_floor_decision_log_id`` was already evaluated by that prior
+    run and its outcome is one of:
+
+      * ADMITTED -- it is then present in ``prior_proof_registry`` and is
+        still revalidated below, one row at a time by id (bounded by
+        registry size, not window size: cheap).
+      * REJECTED -- for a reason that is a deterministic function of the row
+        and the window, with one exception: the window's lower cutoff
+        (``as_of - WINDOW_DAYS``) moves forward as ``as_of`` advances, which
+        can only push a previously in-window row OUT of window on a later
+        run -- the cutoff is monotone non-decreasing in ``as_of`` and the
+        row's ``decision_at_utc`` is fixed, so it can never pull a
+        previously out-of-window row back in. A row rejected as
+        out-of-window stays rejected; any row that stayed in-window and was
+        not rejected was admitted, so it is covered by the first case.
+
+    ``duplicate_target_date`` rejection is order-dependent (the first writer
+    to ``registry_by_target_date`` for a given independence_key wins), but
+    the retained-registry loop below always runs before the freshly scanned
+    window rows, so a retained entry -- representing an id at or below the
+    floor -- always wins its target date over any later-id row with the
+    same date, exactly matching the un-floored full scan's
+    ``ORDER BY id ASC`` admission order.
+
+    Net effect: bounding the scan below the floor can only skip rows this
+    evaluator already adjudicated and either retained (and revalidates) or
+    determined are permanently out of window; it cannot admit a different
+    row, flip which row wins a duplicate target date, or change any
+    admitted sample's values.
+    """
+
     cutoff = (as_of - timedelta(days=WINDOW_DAYS)).isoformat()
     # Reconstructing the same audit_context_sha256 twice always yields the
     # same verified content (the hash proves it); this cache is fresh per
@@ -748,14 +788,29 @@ def _settled_global_counterfactual_evidence(
     # within one evaluate() run and cannot change any admitted value.
     audit_context_cache: dict[str, dict[str, object]] = {}
     prior_samples_by_decision_log_id = prior_realized_proof_samples or {}
+    try:
+        floor = int(scan_floor_decision_log_id)
+    except (TypeError, ValueError):
+        floor = 0
+    if floor < 0:
+        floor = 0
+    max_id_row = trades.execute(
+        "SELECT COALESCE(MAX(id),0) FROM decision_log"
+    ).fetchone()
+    current_max_decision_log_id = int(max_id_row[0])
+    effective_floor = max(floor, current_max_decision_log_id - 10000)
     rows = trades.execute(
         "SELECT id,artifact_json FROM decision_log "
         "WHERE mode IN (?,?,?) AND completed_at>=? AND completed_at<=? "
-        "AND id > (SELECT COALESCE(MAX(id),0)-10000 FROM decision_log) "
+        "AND id > ? "
         "AND instr(artifact_json, '\"proof_counterfactual\"') > 0 "
         "ORDER BY id ASC",
-        (*GLOBAL_AUCTION_RECEIPT_MODES, cutoff, as_of.isoformat()),
+        (*GLOBAL_AUCTION_RECEIPT_MODES, cutoff, as_of.isoformat(), effective_floor),
     ).fetchall()
+    scanned_max_decision_log_id = max(
+        (int(row["id"]) for row in rows),
+        default=current_max_decision_log_id,
+    )
     samples: list[dict[str, object]] = []
     registry_by_target_date: dict[str, dict[str, object]] = {}
     rejection_counts: dict[str, int] = {}
@@ -912,6 +967,7 @@ def _settled_global_counterfactual_evidence(
         ],
         "rejection_counts": dict(sorted(rejection_counts.items())),
         "samples": samples,
+        "scanned_max_decision_log_id": scanned_max_decision_log_id,
     }
 
 
@@ -2290,6 +2346,7 @@ def evaluate(
     prior_proof_registry: Sequence[Mapping[str, object]] = (),
     prior_portfolio_observations: Sequence[Mapping[str, object]] = (),
     prior_realized_proof_samples: Mapping[int, Mapping[str, object]] | None = None,
+    scan_floor_decision_log_id: int = 0,
 ) -> dict[str, object]:
     trades = _read_only(
         trades_path,
@@ -2335,6 +2392,7 @@ def evaluate(
                     as_of=as_of,
                     prior_proof_registry=prior_proof_registry,
                     prior_realized_proof_samples=prior_realized_proof_samples,
+                    scan_floor_decision_log_id=scan_floor_decision_log_id,
                 )
             )
         }
@@ -2506,6 +2564,25 @@ def _prior_proof_registry(path: Path) -> tuple[Mapping[str, object], ...]:
     return tuple(registry)
 
 
+def _prior_scan_floor(path: Path) -> int:
+    """Load the prior run's scanned decision_log frontier; 0 means full scan.
+
+    A missing or invalid artifact, field, or value means 0 -- today's
+    unbounded (10k-tail) scan -- never a guessed floor that could skip a row
+    no prior run actually read.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = payload["settled_counterfactuals"][
+            "combined_current_global_selection"
+        ]["scanned_max_decision_log_id"]
+        floor = int(value)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+    return floor if floor > 0 else 0
+
+
 def _prior_realized_proof_samples(path: Path) -> dict[int, Mapping[str, object]]:
     """Load fully realized samples from the prior artifact, by decision_log_id.
 
@@ -2564,6 +2641,7 @@ def main() -> int:
     prior_proof_registry = _prior_proof_registry(args.artifact)
     prior_portfolio_observations = _prior_portfolio_observations(args.artifact)
     prior_realized_proof_samples = _prior_realized_proof_samples(args.artifact)
+    scan_floor_decision_log_id = _prior_scan_floor(args.artifact)
     try:
         artifact = evaluate(
             world_path=world,
@@ -2573,6 +2651,7 @@ def main() -> int:
             prior_proof_registry=prior_proof_registry,
             prior_portfolio_observations=prior_portfolio_observations,
             prior_realized_proof_samples=prior_realized_proof_samples,
+            scan_floor_decision_log_id=scan_floor_decision_log_id,
         )
     except (OSError, sqlite3.Error, ValueError) as exc:
         artifact = {
