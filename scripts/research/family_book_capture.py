@@ -452,7 +452,9 @@ async def run(args: argparse.Namespace) -> None:
     ladders: dict[str, Ladder] = {}
     initialised: dict[str, int] = {}
     stats: dict[str, int] = {"dropped_uninitialised": 0}
-    epoch = 0
+    # Epochs must be unique across process restarts: a fresh process must not re-use an epoch
+    # number already present in the DB (coverage validity groups rows by connection_epoch).
+    epoch = int(sink.conn.execute("SELECT COALESCE(MAX(connection_epoch), 0) FROM book_top").fetchone()[0])
     reconnects = 0
     msgs_window: list[float] = []
     stop_at = time.monotonic() + args.duration_s if args.duration_s else None
