@@ -487,7 +487,10 @@ async def run(args: argparse.Namespace) -> None:
     t_start = time.monotonic()
 
     while stop_at is None or time.monotonic() < stop_at:
-        if not universe or time.monotonic() - last_universe >= UNIVERSE_REFRESH_S:
+        # Refresh the universe here only when we have none. A reconnect after a venue-side drop
+        # must not wait behind a 300-request Gamma sweep (measured 3-4 min of coverage lost per
+        # drop); the in-connection refresh below handles additions with operation:subscribe.
+        if not universe:
             new_universe = await asyncio.to_thread(resolve_universe, cities, days_ahead=args.days_ahead, fetch=fetch)
             if new_universe:
                 universe = new_universe
