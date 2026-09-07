@@ -1123,11 +1123,17 @@ def _order_capital_ledger(
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='venue_trade_facts'"
     ).fetchone():
+        # venue_commands.created_at carries 3 legacy 'adopted_exit_*' rows
+        # stored as bare unix-epoch strings (not ISO-8601) — verified
+        # 2026-09-07 — so scope.created_at keeps datetime() to stay
+        # correct for those rows. venue_trade_facts.observed_at is
+        # lexically-sortable ISO-8601 on every sampled row (5,210 rows,
+        # all '20*'), so fact.observed_at drops datetime() for the index.
         source_scope = (
             "JOIN venue_commands scope ON scope.command_id=fact.command_id "
             "WHERE datetime(scope.created_at)>=datetime(?) "
             "AND datetime(scope.created_at)<=datetime(?) "
-            "AND datetime(fact.observed_at)<=datetime(?)"
+            "AND fact.observed_at<=?"
         )
         trade_rows = conn.execute(
             f"WITH {canonical_trade_fact_cte(source_clause_sql=source_scope)},"
@@ -1161,11 +1167,16 @@ def _order_capital_ledger(
         "FROM venue_commands AS vc "
         "LEFT JOIN venue_submission_envelopes AS vse "
         "ON vse.envelope_id=vc.envelope_id "
+        # execution_fact.filled_at is lexically-sortable ISO-8601 UTC on
+        # every sampled row (2,572 rows, all '20*') so it drops datetime().
+        # vc.created_at keeps datetime() throughout — venue_commands has 3
+        # legacy 'adopted_exit_*' rows stored as bare unix-epoch strings
+        # that would sort/compare wrong lexically against ISO-8601 peers.
         "LEFT JOIN execution_fact AS ef ON ef.command_id=vc.command_id "
-        "AND (ef.filled_at IS NULL OR datetime(ef.filled_at)<=datetime(?)) "
+        "AND (ef.filled_at IS NULL OR ef.filled_at<=?) "
         "WHERE datetime(vc.created_at)>=datetime(?) "
         "AND datetime(vc.created_at)<=datetime(?) "
-        "ORDER BY datetime(vc.created_at),vc.command_id,datetime(ef.filled_at),ef.intent_id",
+        "ORDER BY datetime(vc.created_at),vc.command_id,ef.filled_at,ef.intent_id",
         (as_of.isoformat(), cutoff.isoformat(), as_of.isoformat()),
     ).fetchall()
     grouped: dict[str, dict[str, object]] = {}
@@ -1320,10 +1331,17 @@ def _order_capital_ledger(
             realized_pnl = None
             gain_status = "ENTRY_ACQUISITION_NOT_REALIZED_GAIN"
         elif intent == "EXIT":
+            # position_events.occurred_at is CHECK-constrained to either
+            # 'QUARANTINE' or the ISO-8601 'YYYY-MM-DDT...' shape (see
+            # sqlite_master), so plain string comparison is byte-identical
+            # to datetime()<=datetime() here (a bare 'QUARANTINE' compares
+            # >= every ISO date lexically, matching datetime('QUARANTINE')
+            # evaluating to NULL/excluded either way) while letting SQLite
+            # use the position_id index without a per-row function call.
             raw_exit_events = conn.execute(
                 "SELECT payload_json FROM position_events "
                 "WHERE position_id=? AND event_type='EXIT_ORDER_FILLED' "
-                "AND command_id=? AND datetime(occurred_at)<=datetime(?) "
+                "AND command_id=? AND occurred_at<=? "
                 "ORDER BY sequence_no LIMIT 2",
                 (
                     str(item["position_id"]),
@@ -1350,7 +1368,7 @@ def _order_capital_ledger(
                     "WHERE position_id=? "
                     "AND caused_by IN "
                     "('partial_exit_fill','partial_exit_economics_repair') "
-                    "AND datetime(occurred_at)<=datetime(?) "
+                    "AND occurred_at<=? "
                     "AND (command_id=? OR lower(COALESCE(order_id,''))=lower(?) "
                     "OR json_extract(payload_json,'$.command_id')=? "
                     "OR lower(COALESCE(json_extract(payload_json,'$.venue_order_id'),''))"
@@ -1475,10 +1493,14 @@ def _current_total_portfolio_capital(
     """Bracket total capital from Chain cash and exact current held tokens."""
 
     collateral = conn.execute(
+        # captured_at is a lexically-sortable ISO-8601 UTC string on every
+        # sampled row (verified 2026-09-07: 228,505 rows, all matching
+        # '20*'), so plain string comparison/ordering matches datetime()
+        # here while letting SQLite use an index on the bare column.
         "SELECT id,pusd_balance_micro,reserved_pusd_for_buys_micro,captured_at,"
         "authority_tier FROM collateral_ledger_snapshots "
-        "WHERE datetime(captured_at)<=datetime(?) "
-        "ORDER BY datetime(captured_at) DESC,id DESC LIMIT 1",
+        "WHERE captured_at<=? "
+        "ORDER BY captured_at DESC,id DESC LIMIT 1",
         (as_of.isoformat(),),
     ).fetchone()
     if collateral is None:
@@ -1585,12 +1607,15 @@ def _current_total_portfolio_capital(
             except (TypeError, ValueError):
                 latest_quote_at = None
             if latest_quote_at is None or latest_quote_at > as_of:
+                # quote_seen_at is lexically-sortable ISO-8601 UTC on every
+                # sampled row (verified 2026-09-07), so plain comparison and
+                # ordering match datetime() while remaining index-usable.
                 book = conn.execute(
                     "SELECT quote_seen_at,depth_before_json "
                     "FROM execution_feasibility_evidence "
                     "WHERE token_id=? AND direction=? "
-                    "AND datetime(quote_seen_at)<=datetime(?) "
-                    "ORDER BY datetime(quote_seen_at) DESC,rowid DESC LIMIT 1",
+                    "AND quote_seen_at<=? "
+                    "ORDER BY quote_seen_at DESC,rowid DESC LIMIT 1",
                     (selected_token, direction, as_of.isoformat()),
                 ).fetchone()
         if book is None:
@@ -1862,11 +1887,14 @@ def _globally_selected_exit_quality(
             ).fetchone()
             if command is None or str(command[1]) != "FILLED":
                 raise ValueError("filled exit venue command unavailable")
+            # position_events.occurred_at is CHECK-constrained to either
+            # 'QUARANTINE' or the ISO-8601 'YYYY-MM-DDT...' shape, so plain
+            # comparison is byte-identical to datetime()<=datetime() here.
             intents = conn.execute(
                 "SELECT occurred_at,payload_json FROM position_events "
                 "WHERE position_id=? AND event_type='EXIT_INTENT' "
-                "AND datetime(occurred_at)<=datetime(?) "
-                "AND datetime(occurred_at)<=datetime(?) "
+                "AND occurred_at<=? "
+                "AND occurred_at<=? "
                 "ORDER BY sequence_no DESC LIMIT 1",
                 (position_id, command[0], realized_at.isoformat()),
             ).fetchall()
@@ -1963,19 +1991,34 @@ def _globally_selected_exit_quality(
         except (TypeError, ValueError):
             pass
 
+        # quote_seen_at is lexically-sortable ISO-8601 UTC on every sampled
+        # row of this table (6,284,470 rows, verified 2026-09-07), so plain
+        # string comparison/ordering matches datetime() while letting
+        # SQLite use idx_execution_feasibility_evidence_token_time
+        # (token_id, quote_seen_at) instead of scanning every row.
         path_rows = conn.execute(
             "SELECT quote_seen_at,depth_before_json FROM execution_feasibility_evidence "
-            "WHERE token_id=? AND datetime(quote_seen_at)>datetime(?) "
-            "AND datetime(quote_seen_at)<=datetime(?) "
+            "WHERE token_id=? AND quote_seen_at>? "
+            "AND quote_seen_at<=? "
             "AND depth_before_json IS NOT NULL AND depth_before_json!='' "
-            "ORDER BY datetime(quote_seen_at),rowid",
+            "ORDER BY quote_seen_at,rowid",
             (str(command[2]), fill_at.isoformat(), as_of.isoformat()),
         ).fetchall()
-        executable_path = [
-            (str(path[0]), vwap)
-            for path in path_rows
-            if (vwap := _executable_bid_vwap(path[1], fill_shares)) is not None
-        ]
+        # Consecutive quotes very often carry the identical order-book
+        # snapshot (the book didn't change between polls). _executable_bid_vwap
+        # is a pure function of (depth_before_json, fill_shares), so memoise
+        # by the exact JSON text within this position's own path — this
+        # changes nothing about which rows are read or the resulting max,
+        # it only skips re-parsing a depth blob already seen for this call.
+        vwap_cache: dict[str, float | None] = {}
+        executable_path = []
+        for path in path_rows:
+            depth_json = path[1]
+            if depth_json not in vwap_cache:
+                vwap_cache[depth_json] = _executable_bid_vwap(depth_json, fill_shares)
+            vwap = vwap_cache[depth_json]
+            if vwap is not None:
+                executable_path.append((str(path[0]), vwap))
         observed_peak = (
             max(vwap for _, vwap in executable_path) if executable_path else None
         )
@@ -2183,9 +2226,12 @@ def _held_to_binary_settlement_quality(
         settled_at = _parse_aware(position[6])
         if not decision_at < settled_at:
             continue
+        # position_events.occurred_at is CHECK-constrained to either
+        # 'QUARANTINE' or the ISO-8601 'YYYY-MM-DDT...' shape, so plain
+        # comparison is byte-identical to datetime()>datetime() here.
         if conn.execute(
             "SELECT 1 FROM position_events WHERE position_id=? "
-            "AND event_type='EXIT_ORDER_FILLED' AND datetime(occurred_at)>datetime(?) "
+            "AND event_type='EXIT_ORDER_FILLED' AND occurred_at>? "
             "LIMIT 1",
             (position_id, decision_at.isoformat()),
         ).fetchone():
