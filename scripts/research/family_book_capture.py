@@ -477,6 +477,7 @@ async def run(args: argparse.Namespace) -> None:
     # number already present in the DB (coverage validity groups rows by connection_epoch).
     epoch = int(sink.conn.execute("SELECT COALESCE(MAX(connection_epoch), 0) FROM book_top").fetchone()[0])
     reconnects = 0
+    connected_at_mono = 0.0
     msgs_window: list[float] = []
     stop_at = time.monotonic() + args.duration_s if args.duration_s else None
     last_universe = -1e9
@@ -599,8 +600,14 @@ async def run(args: argparse.Namespace) -> None:
                 now_iso=datetime.now(UTC).isoformat(), connected=False, subscribed=len(subscribed), msgs_per_min=0.0,
                 reconnects=reconnects, dropped_uninitialised=stats["dropped_uninitialised"], db_bytes=sink.db_bytes(),
             )
+            # Backoff counts only consecutive failures: a connection that streamed for a
+            # minute or more resets it. The venue closes healthy sockets every ~8-12 min, and
+            # an ever-growing delay (58 s by drop #29) was costing more coverage than the drops.
+            held_s = time.monotonic() - connected_at_mono if connected_at_mono else 0.0
+            if held_s >= 60.0:
+                reconnects = 1
             delay = min(60.0, 2.0 * reconnects)
-            log.warning("websocket dropped (%s); reconnect #%d in %.0f s", exc, reconnects, delay)
+            log.warning("websocket dropped after %.0f s (%s); reconnect #%d in %.0f s", held_s, exc, reconnects, delay)
             await asyncio.sleep(delay)
     rows_per_day = _rows_per_day(sink.rows_written, steady_rows_at, steady_t0, time.monotonic())
     print(json.dumps({
