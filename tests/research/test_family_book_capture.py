@@ -198,7 +198,9 @@ def test_sink_depth_checkpoint_is_time_gated_per_token_independent_of_top(tmp_pa
     now_iso = datetime.now(UTC).isoformat()
     assert s.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=0.0, epoch=1) == 1
     assert s.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=30.0, epoch=1) == 0  # inside the 60 s window
-    assert s.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=61.0, epoch=1) == 1
+    assert s.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=61.0, epoch=1) == 0  # window elapsed, ladder unchanged: no row
+    next(iter(ladders.values())).apply_change("BUY", 0.41, 5.0)
+    assert s.maybe_checkpoint_depth(ladders, now_iso=now_iso, now_mono=62.0, epoch=1) == 1  # changed after the window: row
     assert s.conn.execute("SELECT COUNT(*) FROM book_depth").fetchone()[0] == 2
     assert s.conn.execute("SELECT connection_epoch FROM book_depth LIMIT 1").fetchone()[0] == 1
 
