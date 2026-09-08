@@ -103,6 +103,7 @@ def _snapshot(snapshot_id: str = "snap-ws") -> ExecutableMarketSnapshot:
 
 def _envelope(
     *,
+    order_id: str = "ord-ws",
     side: str = "BUY",
     price: Decimal = Decimal("0.50"),
     size: Decimal = Decimal("10"),
@@ -132,8 +133,8 @@ def _envelope(
         signed_order=b"fake-signed-order",
         signed_order_hash=HASH_E,
         raw_request_hash=HASH_A,
-        raw_response_json=json.dumps({"orderID": "ord-ws", "status": "live"}, sort_keys=True),
-        order_id="ord-ws",
+        raw_response_json=json.dumps({"orderID": order_id, "status": "live"}, sort_keys=True),
+        order_id=order_id,
         trade_ids=("trade-ws",),
         transaction_hashes=("0xtx",),
         error_code=None,
@@ -1158,7 +1159,7 @@ def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
         command_id="cmd-other",
         snapshot_id="snap-ws",
         envelope_id="env-other",
-        submission_envelope=_envelope(),
+        submission_envelope=_envelope(order_id="ord-other"),
         position_id="2",
         decision_id="dec-other",
         idempotency_key="idem-cmd-other",
