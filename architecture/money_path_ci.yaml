@@ -274,6 +274,15 @@ segments:
       - tests/test_phase_aware_kelly_live.py
     future_object_rules:
       price_probability_assignment: requires_economic_isolation_test
+  post_fill_observation:
+    invariant_ids: [MP-EXT-001, MP-EXT-002, MP-SCH-001, MP-SCH-002]
+    files:
+      - src/ingest/post_fill_book_observer.py
+      - src/state/post_fill_book_repo.py
+      - src/state/schema/post_fill_book_observations_schema.py
+    relationship_tests:
+      - tests/ingest/test_post_fill_book_observer.py
+      - tests/state/test_post_fill_book_repo.py
   external_truth:
     invariant_ids: [MP-EXT-001, MP-EXT-002]
     files:

@@ -88,6 +88,17 @@ economic_objects:
         meaning: "Settlement source finality time."
 
 state_machines:
+  post_fill_book_observation_reason:
+    owner: src/ingest/post_fill_book_observer.py
+    description: >
+      Passive capture rejection reason when the local acquisition clock moves
+      backward. CLOCK_ROLLBACK is recorded on a FETCH_ERROR observation event;
+      it is not a position, command, order, or venue lifecycle state and grants
+      no trading authority.
+    states:
+      - CLOCK_ROLLBACK
+    invariant_tests:
+      - tests/ingest/test_post_fill_book_observer.py
   reactor_runtime_config:
     owner: src/engine/event_reactor_adapter.py
     description: >
