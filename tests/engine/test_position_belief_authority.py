@@ -600,6 +600,108 @@ class TestLoadReplacementBelief:
         assert belief is None
         assert elapsed < 0.18
 
+    @pytest.mark.parametrize("metric", ("high", "low"))
+    @pytest.mark.parametrize(
+        ("error_kind", "remaining", "expect_deferred"),
+        (
+            ("busy", 0.0005, True),
+            ("busy_snapshot", 0.0005, True),
+            ("busy", 0.001, False),
+            ("busy", 0.01, False),
+            ("non_busy", 0.0005, False),
+            ("message_only", 0.0005, False),
+            ("busy", 0.0, True),
+            ("absent", 0.0005, False),
+        ),
+    )
+    def test_world_floor_error_preserves_monitor_budget_boundary(
+        self, forecasts_db, tmp_path, monkeypatch, metric,
+        error_kind, remaining, expect_deferred,
+    ):
+        """A swallowed lock failure cannot turn an exhausted read into a belief."""
+        from types import SimpleNamespace
+
+        import src.data.replacement_forecast_current_target_plan as target_plan
+        import src.engine.position_belief as pb
+
+        _insert(
+            forecasts_db,
+            posterior_id="world-floor-budget-boundary",
+            computed_at=(NOW - timedelta(minutes=5)).isoformat(),
+            q={BIN: 0.24},
+            metric=metric,
+            source_cycle_time=(NOW - timedelta(hours=1)).isoformat(),
+        )
+        world_db = tmp_path / "world-floor-native-error.db"
+        owner = sqlite3.connect(world_db, timeout=0)
+        reader = sqlite3.connect(world_db, timeout=0)
+        try:
+            if error_kind == "busy_snapshot":
+                owner.execute("PRAGMA journal_mode=WAL")
+            owner.execute("CREATE TABLE sample (value INTEGER)")
+            owner.commit()
+            if error_kind == "busy_snapshot":
+                reader.execute("BEGIN")
+                reader.execute("SELECT * FROM sample").fetchall()
+                owner.execute("INSERT INTO sample VALUES (1)")
+                owner.commit()
+                query = "INSERT INTO sample VALUES (2)"
+            elif error_kind in {"busy", "message_only"}:
+                owner.execute("BEGIN EXCLUSIVE")
+                query = "SELECT * FROM sample"
+            else:
+                query = "SELECT * FROM absent_table"
+            with pytest.raises(sqlite3.OperationalError) as native:
+                reader.execute(query).fetchall()
+            error = native.value
+            if error_kind.startswith("busy"):
+                assert error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+                if error_kind == "busy_snapshot":
+                    assert error.sqlite_errorcode != sqlite3.SQLITE_BUSY
+            elif error_kind == "message_only":
+                error = sqlite3.OperationalError(str(error))
+                assert not hasattr(error, "sqlite_errorcode")
+        finally:
+            reader.rollback()
+            owner.rollback()
+            reader.close()
+            owner.close()
+
+        clock = {"now": 0.0}
+        connections = []
+
+        def read_floor(conn, **kwargs):
+            assert kwargs["temperature_metric"] == metric
+            assert kwargs["require_settlement_channel"] is True
+            connections.append(conn)
+            clock["now"] = 1.0 - remaining
+            if error_kind == "absent":
+                return None
+            raise error
+
+        monkeypatch.setattr(pb, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+        monkeypatch.setattr(target_plan, "_latest_authorized_day0_fact", read_floor)
+        belief = load_replacement_belief(
+            city="Karachi",
+            target_date="2026-06-12",
+            temperature_metric=metric,
+            bin_label=BIN,
+            direction="buy_no",
+            now=NOW,
+            db_path=forecasts_db,
+            world_db_path=str(world_db),
+            deadline_monotonic=1.0,
+        )
+
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connections[0].execute("SELECT 1")
+        if expect_deferred:
+            assert belief is None
+        else:
+            assert belief is not None
+            assert belief.held_side_prob == pytest.approx(0.76)
+
     def test_monitor_deadline_interrupts_primary_belief_sql(
         self, forecasts_db, monkeypatch, caplog
     ):

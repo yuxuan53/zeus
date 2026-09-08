@@ -87,7 +87,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 class _BeliefReadDeadlineExceeded(TimeoutError):
-    """A bounded held-belief read exhausted its caller-owned deadline."""
+    """A bounded held-belief read exhausted its usable caller-owned budget."""
 
 
 def _remaining_read_timeout(
@@ -124,9 +124,16 @@ def _bounded_sqlite_read(conn: sqlite3.Connection, deadline_monotonic: float | N
         yield
         _remaining_read_timeout(deadline_monotonic)
     except sqlite3.OperationalError as exc:
-        if time.monotonic() >= float(deadline_monotonic):
+        remaining = float(deadline_monotonic) - time.monotonic()
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        native_busy = (
+            isinstance(error_code, int)
+            and error_code & 0xFF == sqlite3.SQLITE_BUSY
+        )
+        # Native BUSY can exhaust SQLite's integer-ms wait before the deadline.
+        if remaining <= 0.0 or (native_busy and remaining < 0.001):
             raise _BeliefReadDeadlineExceeded(
-                "held-belief SQLite read deadline elapsed"
+                "held-belief SQLite read budget exhausted"
             ) from exc
         raise
     finally:
@@ -673,7 +680,7 @@ def _observed_running_extreme_native(
                     decision_time=now,
                     require_settlement_channel=True,
                 )
-            except (sqlite3.Error, TypeError, ValueError):
+            except (TypeError, ValueError):
                 fact = None
             if fact is not None:
                 try:
@@ -681,6 +688,9 @@ def _observed_running_extreme_native(
                 except (KeyError, TypeError, ValueError, OverflowError):
                     return None
                 return observed if math.isfinite(observed) else None
+        return None
+    except sqlite3.Error:
+        # Budget errors must reach the deadline context before optional-floor recovery.
         return None
     finally:
         try:
