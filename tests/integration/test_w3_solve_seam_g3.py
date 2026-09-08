@@ -36125,12 +36125,286 @@ def test_global_sell_single_flight_is_command_truth_not_lifecycle_intent(
     ) is expected
 
 
-def test_global_batch_has_no_synthetic_alpha_event_producer():
-    import inspect
+_PR524_SYNTHETIC_DECISION_AT = _dt.datetime(
+    2026, 7, 10, 8, 0, tzinfo=_dt.timezone.utc
+)
 
-    source = inspect.getsource(global_batch_runtime.process_current_global_batch)
-    assert "MARKET_RELATIVE_ALPHA_SHADOW" not in source
-    assert "NoTradeRegretLedger" not in source
+
+def _pr524_current_witness(family_key: str):
+    binding = OutcomeTokenBinding("bin", "condition", "token", "no-token")
+    samples = np.tile(np.asarray(((1.0,),)), (400, 1))
+    identity = joint_probability_witness_identity(
+        family_key=family_key,
+        bindings=(binding,),
+        q_version="q-current",
+        resolution_identity="resolution-current",
+        topology_identity="topology-current",
+        posterior_identity_hash="run-alpha",
+        source_truth_identity="source-current",
+        authority_certificate_hash="certificate-current",
+        band_alpha=0.05,
+        band_basis="PARAMETER_POSTERIOR_SIMPLEX_V1",
+        yes_point_q=np.asarray((1.0,)),
+        yes_q_samples=samples[:, :1],
+        captured_at_utc=_PR524_SYNTHETIC_DECISION_AT,
+    )
+    return JointOutcomeProbabilityWitness(
+        family_key=family_key,
+        bindings=(binding,),
+        yes_point_q=np.asarray((1.0,)),
+        yes_q_samples=samples[:, :1],
+        q_version="q-current",
+        resolution_identity="resolution-current",
+        topology_identity="topology-current",
+        posterior_identity_hash="run-alpha",
+        source_truth_identity="source-current",
+        authority_certificate_hash="certificate-current",
+        band_alpha=0.05,
+        band_basis="PARAMETER_POSTERIOR_SIMPLEX_V1",
+        captured_at_utc=_PR524_SYNTHETIC_DECISION_AT,
+        max_age=_dt.timedelta(seconds=30),
+        witness_identity=identity,
+    )
+
+
+def _pr524_selected_global_batch_fixture(event):
+    scope = current_global_auction_scope_from_events(
+        (event,),
+        captured_at_utc=_PR524_SYNTHETIC_DECISION_AT,
+    )
+    family_key = scope.family_keys[0]
+    witness = _pr524_current_witness(family_key)
+    candidate = _global_test_buy_candidate(
+        family_key=family_key,
+        probability_witness_identity=witness.witness_identity,
+        book_identity="book-current",
+        price="0.40",
+        captured_at=_PR524_SYNTHETIC_DECISION_AT,
+        candidate_id="candidate-current",
+        bin_id="bin",
+        condition_id="condition",
+        token_id="token",
+    )
+    book = _global_test_candidate_book(
+        candidate,
+        epoch_captured_at=_PR524_SYNTHETIC_DECISION_AT,
+    )
+    evaluation = GlobalSingleOrderCandidateEvaluation(
+        candidate_id=candidate.candidate_id,
+        family_key=family_key,
+        bin_id=candidate.bin_id,
+        condition_id=candidate.condition_id,
+        side=candidate.side,
+        token_id=candidate.token_id,
+        action="BUY",
+        status="REJECTED",
+        execution_mode="TAKER_LIMIT",
+        rejection_reason=(
+            "STRATEGY_POLICY_GATED:forecast_qkernel_entry:"
+            "sources=risk_action:gate"
+        ),
+    )
+    growth = SimpleNamespace(
+        probability_basis="POSTERIOR_PREDICTIVE_MEAN",
+        expected_delta_log_wealth=0.10,
+        expected_ev_usd=1.0,
+        expected_capital_efficiency=0.10,
+        expected_log_growth_per_hour=0.01,
+        capital_lock_hours=1.0,
+        ruin_probability_reduction=0.0,
+    )
+    decision = SimpleNamespace(
+        candidate=candidate,
+        candidate_evaluations=(evaluation,),
+        shares=Decimal("2"),
+        cost_usd=Decimal("0.80"),
+        expected_growth=growth,
+        no_trade_reason=None,
+    )
+    actuation = SimpleNamespace(
+        decision=decision,
+        actuation_identity="actuation-current",
+        economic_identity="economics-current",
+        wealth_witness_identity="wealth-current",
+    )
+    selected = SimpleNamespace(
+        decision=decision,
+        winner_event_id=event.event_id,
+        actuation=actuation,
+        holding_coverage=(),
+    )
+    prepared = bridge.PreparedGlobalFamily(
+        decision_id="prepared-current",
+        probability_witness=witness,
+        candidate_seeds=(),
+    )
+    return scope, family_key, candidate, book, prepared, selected
+
+
+def test_real_global_batch_has_no_synthetic_producer_and_preserves_auction_contract(
+    monkeypatch,
+):
+    """A real global cut cannot persist hypothetical alpha event rows."""
+    from src.data import replacement_input_hwm
+    from src.state.schema.no_trade_regret_events_schema import (
+        ensure_table as ensure_regret_table,
+    )
+
+    event = _global_scope_event(city="Alpha", source_run_id="run-alpha")
+    scope, family_key, _candidate, book, prepared, selected = (
+        _pr524_selected_global_batch_fixture(event)
+    )
+    world_conn = sqlite3.connect(":memory:")
+    ensure_regret_table(world_conn)
+
+    releases: list[str] = []
+    store_calls: list[dict[str, object]] = []
+    venue_calls = {"count": 0}
+    selections = iter((selected, selected))
+
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "_begin_selection_read_snapshot",
+        lambda *_args, **_kwargs: lambda: releases.append("selection"),
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "prime_frozen_schema_reads",
+        lambda *_args, **_kwargs: lambda: releases.append("schema"),
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "scan_current_global_auction_scope",
+        lambda **_kwargs: scope,
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "_load_current_maker_fill_samples",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "current_portfolio_wealth_witness",
+        lambda *_args, **_kwargs: _WealthNamespace(
+            spendable_cash_usd=Decimal("10"),
+            economic_identity="wealth-current",
+            witness_identity="wealth-current",
+            ledger_snapshot_id="ledger-current",
+        ),
+    )
+
+    def store_receipt(*_args, **kwargs):
+        store_calls.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "_store_global_auction_receipt",
+        store_receipt,
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "_store_global_preflight_receipt",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "_capital_proof_counterfactual_receipt",
+        lambda selected, **kwargs: {
+            "role": "SIDE_EFFECT_FREE_CAPITAL_COUNTERFACTUAL",
+            "winner": {"candidate_id": selected.decision.candidate.candidate_id},
+            "venue_actuation_available": False,
+            "selection_epoch_identity": kwargs["selection_epoch_identity"],
+        },
+    )
+    monkeypatch.setattr(
+        global_batch_runtime,
+        "select_prepared_global_auction",
+        lambda *_args, **_kwargs: next(selections),
+    )
+    live_semantics_revision = next(
+        iter(global_batch_runtime.LIVE_CURRENT_EVIDENCE_SEMANTICS_REVISIONS)
+    )
+    for helper_name in (
+        "_qkernel_shadow_current_semantics_by_posterior",
+        "_qkernel_current_semantics_by_posterior",
+    ):
+        monkeypatch.setattr(
+            global_batch_runtime,
+            helper_name,
+            lambda *_args, **_kwargs: {"run-alpha": live_semantics_revision},
+            raising=False,
+        )
+    monkeypatch.setattr(
+        replacement_input_hwm,
+        "prime_frozen_replacement_artifact_hwm",
+        lambda *_args, **_kwargs: lambda: releases.append("hwm"),
+    )
+
+    def prepare(current_event, _at):
+        assert current_event.event_id == event.event_id
+        return EventSubmissionReceipt(
+            False,
+            current_event.event_id,
+            current_event.causal_snapshot_id,
+            prepared_global_family=prepared,
+        )
+
+    def book_provider(probabilities, _at):
+        assert tuple(probabilities) == (family_key,)
+        return probabilities, book
+
+    def preflight(_winner, _actuation, _at, _authority):
+        return global_batch_runtime.GlobalWinnerPreflight(
+            status="STABLE",
+            binding_token="binding-current",
+        )
+
+    def actuate(_winner, _actuation, _at, _binding, _authority):
+        venue_calls["count"] += 1
+        return EventSubmissionReceipt(
+            True,
+            event.event_id,
+            event.causal_snapshot_id,
+            proof_accepted=True,
+            side_effect_status="SUBMITTED",
+        )
+
+    result = global_batch_runtime.process_current_global_batch(
+        (event,),
+        decision_time=_PR524_SYNTHETIC_DECISION_AT,
+        world_conn=world_conn,
+        forecast_conn=object(),
+        trade_conn=object(),
+        payload_reader=lambda current: json.loads(current.payload_json),
+        prepare_event=prepare,
+        actuate_winner=lambda *_: pytest.fail("preflight actuator required"),
+        preflight_winner=preflight,
+        actuate_preflighted_winner=global_batch_runtime.GlobalOneShotActuator(
+            actuate
+        ),
+        stamp_receipt=lambda receipt: receipt,
+        venue_submit_count=lambda: venue_calls["count"],
+        current_execution=lambda *_: object(),
+        current_time_provider=lambda: _PR524_SYNTHETIC_DECISION_AT,
+        current_book_epoch_provider=book_provider,
+        proof_candidate_policy_rejection_resolver=lambda _candidate: None,
+    )
+
+    assert result.winner_event_id == event.event_id
+    assert result.venue_submit_count == 1
+    assert result.receipts[event.event_id].submitted is True
+    assert venue_calls["count"] == 1
+    assert len(store_calls) == 1
+    proof = store_calls[0]["proof_counterfactual"]
+    assert proof["venue_actuation_available"] is False
+    assert releases.count("selection") == 1
+    assert releases.count("schema") == 1
+    assert releases.count("hwm") == 1
+    assert world_conn.execute(
+        "SELECT COUNT(*) FROM no_trade_regret_events"
+    ).fetchone()[0] == 0
+    world_conn.close()
 
 
 def test_global_auction_receipt_delta_component_uses_byte_minimal_exact_encoding():

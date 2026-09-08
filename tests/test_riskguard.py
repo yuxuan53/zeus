@@ -5080,43 +5080,6 @@ class TestQkernelMarketRelativeAlphaEvidence:
         assert revisions == (current,)
         assert reason is not None and "status=rejected" in reason
 
-        # Historical no-money shadow rows are retained for audit but cannot
-        # enter actual capital binding or alter a release/rejection reason.
-        conn.execute(
-            "CREATE TABLE no_trade_regret_events "
-            "(event_id TEXT, rejection_reason TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO no_trade_regret_events VALUES (?, ?)",
-            (
-                "legacy-shadow",
-                "MARKET_RELATIVE_ALPHA_SHADOW:forecast_qkernel_entry",
-            ),
-        )
-        conn.commit()
-        rebound, rebound_status = riskguard_module._bind_actual_global_capital_evidence(
-            conn,
-            [self._actual_global_row()],
-            strategy_key="forecast_qkernel_entry",
-            capital_curve=self._actual_capital_curve(),
-        )
-        rebound_evidence = riskguard_module._market_relative_alpha_evidence(
-            rebound,
-            strategy_key="forecast_qkernel_entry",
-            rejection_evalue=10.0,
-            as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
-        )
-        rebound_reason, rebound_revisions = (
-            riskguard_module._market_relative_alpha_rejection_gate_reason(
-                {"status": "ok", "licensed_revisions": [current]},
-                rebound_evidence,
-                required_evalue=10.0,
-            )
-        )
-        assert rebound_status == status
-        assert rebound_evidence == evidence
-        assert rebound_revisions == revisions
-        assert rebound_reason == reason
         conn.close()
 
     def test_superseded_global_selection_cannot_name_current_capital_law(self):
@@ -6699,6 +6662,23 @@ class TestQkernelMarketRelativeAlphaEvidence:
             lambda *_, **__: rows,
         )
 
+        synthetic_reader_calls = []
+
+        def forbidden_synthetic_reader(*_args, **_kwargs):
+            synthetic_reader_calls.append("called")
+            raise AssertionError("synthetic admission reader reached production tick")
+
+        for name in (
+            "_settled_qkernel_market_relative_alpha_shadow_rows",
+            "_settled_day0_market_relative_alpha_shadow_rows",
+        ):
+            monkeypatch.setattr(
+                riskguard_module,
+                name,
+                forbidden_synthetic_reader,
+                raising=False,
+            )
+
         level = riskguard_module.tick()
         risk_row = get_connection(risk_db).execute(
             "SELECT level,details_json FROM risk_state ORDER BY id DESC LIMIT 1"
@@ -6713,6 +6693,7 @@ class TestQkernelMarketRelativeAlphaEvidence:
             ),
         ).fetchall()
 
+        assert synthetic_reader_calls == []
         assert level == RiskLevel.GREEN
         assert risk_row["level"] == RiskLevel.GREEN.value
         assert details["market_relative_alpha_evidence"]["status"] == "no_evidence"
