@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Lifecycle: created=2026-08-12; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Lifecycle: created=2026-08-12; last_reviewed=2026-09-07; last_reused=2026-09-07
 # Purpose: Grade exact current selection/probability revisions on causal capital outcomes.
 # Reuse: Run read-only against canonical WORLD/FORECAST/TRADES DBs; output is evidence, not authority.
 """Fail-closed evaluator for current-regime capital advantage.
@@ -787,7 +787,6 @@ def _settled_global_counterfactual_evidence(
     # call and never persisted, so it only removes redundant recomputation
     # within one evaluate() run and cannot change any admitted value.
     audit_context_cache: dict[str, dict[str, object]] = {}
-    prior_samples_by_decision_log_id = prior_realized_proof_samples or {}
     try:
         floor = int(scan_floor_decision_log_id)
     except (TypeError, ValueError):
@@ -882,38 +881,11 @@ def _settled_global_counterfactual_evidence(
             summary = artifact["summary"]
             if not isinstance(summary, Mapping):
                 raise ValueError("retained proof summary invalid")
-            # A prior run's fully realized sample is reusable without
-            # redoing the expensive audit-context/settlement derivation
-            # only when the decision_log row's own (unhashed, directly
-            # stored) proof_counterfactual_sha256 still matches both the
-            # retained ref and the cached sample it was derived from --
-            # i.e. nothing about this row or its previously proven
-            # settlement outcome has changed since it was cached.
-            current_sha = str(summary.get("proof_counterfactual_sha256") or "")
-            cached_sample = prior_samples_by_decision_log_id.get(decision_log_id)
-            reusable = (
-                cached_sample is not None
-                and current_sha
-                and current_sha == str(raw_ref.get("proof_counterfactual_sha256") or "")
-                and current_sha == str(cached_sample.get("proof_counterfactual_sha256") or "")
-                and str(raw_ref.get("independence_key") or "")
-                == str(cached_sample.get("independence_key") or "")
-                and int(cached_sample.get("decision_log_id") or -1) == decision_log_id
+            admit(
+                decision_log_id=decision_log_id,
+                summary=summary,
+                expected_ref=raw_ref,
             )
-            if reusable:
-                ref = {
-                    "decision_log_id": decision_log_id,
-                    "proof_counterfactual_sha256": current_sha,
-                    "independence_key": str(raw_ref["independence_key"]),
-                    "decision_at_utc": str(raw_ref["decision_at_utc"]),
-                }
-                register(ref, cached_sample)
-            else:
-                admit(
-                    decision_log_id=decision_log_id,
-                    summary=summary,
-                    expected_ref=raw_ref,
-                )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             reject(str(exc) or type(exc).__name__)
 
@@ -2630,13 +2602,11 @@ def _prior_scan_floor(path: Path) -> int:
 
 
 def _prior_realized_proof_samples(path: Path) -> dict[int, Mapping[str, object]]:
-    """Load fully realized samples from the prior artifact, by decision_log_id.
+    """Load prior samples for the compatible public artifact API.
 
-    A settled sample is immutable once produced (settlement cannot un-settle);
-    ``_settled_global_counterfactual_evidence`` only reuses one of these when
-    the owning decision_log row's own stored ``proof_counterfactual_sha256``
-    still matches both the retained ref and this cached sample, so a stale or
-    tampered row still falls back to full canonical revalidation.
+    Retained samples are always rebuilt from the current canonical receipt,
+    settlement, and market geometry; this loader remains for callers that
+    still provide the prior artifact shape.
     """
 
     try:

@@ -1167,3 +1167,60 @@
   `0.95` remains executable at both seams; targeted pytest, `py_compile`, Ruff,
   planning-lock, and `git diff --check` pass.  Rollback is one hot-fix commit;
   this worktree does not deploy it.
+
+
+### 2026-09-08 — canonical capital evidence cache revalidation
+
+- Scope: decision receipt and canonical settlement truth -> capital evidence.
+  Existing script and test only: `scripts/evaluate_current_regime_capital_advantage.py`
+  and `tests/test_evaluate_current_regime_capital_advantage.py`.
+- Defect: the retained realized-sample fast path compares a stored proof hash
+  string but skips receipt integrity/current revision and canonical settlement
+  revalidation. That proof hash does not bind later settlement corrections,
+  authority revocation, market geometry, or cached payoff values.
+- Plan: reproduce changed settlement, revoked authority, changed receipt
+  revision/integrity, and altered cached payoff with tiny SQLite fixtures;
+  always recompute retained samples through the existing canonical validator.
+  Keep bounded receipt scanning and per-run audit-context memoization. No new
+  probability law, schema, order action, or canonical DB writes.
+- Acceptance: each new antibody fails on the base and passes on the repair;
+  full focused evaluator suite has no new failed test names; independent
+  review, compile, changed-surface checks, and diff checks pass. Recheck live
+  HEAD and overlapping dirty paths before choosing the permitted landing lane.
+- SCOPE: exact retained decision proof. DRAIN: ordinary next capital evaluator
+  run rereads canonical receipt and settlement. RESET: fresh complete valid
+  evidence independently admits the sample; revoked or incomplete settlement
+  stays pending. Reverted settlement corrections must immediately change grade.
+- Rollback: one isolated repair commit. This evidence correction alone proves
+  neither post-fill out-of-sample alpha nor profit; those require settled
+  chain outcomes, fill-conditioned costs, and equal-window placebo evidence.
+
+- Verification, checked=2026-W37; basis=current tests and read-only canonical
+  queries; until=recheck-on-use: seven new cases, six fail on pre-fix code and
+  all pass after; full evaluator suite 42 passed, required RiskGuard suite
+  218 passed (27.27s). Compile, planning-lock, map-maintenance and diff checks
+  pass. Initial RiskGuard collection lacked ignored settings.json; temporary
+  settings.example.json fixture resolved it and was removed. Ruff has exactly
+  the same four pre-existing F401 findings at script lines 43/44/73/75 as base.
+- Independent Luna/medium review: canonical revalidation and retained bounded
+  scan PASS; no blocking finding on this three-file slice. Runtime regrade at
+  2026-09-08T02:39:57Z (mode=ro, no canonical writes) took 0.162s for the
+  retained/incremental counterfactual slice: 9 registered target dates, 6
+  settled, delta-log-wealth LCB95=-0.022534010753187176. This is a current
+  counterfactual result, not fill-conditioned alpha or a full-evaluator timing.
+- User-contract audit remains NOT PROVEN across day0/day1/day2+: current
+  audit query found 48 filled rows and zero post_fill_mark values; prospective
+  selection report found 54 selected candidates with empty matched controls
+  and zero usable observations. No accepted equal-window placebo or
+  chain-confirmed OOS profit certificate was established. Historical local
+  PnL and selected counterfactuals do not fill this evidence gap.
+- Runtime audit snapshot at 2026-09-08T02:39:45Z found live daemons active but
+  monitor deadline debt, stale collateral/risk evidence and zero authorized
+  economic actuation; later 02:44:05Z live log still showed allocator
+  sql_interrupt/DEFERRED_PREEMPTED. These are observed symptoms, not a complete
+  root-cause attribution. All current runtime claims expire on recheck.
+- Disposition: completed evidence-integrity slice remains in durable role
+  worktree role/capital-evidence; no live restart, risk re-enable, or order
+  submission. Existing long-lived evaluator retained. Broader profitability
+  and runtime-liveness work remains unproven; no positive economic promotion.
+  Temporary test settings removed; topology friction none_observed.

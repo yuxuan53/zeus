@@ -1,6 +1,6 @@
 # Created: 2026-08-12
-# Last reused/audited: 2026-09-01
-# Lifecycle: created=2026-08-12; last_reviewed=2026-09-01; last_reused=2026-09-01
+# Last reused/audited: 2026-09-07
+# Lifecycle: created=2026-08-12; last_reviewed=2026-09-07; last_reused=2026-09-07
 # Authority: current-regime capital proof must fail closed before entry reopens.
 # Purpose: Exact-revision capital proof, per-order disposition, and total-portfolio truth antibodies.
 # Reuse: Run whenever the capital evaluator, order facts, or portfolio valuation contract changes.
@@ -172,6 +172,64 @@ def _settlement_db() -> sqlite3.Connection:
         "settlement_unit TEXT,settled_at TEXT,recorded_at TEXT,authority TEXT)"
     )
     return conn
+
+
+def _retained_sample_fixture() -> tuple[
+    sqlite3.Connection,
+    sqlite3.Connection,
+    dict[str, object],
+    datetime,
+    dict[str, object],
+    tuple[dict[str, object], ...],
+]:
+    forecasts = _settlement_db()
+    forecasts.execute(
+        "INSERT INTO market_events VALUES (?,?,?,?,?,?)",
+        ("condition-1", "Chicago", "2026-08-13", "high", 80, 81),
+    )
+    forecasts.execute(
+        "INSERT INTO settlement_outcomes VALUES (1,?,?,?,?,?,?,?,?)",
+        (
+            "Chicago",
+            "2026-08-13",
+            "high",
+            81,
+            "F",
+            "2026-08-13T20:00:00+00:00",
+            "2026-08-13T20:01:00+00:00",
+            "VERIFIED",
+        ),
+    )
+    trades = sqlite3.connect(":memory:")
+    trades.row_factory = sqlite3.Row
+    trades.execute(
+        "CREATE TABLE decision_log (id INTEGER PRIMARY KEY,mode TEXT,"
+        "completed_at TEXT,artifact_json TEXT)"
+    )
+    summary = _proof_summary(
+        city="Chicago",
+        target_date="2026-08-13",
+        condition_id="condition-1",
+    )
+    trades.execute(
+        "INSERT INTO decision_log VALUES (1,?,?,?)",
+        (
+            "global_single_order_auction",
+            "2026-08-12T00:00:02+00:00",
+            json.dumps({"summary": summary}),
+        ),
+    )
+    as_of = evaluator.datetime.fromisoformat("2026-08-14T00:00:00+00:00")
+    initial = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+    )
+    cached_samples = {
+        int(row["decision_log_id"]): dict(row) for row in initial["samples"]
+    }
+    retained = tuple(dict(row) for row in initial["proof_registry"])
+    return trades, forecasts, summary, as_of, cached_samples, retained
 
 
 def test_placeholder_database_is_rejected(tmp_path):
@@ -733,6 +791,150 @@ def test_pending_proof_registry_survives_receipt_scan_window_until_settlement():
     assert settled["independent_target_date_count"] == 1
     assert settled["samples"][0]["decision_log_id"] == 1
     assert settled["proof_registry_target_date_count"] == 1
+
+
+def test_retained_sample_regrades_changed_verified_outcome_with_same_receipt_sha():
+    trades, forecasts, _summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    forecasts.execute(
+        "UPDATE settlement_outcomes SET settlement_value=? WHERE settlement_id=?",
+        (79, 1),
+    )
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["samples"][0]["proof_counterfactual_sha256"] == retained[0][
+        "proof_counterfactual_sha256"
+    ]
+    assert evidence["samples"][0]["token_won"] is False
+    assert evidence["samples"][0]["realized_after_cost_payoff_usd"] == "-4"
+    assert evidence["realized_after_cost_pnl_usd"] == "-4"
+
+
+def test_retained_sample_regrades_changed_canonical_geometry():
+    trades, forecasts, _summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    forecasts.execute(
+        "UPDATE market_events SET range_low=?,range_high=? WHERE condition_id=?",
+        (82, 83, "condition-1"),
+    )
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["samples"][0]["token_won"] is False
+    assert evidence["samples"][0]["realized_after_cost_payoff_usd"] == "-4"
+
+
+def test_revoked_settlement_authority_removes_retained_realized_sample():
+    trades, forecasts, _summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    forecasts.execute(
+        "UPDATE settlement_outcomes SET authority=? WHERE settlement_id=?",
+        ("REVOKED", 1),
+    )
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["independent_target_date_count"] == 0
+    assert evidence["samples"] == []
+    assert evidence["proof_registry_target_date_count"] == 1
+
+
+@pytest.mark.parametrize("mutation", ["selection_revision", "integrity"])
+def test_retained_receipt_revalidates_revision_and_integrity_with_same_proof_sha(
+    mutation,
+):
+    trades, _forecasts, summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    if mutation == "selection_revision":
+        summary["global_selection_revision"] = "stale-selection-revision"
+        summary["execution_binding_hash"] = global_auction_execution_binding_hash(
+            summary
+        )
+        summary["artifact_summary_hash"] = global_auction_artifact_summary_hash(
+            summary
+        )
+    else:
+        summary["artifact_summary_hash"] = "f" * 64
+    trades.execute(
+        "UPDATE decision_log SET artifact_json=? WHERE id=?",
+        (json.dumps({"summary": summary}), 1),
+    )
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        _forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["samples"] == []
+    assert evidence["proof_registry_target_date_count"] == 0
+    assert evidence["rejection_counts"]
+
+
+def test_retained_sample_never_adopts_modified_cached_payoff():
+    trades, forecasts, _summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    cached_samples[1]["realized_after_cost_payoff_usd"] = "999"
+    cached_samples[1]["realized_delta_log_wealth"] = 999.0
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["samples"][0]["realized_after_cost_payoff_usd"] == "6"
+    assert evidence["realized_after_cost_pnl_usd"] == "6"
+
+
+def test_unchanged_retained_canonical_evidence_is_stable():
+    trades, forecasts, _summary, as_of, cached_samples, retained = (
+        _retained_sample_fixture()
+    )
+    expected = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+    )
+
+    evidence = evaluator._settled_global_counterfactual_evidence(
+        trades,
+        forecasts,
+        as_of=as_of,
+        prior_proof_registry=retained,
+        prior_realized_proof_samples=cached_samples,
+    )
+
+    assert evidence["samples"] == expected["samples"]
+    assert evidence["proof_registry"] == expected["proof_registry"]
 
 
 def test_invalid_retained_proof_ref_cannot_abort_current_canonical_scan():
