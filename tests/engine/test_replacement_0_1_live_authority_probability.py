@@ -793,8 +793,15 @@ def test_day0_physical_frontier_without_settlement_fact_blocks_entry_belief() ->
     ) is True
 
 
+@pytest.mark.parametrize(
+    ("metric", "settlement_value", "physical_value"),
+    (("high", 28.0, 31.0), ("low", 22.0, 19.0)),
+)
 def test_global_provisional_day0_uses_physical_source_identity(
     monkeypatch: pytest.MonkeyPatch,
+    metric: str,
+    settlement_value: float,
+    physical_value: float,
 ) -> None:
     from src.data import replacement_forecast_bundle_reader as reader
     from src.data import replacement_forecast_current_target_plan as target_plan
@@ -815,7 +822,7 @@ def test_global_provisional_day0_uses_physical_source_identity(
             (
                 "Hong Kong",
                 "2026-06-09",
-                "high",
+                metric,
                 "cond-27",
                 "yes-27",
                 "test-27",
@@ -826,7 +833,7 @@ def test_global_provisional_day0_uses_physical_source_identity(
             (
                 "Hong Kong",
                 "2026-06-09",
-                "high",
+                metric,
                 "cond-28",
                 "yes-28",
                 "test-28",
@@ -839,32 +846,45 @@ def test_global_provisional_day0_uses_physical_source_identity(
     observations = sqlite3.connect(":memory:")
     observations.execute(
         "CREATE TABLE observation_instants ("
-        "city TEXT, target_date TEXT, running_max REAL, utc_timestamp TEXT, "
+        "city TEXT, target_date TEXT, running_min REAL, running_max REAL, "
+        "utc_timestamp TEXT, "
         "local_timestamp TEXT, source TEXT, causality_status TEXT, "
         "authority TEXT, source_role TEXT, training_allowed INTEGER)"
     )
     observations.execute(
-        "INSERT INTO observation_instants VALUES "
-        "('Hong Kong','2026-06-09',27.0,'2026-06-09T10:00:00+00:00',"
-        "'2026-06-09T10:00:00+00:00','ogimet_metar_test','CAUSAL',"
-        "'VERIFIED','settlement_channel',0)"
+        "INSERT INTO observation_instants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "Hong Kong",
+            "2026-06-09",
+            physical_value,
+            physical_value,
+            "2026-06-09T10:00:00+00:00",
+            "2026-06-09T10:00:00+00:00",
+            "ogimet_metar_test",
+            "CAUSAL",
+            "VERIFIED",
+            "settlement_channel",
+            0,
+        ),
     )
 
     settlement_fact = {
         "observation_source": "ogimet_metar_test",
         "observation_time": "2026-06-09T10:01:00+00:00",
-        "observed_extreme_native": 28.0,
+        "observed_extreme_native": settlement_value,
     }
     physical_fact = {
         "observation_source": "aviationweather_metar",
         "observation_time": "2026-06-09T10:00:00+00:00",
-        "observed_extreme_native": 27.0,
+        "observed_extreme_native": physical_value,
     }
     returned_b = {
+        "metric": metric,
         "settlement_source": settlement_fact["observation_source"],
         "observation_time": settlement_fact["observation_time"],
         "observed_extreme_native": settlement_fact["observed_extreme_native"],
         "high_so_far": settlement_fact["observed_extreme_native"],
+        "low_so_far": settlement_fact["observed_extreme_native"],
         "settlement_unit": "C",
     }
     bundle = SimpleNamespace(
@@ -931,7 +951,7 @@ def test_global_provisional_day0_uses_physical_source_identity(
     )
     event = make_opportunity_event(
         event_type="DAY0_EXTREME_UPDATED",
-        entity_key="Hong Kong|2026-06-09|high",
+        entity_key=f"Hong Kong|2026-06-09|{metric}",
         source="test",
         observed_at=settlement_fact["observation_time"],
         available_at=settlement_fact["observation_time"],
@@ -939,13 +959,13 @@ def test_global_provisional_day0_uses_physical_source_identity(
         payload={
             "city": "Hong Kong",
             "target_date": "2026-06-09",
-            "metric": "high",
+            "metric": metric,
             "unit": "C",
             "settlement_source": settlement_fact["observation_source"],
             "settlement_unit": "C",
             "observation_time": settlement_fact["observation_time"],
             "raw_value": settlement_fact["observed_extreme_native"],
-            "rounded_value": 28,
+            "rounded_value": int(settlement_value),
             "source_match_status": "MATCH",
             "local_date_status": "MATCH",
             "station_match_status": "MATCH",
@@ -970,6 +990,33 @@ def test_global_provisional_day0_uses_physical_source_identity(
     adapter._prepare_current_global_probability_family(event, **prepare_kwargs)
     assert fact_requests[:2] == [True, False]
 
+    # The active physical frontier is carried by a valid provisional bundle;
+    # ENTRY must reach the existing identity/action-q checks before rejecting
+    # any later mismatch, just as HELD_MONITOR does.
+    returned_b.update(
+        {
+            "settlement_source": physical_fact["observation_source"],
+            "observation_time": physical_fact["observation_time"],
+            "observed_extreme_native": physical_fact["observed_extreme_native"],
+            "high_so_far": physical_fact["observed_extreme_native"],
+            "low_so_far": physical_fact["observed_extreme_native"],
+        }
+    )
+    entry_prepared = adapter._prepare_current_global_probability_family(
+        event,
+        **{**prepare_kwargs, "probability_use": adapter._CurrentProbabilityUse.ENTRY},
+    )
+    assert entry_prepared.probability_witness.posterior_identity_hash
+    returned_b.update(
+        {
+            "settlement_source": settlement_fact["observation_source"],
+            "observation_time": settlement_fact["observation_time"],
+            "observed_extreme_native": settlement_fact["observed_extreme_native"],
+            "high_so_far": settlement_fact["observed_extreme_native"],
+            "low_so_far": settlement_fact["observed_extreme_native"],
+        }
+    )
+
     for key, bad_value in (
         ("observation_source", "aviationweather_other"),
         ("observation_time", "2026-06-09T10:02:00+00:00"),
@@ -977,14 +1024,18 @@ def test_global_provisional_day0_uses_physical_source_identity(
     ):
         original = physical_fact[key]
         physical_fact[key] = bad_value
-        with pytest.raises(
-            ValueError,
-            match="GLOBAL_DAY0_PROVISIONAL_POSTERIOR_IDENTITY_MISMATCH",
+        for probability_use in (
+            adapter._CurrentProbabilityUse.HELD_MONITOR,
+            adapter._CurrentProbabilityUse.ENTRY,
         ):
-            adapter._prepare_current_global_probability_family(
-                event,
-                **prepare_kwargs,
-            )
+            with pytest.raises(
+                ValueError,
+                match="GLOBAL_DAY0_PROVISIONAL_POSTERIOR_IDENTITY_MISMATCH",
+            ):
+                adapter._prepare_current_global_probability_family(
+                    event,
+                    **{**prepare_kwargs, "probability_use": probability_use},
+                )
         physical_fact[key] = original
 
     bundle.provenance_json["day0_provisional_observation"][

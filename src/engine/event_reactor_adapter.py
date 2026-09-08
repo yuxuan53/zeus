@@ -39107,12 +39107,13 @@ def _prepare_current_global_probability_family(
                     fast_residual_conditioning
                 )
             # Family-scoped entry gate. DRAIN: the next causal seed/materialize
-            # cycle writes a posterior containing the newer same-station fast
-            # frontier. RESET: that latest valid fast-residual bundle discharges
-            # this gate; unrelated families and held-position SELLs are untouched.
+            # cycle binds the newer same-station physical frontier. RESET: a
+            # validated fast-residual or provisional bundle reaches the identity
+            # checks below; unrelated families and held-position SELLs are untouched.
             if (
                 physical_frontier_requires_confirmation
                 and fast_residual_conditioning is None
+                and not probability_conditioning_is_provisional
             ):
                 raise ValueError(
                     "GLOBAL_DAY0_PHYSICAL_FRONTIER_NOT_SETTLEMENT_CONFIRMED"
