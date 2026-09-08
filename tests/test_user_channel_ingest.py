@@ -49,7 +49,8 @@ HASH_E = "e" * 64
 
 
 @pytest.fixture
-def conn():
+def conn(monkeypatch):
+    monkeypatch.setenv("ZEUS_ENTRY_Q_VERSION_STRICT", "1")
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
@@ -198,13 +199,13 @@ def _seed_entry_certificate(c, command_id: str) -> str:
 
 def _seed_acknowledged_command(c) -> None:
     insert_snapshot(c, _snapshot())
-    insert_submission_envelope(c, _envelope(), envelope_id="env-ws")
     _seed_trade_decision_runtime_alias(c, trade_id=1, runtime_trade_id="1")
     insert_command(
         c,
         command_id="cmd-ws",
         snapshot_id="snap-ws",
         envelope_id="env-ws",
+        submission_envelope=_envelope(),
         position_id="1",
         decision_id="dec-ws",
         idempotency_key="idem-cmd-ws",
@@ -1152,12 +1153,12 @@ def test_maker_side_partial_fill_lifecycle_uses_zeus_maker_leg_economics(conn):
 def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
     ingestor = _ingestor(conn)
     ingestor.handle_message(_trade_message("MATCHED"))
-    insert_submission_envelope(conn, _envelope(), envelope_id="env-other")
     insert_command(
         conn,
         command_id="cmd-other",
         snapshot_id="snap-ws",
         envelope_id="env-other",
+        submission_envelope=_envelope(),
         position_id="2",
         decision_id="dec-other",
         idempotency_key="idem-cmd-other",
