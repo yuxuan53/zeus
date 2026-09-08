@@ -51,8 +51,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal, DecimalException, InvalidOperation, localcontext
 from typing import Any, Mapping
 
 from src.contracts.semantic_types import EntryMethod
@@ -494,6 +496,48 @@ def _float_or_none(value: Any) -> float | None:
     return parsed
 
 
+_SQLITE_INTEGER_MAX = 2**63 - 1
+_MICRO_USD = Decimal(1_000_000)
+_MAX_USD_FOR_MICRO = Decimal(_SQLITE_INTEGER_MAX) / _MICRO_USD
+
+
+def _exact_micro_units(value: Decimal) -> int | None:
+    if not value.is_finite() or value < 0 or value > _MAX_USD_FOR_MICRO:
+        return None
+    try:
+        with localcontext() as context:
+            context.prec = 28
+            quantized = value.quantize(Decimal("0.000001"))
+            if quantized != value:
+                return None
+            units = quantized * _MICRO_USD
+            units_int = int(units)
+            return units_int if Decimal(units_int) / _MICRO_USD == value else None
+    except (ArithmeticError, DecimalException, ValueError):
+        return None
+
+
+def _fee_amount(value: Any) -> Decimal | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0 or parsed > _MAX_USD_FOR_MICRO:
+        return None
+    if _exact_micro_units(parsed) is None:
+        return None
+    return parsed
+
+
+def _fee_paid_micro(value: Any) -> int | None:
+    amount = _fee_amount(value)
+    if amount is None:
+        return None
+    return _exact_micro_units(amount)
+
+
 def _confirmed_fill_payloads(events: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
     """One UserTradeObserved payload per DISTINCT venue fill (deduped by trade_id).
 
@@ -549,7 +593,7 @@ def _has_confirmed_fill(events: list[tuple[str, dict[str, Any]]]) -> bool:
     return False
 
 
-def _aggregate_fill_economics(fill_payloads: list[dict[str, Any]]) -> tuple[float, float, float]:
+def _aggregate_fill_economics(fill_payloads: list[dict[str, Any]]) -> tuple[float, float, float | None]:
     """Sum filled_size, size-weight avg_fill_price, sum fees across DISTINCT fills.
 
     The caller (``_confirmed_fill_payloads``) has already collapsed the
@@ -563,7 +607,8 @@ def _aggregate_fill_economics(fill_payloads: list[dict[str, Any]]) -> tuple[floa
     """
     total_size = 0.0
     total_notional = 0.0
-    total_fees = 0.0
+    total_fees = Decimal(0)
+    fees_known = True
     for payload in fill_payloads:
         size = _float_or_none(payload.get("filled_size") or payload.get("size"))
         if size is None or size <= 0:
@@ -573,11 +618,19 @@ def _aggregate_fill_economics(fill_payloads: list[dict[str, Any]]) -> tuple[floa
             continue
         total_size += size
         total_notional += size * price
-        fees = _float_or_none(payload.get("fees"))
-        if fees is not None:
+        fees = _fee_amount(payload.get("fees"))
+        if fees is None:
+            fees_known = False
+        else:
             total_fees += fees
     avg_price = (total_notional / total_size) if total_size > 0 else 0.0
-    return total_size, avg_price, total_fees
+    total_fees_float = float(total_fees) if fees_known else None
+    if total_fees_float is not None and (
+        not math.isfinite(total_fees_float)
+        or Decimal(str(total_fees_float)) != total_fees
+    ):
+        total_fees_float = None
+    return total_size, avg_price, total_fees_float
 
 
 def _confirmed_fill_time(
@@ -791,7 +844,7 @@ def _build_bridge_position(
     identity: dict[str, Any],
     filled_size: float,
     avg_fill_price: float,
-    fees: float,
+    fees: float | None,
     filled_at: str,
     posted_at: str | None = None,
     env: str,
@@ -1730,7 +1783,7 @@ def _append_edli_confirmed_trade_facts(
                 index,
             )
             continue
-        fees = _float_or_none(payload.get("fees")) or 0.0
+        fee_paid_micro = _fee_paid_micro(payload.get("fees"))
         source_event_hash = _edli_source_event_hash(aggregate_id, payload, index)
         native_trade_id = str(payload.get("trade_id") or "").strip()
         # Idempotent prefixing (2026-07-25): on a stall longer than one bridge
@@ -1769,7 +1822,7 @@ def _append_edli_confirmed_trade_facts(
             state=_EDLI_TRADE_FACT_STATE,
             filled_size=filled_size_s,
             fill_price=fill_price_s,
-            fee_paid_micro=int(round(fees * 1_000_000)),
+            fee_paid_micro=fee_paid_micro,
             # WS_USER: EDLI fills are confirmed via the same authenticated
             # user channel legacy WS_USER trade facts represent (see
             # src.events.live_order_reconcile.assert_user_channel_fill_authority);

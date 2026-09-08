@@ -1,9 +1,10 @@
 # Created: 2026-06-01
-# Lifecycle: created=2026-06-01; last_reviewed=2026-08-20; last_reused=2026-08-20
-# Last reused or audited: 2026-08-20
+# Lifecycle: created=2026-06-01; last_reviewed=2026-09-08; last_reused=2026-09-08
+# Last reused or audited: 2026-09-08
 # Authority basis: DEFECT-1 capital-recoverability bridge. An EDLI FILL_CONFIRMED
 #   must materialise a canonical position_current row (the seam audited as
 #   missing), idempotently, chain-reconcilable by token, summing partial fills.
+#   Current capital-gains plan: preserve unknown and exact recovered-fill fees.
 """TDD for src.events.edli_position_bridge.
 
 Fitz #3 relationship tests: these verify a CROSS-MODULE invariant — what holds
@@ -261,6 +262,7 @@ def _seed_confirmed_buy_no_aggregate(
     fills: list[tuple[float, float, float]] | None = None,
     fill_payload_extras: list[dict] | None = None,
     pre_submit_snapshot_id: str | None = "exec-snap-1",
+    include_fee: bool = True,
 ) -> str:
     """Seed a realistic CONFIRMED buy_no aggregate.
 
@@ -299,19 +301,21 @@ def _seed_confirmed_buy_no_aggregate(
     seq = 3
     for index, (size, price, fees) in enumerate(fills):
         extras = fill_payload_extras[index] if fill_payload_extras else {}
+        fill_payload = {
+            "event_id": EVENT_ID,
+            "final_intent_id": FINAL_INTENT_ID,
+            "trade_status": "CONFIRMED",
+            "fill_authority_state": "FILL_CONFIRMED",
+            "venue_order_id": VENUE_ORDER_ID,
+            "filled_size": size,
+            "avg_fill_price": price,
+            **extras,
+        }
+        if include_fee:
+            fill_payload["fees"] = fees
         _insert_edli_event(
             conn, aggregate_id=aggregate_id, sequence=seq, event_type="UserTradeObserved",
-            payload={
-                "event_id": EVENT_ID,
-                "final_intent_id": FINAL_INTENT_ID,
-                "trade_status": "CONFIRMED",
-                "fill_authority_state": "FILL_CONFIRMED",
-                "venue_order_id": VENUE_ORDER_ID,
-                "filled_size": size,
-                "avg_fill_price": price,
-                "fees": fees,
-                **extras,
-            },
+            payload=fill_payload,
             source_authority="user_channel",
         )
         seq += 1
@@ -927,6 +931,84 @@ def test_confirmed_edli_fill_appends_canonical_trade_fact(conn):
     assert payload["edli_aggregate_id"] == aggregate_id
     assert payload["source_edli_event_hash"] == fact["raw_payload_hash"]
     assert payload["fill_authority_state"] == "FILL_CONFIRMED"
+
+
+@pytest.mark.parametrize(
+    "fee, expected_micro, expected_fee",
+    [
+        (None, None, None),
+        ("", None, None),
+        ("malformed", None, None),
+        (float("nan"), None, None),
+        (float("inf"), None, None),
+        (float("-inf"), None, None),
+        (-0.01, None, None),
+        (True, None, None),
+        (0.0000001, None, None),
+        (0.0, 0, 0.0),
+        (0.000001, 1, 0.000001),
+        (0.02, 20000, 0.02),
+        ("9223372036854.776", None, None),
+        ("1e999999", None, None),
+        ("0.0000010000000000000000000000001", None, None),
+        ("9223372036854.775807", 9223372036854775807, None),
+    ],
+)
+def test_confirmed_edli_fill_preserves_fee_unknown_or_exact_micro_units(
+    conn, fee, expected_micro, expected_fee
+):
+    aggregate_id = _seed_confirmed_buy_no_aggregate(conn, fills=[(16.75, 0.42, fee)])
+    _seed_venue_command_for_execution_command_id(
+        conn, command_id=f"cmd-fee-{str(expected_micro)}", execution_command_id=EXECUTION_COMMAND_ID
+    )
+    result = materialize_position_current_from_edli_fill(conn, aggregate_id)
+    fact = conn.execute("SELECT * FROM venue_trade_facts").fetchone()
+    assert fact["fee_paid_micro"] == expected_micro
+    assert result["shares"] == pytest.approx(16.75)
+    assert result["avg_fill_price"] == pytest.approx(0.42)
+    if expected_fee is None:
+        assert result["fees"] is None
+    else:
+        assert result["fees"] == pytest.approx(expected_fee)
+    assert fact["state"] == "CONFIRMED"
+
+
+def test_confirmed_edli_fill_missing_fee_field_stays_unknown(conn):
+    aggregate_id = _seed_confirmed_buy_no_aggregate(
+        conn, fills=[(16.75, 0.42, None)], include_fee=False
+    )
+    _seed_venue_command_for_execution_command_id(
+        conn, command_id="cmd-fee-missing", execution_command_id=EXECUTION_COMMAND_ID
+    )
+    result = materialize_position_current_from_edli_fill(conn, aggregate_id)
+    fact = conn.execute("SELECT * FROM venue_trade_facts").fetchone()
+    assert fact["fee_paid_micro"] is None
+    assert result["fees"] is None
+    assert result["shares"] == pytest.approx(16.75)
+    assert result["avg_fill_price"] == pytest.approx(0.42)
+
+
+def test_confirmed_replay_with_same_trade_id_and_missing_fee_does_not_reuse_old_fee(conn):
+    aggregate_id = _seed_confirmed_buy_no_aggregate(
+        conn,
+        fills=[(16.0, 0.42, 0.03), (16.0, 0.42, None)],
+        fill_payload_extras=[{"trade_id": "same-trade"}, {"trade_id": "same-trade"}],
+    )
+    _seed_venue_command_for_execution_command_id(
+        conn, command_id="cmd-fee-replay", execution_command_id=EXECUTION_COMMAND_ID
+    )
+    result = materialize_position_current_from_edli_fill(conn, aggregate_id)
+    fact = conn.execute("SELECT * FROM venue_trade_facts").fetchone()
+    assert result["shares"] == pytest.approx(16.0)
+    assert result["avg_fill_price"] == pytest.approx(0.42)
+    assert result["fees"] is None
+    assert fact["fee_paid_micro"] is None
+
+
+def test_fee_micro_parser_accepts_long_trailing_zero_decimal():
+    from src.events.edli_position_bridge import _fee_paid_micro
+
+    assert _fee_paid_micro("0.03" + "0" * 5000) == 30000
 
 
 def test_confirmed_fill_repairs_command_snapshot_and_attribution_identity(conn):

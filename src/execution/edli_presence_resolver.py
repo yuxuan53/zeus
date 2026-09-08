@@ -37,8 +37,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation, localcontext
 from typing import Any, Callable
 
 from src.events.live_cap import LiveCapLedger
@@ -69,6 +70,24 @@ logger = logging.getLogger(__name__)
 PRESENCE_RESOLUTION_REASON = "AUTHENTICATED_CLOB_CONFIRMED_FILL_OWNED_BY_FUNDER"
 _MATCH_TIME_SKEW = timedelta(seconds=5)
 _MATCH_TIME_LAG = timedelta(seconds=30)
+_MICRO_USD = Decimal(1_000_000)
+_MAX_USD_FOR_MICRO = Decimal(2**63 - 1) / _MICRO_USD
+
+
+def _exact_micro_units(value: Decimal) -> int | None:
+    if not value.is_finite() or value < 0 or value > _MAX_USD_FOR_MICRO:
+        return None
+    try:
+        with localcontext() as context:
+            context.prec = 28
+            quantized = value.quantize(Decimal("0.000001"))
+            if quantized != value:
+                return None
+            units = quantized * _MICRO_USD
+            units_int = int(units)
+            return units_int if Decimal(units_int) / _MICRO_USD == value else None
+    except (ArithmeticError, DecimalException, ValueError):
+        return None
 
 
 def _f(value: object) -> float | None:
@@ -78,6 +97,24 @@ def _f(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _fee_amount(value: object) -> float | None:
+    """Parse an explicit charged USD amount; fee rates are not amounts."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0 or parsed > _MAX_USD_FOR_MICRO:
+        return None
+    if _exact_micro_units(parsed) is None:
+        return None
+    amount = float(parsed)
+    if not math.isfinite(amount) or Decimal(str(amount)) != parsed:
+        return None
+    return amount
 
 
 def _d(value: object, field: str) -> Decimal:
@@ -199,7 +236,7 @@ def _our_fill_legs(
                 "size": float(size),
                 "price_decimal": format(price, "f"),
                 "size_decimal": format(size, "f"),
-                "fees": _f(trade.get("fees")) or 0.0,
+                "fees": _fee_amount(trade.get("fees")),
                 "match_time": trade.get("match_time"),
                 "side": str(trade.get("side") or "").upper(),
                 "trader_side": str(trade.get("trader_side") or "").upper(),
@@ -222,7 +259,7 @@ def _our_fill_legs(
                     "size": float(size),
                     "price_decimal": format(price, "f"),
                     "size_decimal": format(size, "f"),
-                    "fees": _f(mk.get("fee_rate_bps")) and 0.0 or 0.0,
+                    "fees": _fee_amount(mk.get("fees")),
                     "match_time": trade.get("match_time"),
                     "side": str(mk.get("side") or "").upper(),
                     "trader_side": str(trade.get("trader_side") or "").upper(),
@@ -366,7 +403,18 @@ def build_presence_proof(
     )
     total_size = float(total_size_decimal)
     total_notional = float(total_notional_decimal)
-    total_fees = sum(float(leg["fees"]) for leg in unique_legs)
+    fee_values = [leg["fees"] for leg in unique_legs]
+    total_fees = (
+        None
+        if any(value is None for value in fee_values)
+        else float(sum((Decimal(str(value)) for value in fee_values), Decimal(0)))
+    )
+    if total_fees is not None and (
+        not math.isfinite(total_fees)
+        or Decimal(str(total_fees))
+        != sum((Decimal(str(value)) for value in fee_values), Decimal(0))
+    ):
+        total_fees = None
     if total_size <= 0:
         raise RuntimeError("presence legs sum to non-positive size")
     # Immediate BUY taker price improvement can return more outcome shares than
@@ -543,7 +591,7 @@ def resolve_presence(
                         "matched_trade_ids": proof["matched_trade_ids"],
                         "filled_size": float(proof["filled_size"]),
                         "avg_fill_price": float(proof["avg_fill_price"]),
-                        "fees": float(proof["fees"]),
+                        "fees": proof["fees"],
                         "token_id": str(proof["token_id"]),
                         "condition_id": str(proof["condition_id"]),
                         "direction": str(proof["direction"]),

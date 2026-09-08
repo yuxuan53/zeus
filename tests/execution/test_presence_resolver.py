@@ -1,7 +1,8 @@
 # Created: 2026-06-16
-# Last audited: 2026-07-23
+# Last reused/audited: 2026-09-08
 # Authority basis: docs/evidence/settlement_guard/boot_presence_reconcile_2026-06-16.md
 #   + presence_resolver_review_2026-06-16.md (the double-count guard).
+#   + current capital-gains plan: preserve unknown recovered-fill fees.
 """Boot presence-resolution: attribution + double-count antibody + fail-closed.
 
 The #122 db-lock orphan (a FILLED maker order stuck at SubmitUnknown) must
@@ -105,6 +106,59 @@ def test_our_fill_legs_taker_branch_attributes_our_taker_order():
     assert len(legs) == 1
     assert legs[0]["role"] == "TAKER"
     assert legs[0]["venue_order_id"] == "0xourtaker"
+
+
+@pytest.mark.parametrize(
+    "fee",
+    [
+        None,
+        "",
+        "malformed",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        -0.01,
+        True,
+        "1e-1000",
+        "1e999999",
+        "0.0000010000000000000000000000001",
+        "1000000000000.000001",
+    ],
+)
+def test_our_fill_legs_invalid_or_missing_taker_fee_stays_unknown(fee):
+    trade = {
+        "id": "tk-fee",
+        "status": "CONFIRMED",
+        "trader_side": "TAKER",
+        "asset_id": OUR_TOKEN,
+        "maker_address": FUNDER,
+        "price": "0.64",
+        "size": "5.0",
+        "match_time": "1002",
+        "taker_order_id": "0xourtaker",
+        "fees": fee,
+        "maker_orders": [],
+    }
+    assert pr._our_fill_legs(trade, OUR_TOKEN, FUNDER)[0]["fees"] is None
+
+
+def test_our_maker_fee_rate_alone_is_not_a_charged_amount():
+    trade = _our_maker_trade()
+    trade["maker_orders"][0]["fee_rate_bps"] = "25"
+    assert pr._our_fill_legs(trade, OUR_TOKEN, FUNDER)[0]["fees"] is None
+
+
+@pytest.mark.parametrize("fee", [0.0, 0.02])
+def test_our_maker_explicit_fee_amount_is_preserved(fee):
+    trade = _our_maker_trade()
+    trade["maker_orders"][0]["fees"] = fee
+    assert pr._our_fill_legs(trade, OUR_TOKEN, FUNDER)[0]["fees"] == fee
+
+
+def test_our_fee_parser_accepts_trailing_zero_decimal_without_integer_overflow():
+    trade = _our_maker_trade()
+    trade["maker_orders"][0]["fees"] = "0.03" + "0" * 5000
+    assert pr._our_fill_legs(trade, OUR_TOKEN, FUNDER)[0]["fees"] == 0.03
 
 
 def _patch_plan(monkeypatch, size=5.078125, limit_price=0.65, order_type="GTC"):
@@ -214,6 +268,33 @@ def test_build_presence_proof_happy_path(monkeypatch):
     assert proof["venue_order_id"] == OUR_ORDER
     assert proof["venue_command_state"] == "PARTIAL"  # 5.07 filled < 5.078125 ordered
     assert proof["matched_trade_ids"] == ["cf967209"]
+    assert proof["fees"] is None
+    assert proof["matched_legs"][0]["fees"] is None
+
+
+def test_build_presence_proof_sums_known_fees_and_preserves_unknown(monkeypatch):
+    _patch_plan(monkeypatch, size=11.0)
+    first = _our_maker_trade()
+    first["maker_orders"][0]["fees"] = 0.01
+    second = _our_maker_trade()
+    second["id"] = "cf967210"
+    second["maker_orders"][0]["fees"] = 0.02
+    known = pr.build_presence_proof(None, "agg", trades=[first, second], funder_address=FUNDER)
+    assert known["fees"] == pytest.approx(0.03)
+    second["maker_orders"][0]["fees"] = None
+    unknown = pr.build_presence_proof(None, "agg", trades=[first, second], funder_address=FUNDER)
+    assert unknown["fees"] is None
+
+
+def test_build_presence_proof_fee_aggregate_overflow_stays_unknown(monkeypatch):
+    _patch_plan(monkeypatch, size=11.0)
+    first = _our_maker_trade()
+    first["maker_orders"][0]["fees"] = "1e999999"
+    second = _our_maker_trade()
+    second["id"] = "cf967210"
+    second["maker_orders"][0]["fees"] = "1e999999"
+    proof = pr.build_presence_proof(None, "agg", trades=[first, second], funder_address=FUNDER)
+    assert proof["fees"] is None
 
 
 def test_build_presence_proof_refuses_genuine_absence(monkeypatch):
