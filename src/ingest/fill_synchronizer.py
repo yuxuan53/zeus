@@ -99,6 +99,7 @@ from src.execution.exchange_reconcile import (
     _trade_order_ids,
     _trade_state,
 )
+from src.ingest.trade_match_time import trade_match_time
 from src.state.schema.fill_sync_watermarks_schema import ensure_table as ensure_watermark_table
 from src.state.schema.wallet_fill_observations_schema import ensure_table as ensure_wallet_fill_observations_table
 from src.state.venue_command_repo import _row_factory_as, append_trade_fact
@@ -329,9 +330,7 @@ def _append_wallet_fill_observation(
         _first_present(raw, "fee_paid_micro", "feePaidMicro", default=None)
     )
     tx_hash = raw.get("transaction_hash") or raw.get("tx_hash")
-    venue_timestamp = _first_present(
-        raw, "match_time", "matchTime", "last_update", "timestamp", default=None
-    )
+    venue_timestamp = trade_match_time(raw)
 
     conn.execute(
         """
@@ -351,7 +350,7 @@ def _append_wallet_fill_observation(
             fee_rate_bps,
             fee_paid_micro,
             str(tx_hash) if tx_hash is not None else None,
-            str(venue_timestamp) if venue_timestamp is not None else None,
+            venue_timestamp.isoformat() if venue_timestamp is not None else None,
             observed_at.isoformat(),
             raw_payload_hash,
             json.dumps(raw, sort_keys=True, default=str),
@@ -362,24 +361,13 @@ def _append_wallet_fill_observation(
 
 
 def _venue_timestamp_iso(raw: dict) -> str | None:
-    """The venue's match/execution time as ISO-8601 (UTC) -- comparable to
-    observed_at for the reducer's execution-ordered fold. Polymarket
-    get_trades reports ``match_time`` as unix epoch seconds; a pre-formatted
-    string is accepted as-is. None when absent (the reducer then falls back to
-    the earliest observed_at across the trade's revisions). Same field
-    extraction the observation lane uses in _append_wallet_fill_observation --
-    but written to venue_trade_facts too, so a synchronizer-appended fill
-    carries an execution time and never sorts after its own exits."""
-    val = _first_present(
-        raw, "match_time", "matchTime", "last_update", "timestamp", default=None
-    )
-    if val is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(float(val)), tz=timezone.utc).isoformat()
-    except (ValueError, TypeError, OSError):
-        s = str(val).strip()
-        return s or None
+    """Return normalized native match time as UTC ISO, or ``None`` if invalid.
+
+    Raw payload and observed-at provenance remain independent of this optional
+    venue clock; the reducer may use its existing observed-at fallback.
+    """
+    venue_timestamp = trade_match_time(raw)
+    return venue_timestamp.isoformat() if venue_timestamp is not None else None
 
 
 def _prepare_fill_sync(

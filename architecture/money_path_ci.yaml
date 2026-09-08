@@ -311,6 +311,15 @@ segments:
     relationship_tests:
       - tests/integration/test_w3_solve_seam_g3.py::test_bounded_sqlite_preserves_error_identity_at_timeout_precision
       - tests/integration/test_w3_solve_seam_g3.py::test_global_work_deadline_bounds_selection_schema_lock_before_network
+  native_fill_time:
+    invariant_ids: [MP-EXT-001, MP-EXT-002]
+    files:
+      - src/ingest/trade_match_time.py
+      - src/ingest/fill_synchronizer.py
+      - src/ingest/polymarket_user_channel.py
+    relationship_tests:
+      - tests/test_fill_synchronizer.py
+      - tests/test_user_channel_ingest.py
   post_fill_observation:
     invariant_ids: [MP-EXT-001, MP-EXT-002, MP-SCH-001, MP-SCH-002]
     files:

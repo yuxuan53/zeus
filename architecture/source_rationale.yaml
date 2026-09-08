@@ -1512,7 +1512,7 @@ files:
   src/ingest/polymarket_user_channel.py:
     zone: K2_runtime
     authority_role: user_channel_ingest
-    why: R3 M3 authenticated Polymarket user WebSocket ingestor; normalizes order/trade messages into U2 append-only venue facts and emits gap status without owning M5 reconciliation.
+    why: R3 M3 authenticated Polymarket user WebSocket ingestor; normalizes order/trade messages into U2 append-only venue facts and emits gap status without owning M5 reconciliation. Native execution clocks use the shared strict match-time parser; unavailable clocks never borrow local delivery time and do not discard real fills.
     hazards:
     - TRANSITIONAL_DO_NOT_DEEPEN
     write_routes:
@@ -3349,11 +3349,18 @@ files:
     - src/ingest/price_channel_daemon.py
     - src/main.py
     - src/events/price_channel_redecision_router.py
+  src/ingest/trade_match_time.py:
+    zone: K2_runtime
+    authority_role: native_venue_match_time_normalization
+    why: Normalize only explicit exchange match-time fields to exact aware UTC microseconds. Conflicting, malformed or missing native clocks remain absent; delivery/status clocks and unit guesses cannot become execution-time evidence. Shared by authenticated REST and WS writers without changing fill economics or persistence.
+    downstream:
+    - src/ingest/fill_synchronizer.py
+    - src/ingest/polymarket_user_channel.py
   src/ingest/fill_synchronizer.py:
     zone: K2_runtime
     authority_role: continuous_authenticated_fill_fact_producer
     why: >-
-      Continuously reads authenticated venue fills, freezes venue/parsing/read-side evidence outside every writer lease, then atomically appends observations and attributed facts, advances command projections, and publishes the monotonic coverage watermark inside one unified TRADE WriteCoordinator transaction. Existing schema is checked read-only so the hot path requests no redundant schema writer lease; a missing cold-start schema is created through its own coordinated unit. Canonical fill recovery uses bounded RECOVERY_CRITICAL admission: it waits behind visible MONITOR intent instead of overtaking it, but cannot starve forever as disposable background work. The scheduler reports bounded contention as retryable failure; it never bypasses the writer turnstile or holds a canonical write transaction across venue I/O.
+      Continuously reads authenticated venue fills, freezes venue/parsing/read-side evidence outside every writer lease, then atomically appends observations and attributed facts, advances command projections, and publishes the monotonic coverage watermark inside one unified TRADE WriteCoordinator transaction. Existing schema is checked read-only so the hot path requests no redundant schema writer lease; a missing cold-start schema is created through its own coordinated unit. Canonical fill recovery uses bounded RECOVERY_CRITICAL admission: it waits behind visible MONITOR intent instead of overtaking it, but cannot starve forever as disposable background work. The scheduler reports bounded contention as retryable failure; it never bypasses the writer turnstile or holds a canonical write transaction across venue I/O. Facts and wallet observations share strict native match-time normalization; invalid clocks remain NULL while raw fills and economics are retained.
     downstream:
     - src/ingest/price_channel_daemon.py
     - src/execution/command_recovery.py

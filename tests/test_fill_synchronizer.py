@@ -25,6 +25,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,46 @@ from src.ingest.fill_synchronizer import DEFAULT_SOURCE, get_watermark, sync_fil
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 YES_TOKEN = "yes-token-fill-sync"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (1.5, datetime(1970, 1, 1, 0, 0, 1, 500000, tzinfo=timezone.utc)),
+        (0, datetime(1970, 1, 1, tzinfo=timezone.utc)),
+        (Decimal("-0.5"), datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)),
+        (Decimal("1783944000.123456"), datetime(2026, 7, 13, 12, 0, 0, 123456, tzinfo=timezone.utc)),
+        (float("nan"), None),
+        (float("inf"), None),
+        (True, None),
+        (Decimal("NaN"), None),
+        (Decimal("1." + "0" * 200 + "1"), None),
+        (Decimal("1." + "9" * 200), None),
+        ("20260427T120000.1234567+00:00", None),
+        ("2026-04-27T12:00:00+00:00:00.1234567", None),
+        ("2026-04-27T12:00:00+00:00:00.5", None),
+        ("20260427T120000.123456+00:00", datetime(2026, 4, 27, 12, 0, 0, 123456, tzinfo=timezone.utc)),
+        ("1" * 129, None),
+        ("1e1000000", None),
+        ("1e-1000000", None),
+        ("253402300800", None),
+        ("0001-01-01T00:00:00+14:00", None),
+        (NOW.replace(tzinfo=None), None),
+        (NOW.astimezone(timezone(timedelta(hours=-3))), NOW),
+        (
+            datetime(2026, 1, 1, tzinfo=timezone(timedelta(seconds=1, microseconds=1))),
+            datetime(2025, 12, 31, 23, 59, 58, 999999, tzinfo=timezone.utc),
+        ),
+    ),
+)
+def test_native_match_time_is_exact_and_bounded(value, expected):
+    from src.ingest.trade_match_time import trade_match_time
+
+    with localcontext() as context:
+        context.prec = 2
+        context.Emax = 2
+        context.Emin = -2
+        assert trade_match_time({"match_time": value}) == expected
 
 
 @pytest.fixture
@@ -125,6 +166,51 @@ def _observation_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 class TestBasicAttribution:
+    @pytest.mark.parametrize(
+        ("clock_fields", "expected"),
+        (
+            ({"match_time": "bad-clock"}, None),
+            ({"match_time": "1e100"}, None),
+            ({"match_time": True}, None),
+            ({"match_time": "NaN"}, None),
+            ({"match_time": NOW.replace(tzinfo=None).isoformat()}, None),
+            ({"last_update": str(int(NOW.timestamp()))}, None),
+            ({"timestamp": str(int(NOW.timestamp()))}, None),
+            ({"match_time": str(int(NOW.timestamp()) * 1000)}, None),
+            ({"match_time": str(int(NOW.timestamp())) + ".0000001"}, None),
+            ({"match_time": NOW.isoformat().replace("+", ".1234567+", 1)}, None),
+            ({"match_time": NOW.isoformat(), "matchTime": (NOW + timedelta(seconds=1)).isoformat()}, None),
+            ({"match_time": str(int(NOW.timestamp()))}, NOW.isoformat()),
+            ({"match_time": str(int(NOW.timestamp())) + ".123456"}, (NOW + timedelta(microseconds=123456)).isoformat()),
+            ({"matchtime": NOW.isoformat()}, NOW.isoformat()),
+            ({"matchTime": NOW.astimezone(timezone(timedelta(hours=2))).isoformat()}, NOW.isoformat()),
+            ({"match_time": NOW.isoformat(), "matchTime": str(int(NOW.timestamp()))}, NOW.isoformat()),
+            ({"match_time": "", "matchTime": "0"}, "1970-01-01T00:00:00+00:00"),
+        ),
+    )
+    def test_native_match_clock_preserves_fill_and_wallet_observation(
+        self, conn, clock_fields, expected,
+    ):
+        """A malformed or delivery clock cannot become a matched-fill time."""
+        _seed_command(conn, command_id="cmd-clock", venue_order_id="ord-clock")
+        raw = _trade(trade_id="trade-clock", order_id="ord-clock")
+        raw.update(clock_fields)
+
+        result = sync_fills(conn, FakeSyncAdapter([raw]), observed_at=NOW)
+
+        assert result["appended"] == result["observation_appended"] == 1
+        fact, = _trade_rows(conn)
+        observation, = _observation_rows(conn)
+        assert fact["venue_timestamp"] == expected
+        assert observation["venue_timestamp"] == expected
+        assert fact["observed_at"] == observation["observed_at"] == NOW.isoformat()
+        assert fact["filled_size"] == observation["size"] == "5"
+        assert fact["fill_price"] == observation["price"] == "0.50"
+        assert fact["state"] == "CONFIRMED"
+        assert json.loads(fact["raw_payload_json"]) == raw
+        assert json.loads(observation["raw_payload_json"]) == raw
+        assert sync_fills(conn, FakeSyncAdapter([raw]), observed_at=NOW)["appended"] == 0
+
     def test_linkable_trade_is_appended_as_trade_fact(self, conn):
         _seed_command(conn, command_id="cmd-1", venue_order_id="ord-1")
         adapter = FakeSyncAdapter([_trade(trade_id="trade-1", order_id="ord-1")])
