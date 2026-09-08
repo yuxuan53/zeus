@@ -3421,4 +3421,4 @@ files:
   src/ingest/post_fill_book_observer.py:
     zone: K2_runtime
     authority_role: passive_public_book_observer
-    why: Bounded public /book collector for explicitly registered protocols. It releases every DB connection before HTTP and never submits, scores, or promotes book facts.
+    why: Bounded public /book collector for explicitly registered protocols. Raw receipt hash, trade/order identity, and native match time bind the first H request; rejected revisions remain observations. It releases every DB connection before HTTP and never submits, scores, or promotes book facts.

@@ -3,6 +3,8 @@
 # Authority basis: docs/operations/current/plans/hourly_capital_gains_improvement_loop.md
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -18,6 +20,12 @@ NOW = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
 def _row(
     fact_id: int, venue_timestamp: str | None, *, state: str = "MATCHED"
 ) -> dict[str, object]:
+    raw = json.dumps(
+        {"id": "trade", "orderID": "order", "match_time": venue_timestamp},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return {
         "trade_fact_id": fact_id,
         "command_id": "cmd",
@@ -36,7 +44,8 @@ def _row(
         "fee_paid_micro": 0,
         "tx_hash": "tx",
         "source": "REST",
-        "raw_payload_hash": "a" * 64,
+        "raw_payload_hash": hashlib.sha256(raw.encode()).hexdigest(),
+        "raw_payload_json": raw,
     }
 
 

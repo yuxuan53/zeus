@@ -1504,7 +1504,14 @@ def test_day0_provider_run_witness_reaches_receipt_carrier(monkeypatch: pytest.M
     )
     import src.engine.event_reactor_adapter as era
 
-    now = datetime.now(UTC)
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+
+    class CaptureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr("src.data.day0_hourly_vectors.datetime", CaptureClock)
     target_date = now.astimezone(ZoneInfo("Europe/Paris")).date().isoformat()
     models = ["ecmwf_ifs", "icon_global", "ukmo_global_deterministic_10km"]
     times = [f"{target_date}T{hour:02d}:00" for hour in range(24)]
@@ -1545,7 +1552,7 @@ def test_day0_provider_run_witness_reaches_receipt_carrier(monkeypatch: pytest.M
         request_hash=request_hash,
         now=now,
     ) == len(models)
-    computed_at = datetime.now(UTC)
+    computed_at = now + timedelta(seconds=1)
     anchor_vector_id = conn.execute(
         "SELECT vector_id FROM day0_hourly_vectors WHERE model = 'ecmwf_ifs'"
     ).fetchone()[0]

@@ -94,6 +94,16 @@ def test_clock_requires_aware_venue_timestamp_and_never_substitutes_observed_at(
     row["venue_timestamp"] = "2026-09-08T11:59:00+00:00"
     assert classify_source_fact(row, protocol)[0] == "HISTORICAL_PRE_REGISTRATION"
     row["venue_timestamp"] = "2026-09-08T12:01:00+00:00"
+    payload = _receipt_payload(
+        trade_id="trade",
+        order_id="order",
+        match_time=row["venue_timestamp"],
+    )
+    row.update(
+        source="REST",
+        raw_payload_json=_receipt_json(payload),
+        raw_payload_hash=hashlib.sha256(_receipt_json(payload).encode()).hexdigest(),
+    )
     assert classify_source_fact(row, protocol) == (
         "SCHEDULED",
         "2026-09-08T12:01:00+00:00",
@@ -102,11 +112,31 @@ def test_clock_requires_aware_venue_timestamp_and_never_substitutes_observed_at(
     )
 
 
+def _receipt_payload(*, trade_id: str, order_id: str, match_time: str) -> dict[str, object]:
+    return {
+        "trade_id": trade_id,
+        "tradeID": trade_id,
+        "id": trade_id,
+        "orderID": order_id,
+        "match_time": match_time,
+    }
+
+
+def _receipt_json(payload: dict[str, object]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _set_receipt_payload(row: dict[str, object], payload: dict[str, object]) -> None:
+    payload_json = _receipt_json(payload)
+    row["raw_payload_json"] = payload_json
+    row["raw_payload_hash"] = hashlib.sha256(payload_json.encode()).hexdigest()
+
+
 def _seed_db(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript("""
-      CREATE TABLE venue_trade_facts (trade_fact_id INTEGER PRIMARY KEY, trade_id TEXT, venue_order_id TEXT, command_id TEXT, state TEXT, filled_size TEXT, fill_price TEXT, fee_paid_micro INTEGER, tx_hash TEXT, source TEXT, observed_at TEXT, venue_timestamp TEXT, raw_payload_hash TEXT);
+      CREATE TABLE venue_trade_facts (trade_fact_id INTEGER PRIMARY KEY, trade_id TEXT, venue_order_id TEXT, command_id TEXT, state TEXT, filled_size TEXT, fill_price TEXT, fee_paid_micro INTEGER, tx_hash TEXT, source TEXT, observed_at TEXT, venue_timestamp TEXT, raw_payload_hash TEXT, raw_payload_json TEXT);
       CREATE TABLE venue_commands (command_id TEXT PRIMARY KEY, envelope_id TEXT, token_id TEXT, side TEXT);
       CREATE TABLE venue_submission_envelopes (envelope_id TEXT PRIMARY KEY, condition_id TEXT, selected_outcome_token_id TEXT, side TEXT);
     """)
@@ -122,9 +152,15 @@ def _seed_db(path):
     conn.execute(
         "INSERT INTO venue_submission_envelopes VALUES ('env','condition','token','BUY')"
     )
+    payload = _receipt_payload(
+        trade_id="trade",
+        order_id="order",
+        match_time="2026-09-08T12:00:00+00:00",
+    )
+    payload_json = _receipt_json(payload)
     conn.execute(
-        "INSERT INTO venue_trade_facts VALUES (1,'trade','order','cmd','CONFIRMED','1','0.5',0,'tx','REST','2026-09-08T12:00:01+00:00','2026-09-08T12:00:00+00:00',?)",
-        ("a" * 64,),
+        "INSERT INTO venue_trade_facts VALUES (1,'trade','order','cmd','CONFIRMED','1','0.5',0,'tx','REST','2026-09-08T12:00:01+00:00','2026-09-08T12:00:00+00:00',?,?)",
+        (hashlib.sha256(payload_json.encode()).hexdigest(), payload_json),
     )
     conn.commit()
     conn.close()
@@ -200,9 +236,18 @@ def test_left_join_missing_command_is_observed_and_cursor_advances(
     path = tmp_path / "trade.db"
     _seed_db(path)
     conn = sqlite3.connect(path)
+    missing_payload = _receipt_payload(
+        trade_id="missing",
+        order_id="order-missing",
+        match_time="2026-09-08T12:00:00+00:00",
+    )
+    missing_payload_json = _receipt_json(missing_payload)
     conn.execute(
-        "INSERT INTO venue_trade_facts VALUES (2,'missing','order-missing','missing-command','MATCHED','1','0.5',0,'tx2','REST','2026-09-08T12:00:01+00:00','2026-09-08T12:00:00+00:00',?)",
-        ("b" * 64,),
+        "INSERT INTO venue_trade_facts VALUES (2,'missing','order-missing','missing-command','MATCHED','1','0.5',0,'tx2','REST','2026-09-08T12:00:01+00:00','2026-09-08T12:00:00+00:00',?,?)",
+        (
+            hashlib.sha256(missing_payload_json.encode()).hexdigest(),
+            missing_payload_json,
+        ),
     )
     conn.commit()
     conn.close()
@@ -304,12 +349,27 @@ def _fact(
     token: str = "token-1",
     condition: str = "condition-1",
     side: str = "BUY",
+    order_alias: str = "orderID",
+    source: str = "REST",
 ) -> dict[str, object]:
+    order_id = f"order-{trade_id}"
+    payload = _receipt_payload(
+        trade_id=trade_id,
+        order_id=order_id,
+        match_time=_iso(fill_time),
+    )
+    if order_alias != "orderID":
+        payload.pop("orderID")
+        if order_alias == "maker_orders":
+            payload[order_alias] = [{"orderID": order_id}]
+        else:
+            payload[order_alias] = order_id
+    payload_json = _receipt_json(payload)
     return {
         "trade_fact_id": fact_id,
         "command_id": command_id,
         "trade_id": trade_id,
-        "venue_order_id": f"order-{trade_id}",
+        "venue_order_id": order_id,
         "condition_id": condition,
         "token_id": token,
         "side": side,
@@ -322,8 +382,9 @@ def _fact(
         "fill_price": price,
         "fee_paid_micro": fee,
         "tx_hash": f"tx-{trade_id}",
-        "source": "REST",
-        "raw_payload_hash": hashlib.sha256(f"raw-{fact_id}".encode()).hexdigest(),
+        "source": source,
+        "raw_payload_hash": hashlib.sha256(payload_json.encode()).hexdigest(),
+        "raw_payload_json": payload_json,
     }
 
 
@@ -368,6 +429,158 @@ def _request(conn: sqlite3.Connection, protocol_id: str = "p") -> sqlite3.Row:
     ).fetchone()
     assert row is not None
     return row
+
+
+@pytest.mark.parametrize(
+    ("source", "order_alias"),
+    (
+        ("REST", "orderID"),
+        ("WS_USER", "orderId"),
+        ("REST", "order_id"),
+        ("WS_USER", "maker_order_id"),
+        ("REST", "taker_order_id"),
+        ("WS_USER", "maker_orders"),
+    ),
+)
+def test_classifier_accepts_native_receipt_aliases_for_scheduled_positive(
+    source: str, order_alias: str
+) -> None:
+    row = _fact(1, source=source, order_alias=order_alias)
+    assert classify_source_fact(row, {"registered_at": _iso(REG), "horizon_seconds": 60, "window_seconds": 30})[0] == "SCHEDULED"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    (
+        ("missing-json", "SOURCE_PAYLOAD_JSON_INVALID"),
+        ("nonmapping-json", "SOURCE_PAYLOAD_JSON_INVALID"),
+        ("malformed-json", "SOURCE_PAYLOAD_JSON_INVALID"),
+        ("hash-mismatch", "SOURCE_PAYLOAD_HASH_MISMATCH"),
+        ("trade-id-mismatch", "SOURCE_TRADE_ID_MISMATCH"),
+        ("order-id-mismatch", "SOURCE_ORDER_ID_MISMATCH"),
+        ("match-time-invalid", "SOURCE_MATCH_TIME_INVALID"),
+        ("match-time-mismatch", "SOURCE_MATCH_TIME_MISMATCH"),
+        ("match-time-overprecision", "SOURCE_MATCH_TIME_INVALID"),
+        ("unsupported-source", "SOURCE_TYPE_UNSUPPORTED"),
+    ),
+)
+def test_classifier_rejects_untrusted_source_receipt_provenance(
+    label: str, expected: str
+) -> None:
+    row = _fact(1)
+    if label == "missing-json":
+        row["raw_payload_json"] = None
+    elif label == "nonmapping-json":
+        row["raw_payload_json"] = "[]"
+    elif label == "malformed-json":
+        row["raw_payload_json"] = "{"  # keep the original hash to test JSON first
+    elif label == "hash-mismatch":
+        row["raw_payload_hash"] = "0" * 64
+    elif label == "trade-id-mismatch":
+        payload = json.loads(str(row["raw_payload_json"]))
+        payload["tradeID"] = "other-trade"
+        _set_receipt_payload(row, payload)
+    elif label == "order-id-mismatch":
+        payload = json.loads(str(row["raw_payload_json"]))
+        payload["orderID"] = "other-order"
+        _set_receipt_payload(row, payload)
+    elif label == "match-time-invalid":
+        payload = json.loads(str(row["raw_payload_json"]))
+        payload.pop("match_time")
+        _set_receipt_payload(row, payload)
+    elif label == "match-time-mismatch":
+        payload = json.loads(str(row["raw_payload_json"]))
+        payload["match_time"] = _iso(REG + timedelta(minutes=2))
+        _set_receipt_payload(row, payload)
+    elif label == "match-time-overprecision":
+        payload = json.loads(str(row["raw_payload_json"]))
+        payload["match_time"] = "2026-09-08T12:01:00.1234567+00:00"
+        _set_receipt_payload(row, payload)
+    elif label == "unsupported-source":
+        row["source"] = "OTHER"
+    else:
+        raise AssertionError(label)
+
+    status = classify_source_fact(
+        row,
+        {"registered_at": _iso(REG), "horizon_seconds": 60, "window_seconds": 30},
+    )
+    assert status[0] == expected
+
+    conn = _memory_conn()
+    try:
+        _register(conn)
+        _observe(conn, "p", [row])
+        event = conn.execute(
+            "SELECT event_type,reason FROM post_fill_book_observation_events"
+        ).fetchone()
+        assert tuple(event) == ("SOURCE_OBSERVED", expected)
+        assert conn.execute("SELECT COUNT(*) FROM post_fill_book_requests").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_source_provenance_failure_is_observed_without_request() -> None:
+    conn = _memory_conn()
+    _register(conn)
+    row = _fact(1)
+    payload = json.loads(str(row["raw_payload_json"]))
+    payload["tradeID"] = "other-trade"
+    _set_receipt_payload(row, payload)
+
+    _observe(conn, "p", [row])
+
+    event = conn.execute(
+        "SELECT event_type, reason FROM post_fill_book_observation_events"
+    ).fetchone()
+    assert tuple(event) == ("SOURCE_OBSERVED", "SOURCE_TRADE_ID_MISMATCH")
+    assert conn.execute("SELECT COUNT(*) FROM post_fill_book_requests").fetchone()[0] == 0
+
+
+def test_missing_native_match_time_does_not_create_request_until_valid_revision():
+    conn = _memory_conn()
+    _register(conn)
+    missing = _fact(1)
+    payload = json.loads(str(missing["raw_payload_json"]))
+    payload.pop("match_time")
+    _set_receipt_payload(missing, payload)
+    _observe(conn, "p", [missing])
+    assert conn.execute("SELECT COUNT(*) FROM post_fill_book_requests").fetchone()[0] == 0
+
+    valid = _fact(2)
+    _observe(conn, "p", [valid])
+    request = _request(conn)
+    assert request["source_trade_fact_id"] == 2
+    assert request["trade_id"] == "trade-1"
+
+
+@pytest.mark.parametrize("order_alias", ("maker_order_id", "taker_order_id"))
+def test_classifier_accepts_own_order_in_native_maker_taker_membership(order_alias):
+    row = _fact(1, order_alias=order_alias)
+    payload = json.loads(str(row["raw_payload_json"]))
+    payload["maker_order_id"] = row["venue_order_id"]
+    payload["taker_order_id"] = "foreign-order"
+    if order_alias == "taker_order_id":
+        payload["maker_order_id"] = "foreign-order"
+        payload["taker_order_id"] = row["venue_order_id"]
+    _set_receipt_payload(row, payload)
+
+    assert classify_source_fact(
+        row,
+        {"registered_at": _iso(REG), "horizon_seconds": 60, "window_seconds": 30},
+    )[0] == "SCHEDULED"
+
+
+def test_classifier_accepts_native_and_canonical_clocks_with_same_instant():
+    row = _fact(1)
+    payload = json.loads(str(row["raw_payload_json"]))
+    payload["match_time"] = "2026-09-08T14:01:00+02:00"
+    _set_receipt_payload(row, payload)
+
+    assert classify_source_fact(
+        row,
+        {"registered_at": _iso(REG), "horizon_seconds": 60, "window_seconds": 30},
+    )[0] == "SCHEDULED"
 
 
 def test_matched_to_late_confirmed_freezes_original_request_and_records_both_facts():
@@ -475,7 +688,7 @@ def _file_schema(
             trade_fact_id INTEGER PRIMARY KEY, trade_id TEXT, venue_order_id TEXT,
             command_id TEXT, state TEXT, filled_size TEXT, fill_price TEXT,
             fee_paid_micro INTEGER, tx_hash TEXT, source TEXT, observed_at TEXT,
-            venue_timestamp TEXT, raw_payload_hash TEXT
+            venue_timestamp TEXT, raw_payload_hash TEXT, raw_payload_json TEXT
         );
         CREATE TABLE venue_commands (
             command_id TEXT PRIMARY KEY, envelope_id TEXT, token_id TEXT, side TEXT
@@ -491,7 +704,7 @@ def _file_schema(
         _register(conn, protocol_id)
     for row in facts:
         conn.execute(
-            "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(
                 row.get(key)
                 for key in (
@@ -508,6 +721,7 @@ def _file_schema(
                     "observed_at",
                     "venue_timestamp",
                     "raw_payload_hash",
+                    "raw_payload_json",
                 )
             ),
         )
@@ -633,7 +847,7 @@ def test_fetch_error_retries_once_within_window_then_expired_backlog_is_missed(
         2, trade_id="trade-2", command_id="cmd-2", fill_time=REG + timedelta(minutes=10)
     )
     conn.execute(
-        "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         tuple(
             row2.get(key)
             for key in (
@@ -650,6 +864,7 @@ def test_fetch_error_retries_once_within_window_then_expired_backlog_is_missed(
                 "observed_at",
                 "venue_timestamp",
                 "raw_payload_hash",
+                "raw_payload_json",
             )
         ),
     )
@@ -671,6 +886,85 @@ def test_fetch_error_retries_once_within_window_then_expired_backlog_is_missed(
         utc_clock=lambda: REG + timedelta(minutes=12),
     )
     assert expired["missed"] == 1
+
+
+def test_late_valid_revision_is_missed_without_http_fetch(tmp_path, monkeypatch):
+    path = tmp_path / "late-valid-revision.db"
+    missing = _fact(1, fill_time=REG + timedelta(minutes=1))
+    payload = json.loads(str(missing["raw_payload_json"]))
+    payload.pop("match_time")
+    _set_receipt_payload(missing, payload)
+    _file_schema(path, facts=[missing])
+    _patch_cycle_db(monkeypatch, path)
+    calls: list[str] = []
+
+    def fetch(token_id, **_kwargs):
+        calls.append(token_id)
+        raise AssertionError("late valid revision must not fetch")
+
+    first = observer.run_cycle(
+        protocol_id="p",
+        fetch=fetch,
+        utc_clock=lambda: REG + timedelta(minutes=1, seconds=2),
+    )
+    assert first["source_observed"] == 1
+    assert first["missed"] == 0
+
+    valid = _fact(2, fill_time=REG + timedelta(minutes=1))
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM post_fill_book_requests").fetchone()[0] == 0
+        columns = (
+            "trade_fact_id",
+            "trade_id",
+            "venue_order_id",
+            "command_id",
+            "state",
+            "filled_size",
+            "fill_price",
+            "fee_paid_micro",
+            "tx_hash",
+            "source",
+            "observed_at",
+            "venue_timestamp",
+            "raw_payload_hash",
+            "raw_payload_json",
+        )
+        conn.execute(
+            "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(valid[key] for key in columns),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = observer.run_cycle(
+        protocol_id="p",
+        fetch=fetch,
+        utc_clock=lambda: REG + timedelta(minutes=3),
+    )
+
+    assert result["missed"] == 1
+    assert calls == []
+    conn = sqlite3.connect(path)
+    try:
+        event = conn.execute(
+            "SELECT event_type,reason FROM post_fill_book_observation_events ORDER BY event_id"
+        ).fetchall()
+        assert [tuple(row) for row in event] == [
+            ("SOURCE_OBSERVED", "SOURCE_MATCH_TIME_INVALID"),
+            ("SOURCE_OBSERVED", "SCHEDULED"),
+            ("MISSED_WINDOW", "WINDOW_EXPIRED"),
+        ]
+        request = conn.execute(
+            "SELECT source_trade_fact_id,due_at FROM post_fill_book_requests WHERE protocol_id='p'"
+        ).fetchall()
+        assert [tuple(row) for row in request] == [(2, _iso(REG + timedelta(minutes=2)))]
+        assert conn.execute(
+            "SELECT last_trade_fact_id FROM post_fill_book_cursors WHERE protocol_id='p'"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
 
 
 def test_crash_after_fetch_before_result_leaves_committed_request_for_restart_retry(
@@ -767,7 +1061,7 @@ def test_active_window_is_served_despite_expired_backlog_and_second_protocol(
     conn.row_factory = sqlite3.Row
     _register(conn, "active-protocol")
     conn.execute(
-        "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO venue_trade_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         tuple(
             active.get(key)
             for key in (
@@ -784,6 +1078,7 @@ def test_active_window_is_served_despite_expired_backlog_and_second_protocol(
                 "observed_at",
                 "venue_timestamp",
                 "raw_payload_hash",
+                "raw_payload_json",
             )
         ),
     )
@@ -822,6 +1117,43 @@ def test_active_window_is_served_despite_expired_backlog_and_second_protocol(
         == 1
     )
     conn.close()
+
+
+def test_oversized_source_payload_records_observed_error_and_advances_cursor(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "oversized-source.db"
+    row = _fact(1)
+    payload = json.loads(str(row["raw_payload_json"]))
+    payload["padding"] = "x" * 100
+    _set_receipt_payload(row, payload)
+    _file_schema(path, facts=[row])
+    _patch_cycle_db(monkeypatch, path)
+
+    result = observer.run_cycle(
+        protocol_id="p",
+        fetch=lambda *_args, **_kwargs: pytest.fail("oversized source must not fetch"),
+        utc_clock=lambda: REG + timedelta(minutes=2),
+        max_body_bytes=64,
+    )
+
+    assert result["source_observed"] == 1
+    assert result["captured"] == 0
+    conn = sqlite3.connect(path)
+    try:
+        event = conn.execute(
+            "SELECT event_type,reason FROM post_fill_book_observation_events"
+        ).fetchone()
+        assert tuple(event) == ("SOURCE_OBSERVED", "SOURCE_PAYLOAD_TOO_LARGE")
+        assert conn.execute("SELECT COUNT(*) FROM post_fill_book_requests").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT last_trade_fact_id FROM post_fill_book_cursors WHERE protocol_id='p'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
 
 
 def test_trade_only_schema_empty_registered_protocol_runs_without_fetch(

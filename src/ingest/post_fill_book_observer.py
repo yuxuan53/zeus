@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import sqlite3
@@ -14,10 +15,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
+from src.ingest.trade_match_time import trade_match_time
 from src.state import post_fill_book_repo as repo
 from src.state.post_fill_book_repo import validate_book as _validate_book
 
 BOOK_ENDPOINT = "https://clob.polymarket.com/book"
+_DEFAULT_MAX_BODY_BYTES = 262144
 _LOCK = threading.Lock()
 _LOG = logging.getLogger(__name__)
 _KNOWN_REASONS = {
@@ -72,7 +75,10 @@ def _positive_seconds(value: Any, name: str) -> float:
 
 
 def classify_source_fact(
-    row: Mapping[str, Any], protocol: Mapping[str, Any]
+    row: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    *,
+    max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
 ) -> tuple[str, str | None, str | None, str | None]:
     if str(row.get("source") or "") == "FAKE_VENUE":
         return "FAKE_VENUE_EXCLUDED", None, None, None
@@ -110,7 +116,7 @@ def classify_source_fact(
         return "SOURCE_ECONOMICS_INVALID", None, None, None
     if str(row.get("state") or "").upper() not in repo.ELIGIBLE_STATES:
         return "STATE_NOT_ECONOMIC", None, None, None
-    fill_time = _utc(row.get("venue_timestamp"))
+    fill_time = trade_match_time({"match_time": row.get("venue_timestamp")})
     observed_at = _utc(row.get("observed_at"))
     registered_at = _utc(protocol["registered_at"])
     if fill_time is None:
@@ -119,9 +125,76 @@ def classify_source_fact(
         return "VENUE_TIMESTAMP_AFTER_OBSERVED", fill_time.isoformat(), None, None
     if registered_at is None or fill_time < registered_at:
         return "HISTORICAL_PRE_REGISTRATION", fill_time.isoformat(), None, None
+    reason = _source_receipt_rejection(row, fill_time, max_body_bytes)
+    if reason is not None:
+        return reason, fill_time.isoformat(), None, None
     due = fill_time + timedelta(seconds=int(protocol["horizon_seconds"]))
     end = due + timedelta(seconds=int(protocol["window_seconds"]))
     return "SCHEDULED", fill_time.isoformat(), due.isoformat(), end.isoformat()
+
+
+def _source_receipt_rejection(
+    row: Mapping[str, Any], fill_time: datetime, max_body_bytes: int
+) -> str | None:
+    # SCOPE: this source revision's first H request. DRAIN: retain the fact and
+    # advance the cursor. RESET: a later consistent native receipt may schedule;
+    # an elapsed window remains missed. Existing requests never move.
+    if row.get("source") not in {"REST", "WS_USER"}:
+        return "SOURCE_TYPE_UNSUPPORTED"
+    raw = row.get("raw_payload_json")
+    if (row.get("source_payload_bytes") or 0) > max_body_bytes:
+        return "SOURCE_PAYLOAD_TOO_LARGE"
+    if not isinstance(raw, str):
+        return "SOURCE_PAYLOAD_JSON_INVALID"
+    if len(raw) > max_body_bytes:
+        return "SOURCE_PAYLOAD_TOO_LARGE"
+    try:
+        if len(raw.encode("utf-8")) > max_body_bytes:
+            return "SOURCE_PAYLOAD_TOO_LARGE"
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return "SOURCE_PAYLOAD_JSON_INVALID"
+        # Match the venue writers' hash preimage, including their serialization.
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except (ValueError, TypeError, RecursionError, UnicodeError):
+        return "SOURCE_PAYLOAD_JSON_INVALID"
+    if digest != row.get("raw_payload_hash"):
+        return "SOURCE_PAYLOAD_HASH_MISMATCH"
+    trade_ids = [
+        payload[key]
+        for key in ("trade_id", "tradeID", "id")
+        if payload.get(key) not in (None, "")
+    ]
+    if not trade_ids or any(value != row.get("trade_id") for value in trade_ids):
+        return "SOURCE_TRADE_ID_MISMATCH"
+    order_ids = [
+        payload.get(key)
+        for key in (
+            "orderID",
+            "orderId",
+            "order_id",
+            "maker_order_id",
+            "taker_order_id",
+        )
+    ]
+    makers = payload.get("maker_orders")
+    if isinstance(makers, list):
+        for maker in makers:
+            if isinstance(maker, dict):
+                order_ids.extend(
+                    maker.get(key) for key in ("order_id", "orderID", "orderId")
+                )
+    if row.get("venue_order_id") not in order_ids:
+        return "SOURCE_ORDER_ID_MISMATCH"
+    native_time = trade_match_time(payload)
+    if native_time is None:
+        return "SOURCE_MATCH_TIME_INVALID"
+    if native_time != fill_time:
+        return "SOURCE_MATCH_TIME_MISMATCH"
+    return None
 
 
 async def _public_book_fetch_async(
@@ -248,7 +321,11 @@ def _error_reason(exc: Exception) -> str:
 
 
 def _source_rows(
-    conn: sqlite3.Connection, protocol_id: str, fact_limit: int
+    conn: sqlite3.Connection,
+    protocol_id: str,
+    fact_limit: int,
+    *,
+    max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
 ) -> list[dict[str, Any]]:
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
@@ -265,6 +342,9 @@ def _source_rows(
                 tf.state, tf.filled_size, tf.fill_price, tf.fee_paid_micro,
                 tf.tx_hash, tf.source, tf.observed_at, tf.venue_timestamp,
                 tf.raw_payload_hash, vc.token_id, vc.side, e.condition_id,
+                LENGTH(CAST(tf.raw_payload_json AS BLOB)) AS source_payload_bytes,
+                CASE WHEN LENGTH(CAST(tf.raw_payload_json AS BLOB)) <= ?
+                     THEN tf.raw_payload_json END AS raw_payload_json,
                 e.selected_outcome_token_id AS envelope_token_id,
                 e.side AS envelope_side
               FROM venue_trade_facts AS tf
@@ -273,7 +353,7 @@ def _source_rows(
               WHERE tf.trade_fact_id > ?
               ORDER BY tf.trade_fact_id
               LIMIT ?""",
-            (cursor[0], fact_limit),
+            (max_body_bytes, cursor[0], fact_limit),
         )
     ]
 
@@ -324,7 +404,7 @@ def run_cycle(
     request_limit: int = 10,
     expired_limit: int = 100,
     timeout_seconds: float = 5.0,
-    max_body_bytes: int = 262144,
+    max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
     cycle_deadline_seconds: float = 20.0,
 ) -> dict[str, int]:
     """Consume registered protocols; no DB connection spans a public HTTP call."""
@@ -379,13 +459,17 @@ def run_cycle(
             conn = None
             try:
                 conn = _open_observation_connection(deadline_monotonic)
-                rows = _source_rows(conn, current_protocol, fact_limit)
+                rows = _source_rows(
+                    conn, current_protocol, fact_limit, max_body_bytes=max_body_bytes
+                )
                 result["source_observed"] += repo.observe_source_facts(
                     conn,
                     protocol_id=current_protocol,
                     rows=rows,
                     observed_at=read_clock().isoformat(),
-                    classify=classify_source_fact,
+                    classify=lambda row, protocol: classify_source_fact(
+                        row, protocol, max_body_bytes=max_body_bytes
+                    ),
                 )
             except Exception as exc:
                 result["protocol_failures"] += 1
