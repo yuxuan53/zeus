@@ -1,17 +1,11 @@
-# Lifecycle: created=2026-06-12; last_reviewed=2026-06-12; last_reused=2026-06-12
-# Purpose: antibody for the fee-schedule-as-realized-fee data-semantics error —
-#   the taker fee fraction in EV math must come from realized-fill evidence,
-#   degrading to the venue schedule only when evidence is thin/stale/absent.
-# Reuse: incident 2026-06-12 — CLOB base_fee=1000bps (schedule CAP) consumed as
-#   the actual fee, a ~10% phantom tax per EV, while 42/42 realized fills carried
-#   trade-level fee_rate_bps=0 and cost basis reconciled to price*shares exactly.
-# Last reused/audited: 2026-06-12
-# Authority basis: calibration authority Task 2.3 + operator no-unfitted-hardcode law.
+# Lifecycle: created=2026-06-12; last_reviewed=2026-09-08; last_reused=2026-09-08
+# Purpose: antibody that current executable snapshot/Gamma fee schedule is the
+#   only taker fee authority; historical fee artifacts remain diagnostic.
 """Tests for src/contracts/fee_authority.py + the reconciler artifact contract."""
 from __future__ import annotations
 
-import importlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -23,9 +17,8 @@ import src.contracts.fee_authority as fa
 @pytest.fixture()
 def artifact_path(tmp_path, monkeypatch):
     p = tmp_path / "fee_reconciliation.json"
-    monkeypatch.setattr(fa, "ARTIFACT_PATH", p)
-    fa._cache["mtime"] = None
-    fa._cache["artifact"] = None
+    monkeypatch.setattr(fa, "ARTIFACT_PATH", p, raising=False)
+    monkeypatch.setattr(fa, "_cache", {"mtime": None, "artifact": None}, raising=False)
     return p
 
 
@@ -40,86 +33,70 @@ def _write(p: Path, **kw):
     p.write_text(json.dumps(base))
 
 
-def test_licensed_zero_evidence_overrides_schedule(artifact_path):
-    _write(artifact_path)
-    fraction, source = fa.resolve_taker_fee_fraction(0.10)
-    assert fraction == 0.0
-    assert source.startswith("realized_fills_n=42")
+def test_fresh_zero_artifact_does_not_override_current_schedule(artifact_path):
+    _write(artifact_path, n_fills=41221)
+    fraction, source = fa.resolve_taker_fee_fraction(0.05)
+    assert fraction == 0.05
+    assert source == "current_snapshot_fee_schedule"
 
 
 def test_no_artifact_falls_back_to_schedule(artifact_path):
     fraction, source = fa.resolve_taker_fee_fraction(0.10)
     assert fraction == 0.10
-    assert "no_reconciliation_artifact" in source
+    assert source == "current_snapshot_fee_schedule"
 
 
 def test_thin_evidence_falls_back_to_schedule(artifact_path):
     _write(artifact_path, n_fills=3)
     fraction, source = fa.resolve_taker_fee_fraction(0.10)
     assert fraction == 0.10
-    assert "insufficient_fills" in source
+    assert source == "current_snapshot_fee_schedule"
 
 
-def test_nonzero_observed_fee_is_used_but_never_exceeds_schedule(artifact_path):
+def test_positive_or_large_artifact_cannot_lower_current_schedule(artifact_path):
     _write(artifact_path, observed_max_fee_fraction=0.02)
-    fraction, _ = fa.resolve_taker_fee_fraction(0.10)
-    assert fraction == 0.02
-    # observed above schedule: schedule (the venue's own cap) wins
+    fraction, source = fa.resolve_taker_fee_fraction(0.10)
+    assert fraction == 0.10
+    assert source == "current_snapshot_fee_schedule"
     _write(artifact_path, observed_max_fee_fraction=0.50)
-    fa._cache["mtime"] = None
     fraction2, _ = fa.resolve_taker_fee_fraction(0.10)
     assert fraction2 == 0.10
 
 
-def test_stale_evidence_degrades_to_schedule(artifact_path, monkeypatch):
+def test_stale_artifact_is_ignored(artifact_path):
     _write(artifact_path)
-    old = time.time() - (fa.MAX_EVIDENCE_AGE_DAYS + 5) * 86400
-    import os
+    old = time.time() - 35 * 86400
     os.utime(artifact_path, (old, old))
-    fa._cache["mtime"] = None
     fraction, source = fa.resolve_taker_fee_fraction(0.10)
     assert fraction == 0.10
-    assert "evidence_stale" in source
+    assert source == "current_snapshot_fee_schedule"
 
 
-def test_stale_evidence_warns_once_per_episode(artifact_path, monkeypatch, caplog):
-    """Recurrence 2026-07-12 -> 2026-08-24: staleness was silent for ~6 weeks. The
-    fallback direction (schedule fee) is correct and must not change; only the
-    silence was the defect. One WARNING per staleness episode, not per call
-    (this path runs on the hot EV-decision loop)."""
-    import os
+@pytest.mark.parametrize("schedule", [0.0, 0.02, 1.0])
+def test_valid_current_snapshot_schedule_is_returned_unchanged(schedule):
+    fraction, source = fa.resolve_taker_fee_fraction(schedule)
+    assert fraction == float(schedule)
+    assert source == "current_snapshot_fee_schedule"
 
-    _write(artifact_path)
-    old = time.time() - (fa.MAX_EVIDENCE_AGE_DAYS + 5) * 86400
-    os.utime(artifact_path, (old, old))
-    fa._cache["mtime"] = None
-    monkeypatch.setattr(fa, "_stale_warned", False)
 
-    with caplog.at_level("WARNING", logger="src.contracts.fee_authority"):
-        fa.resolve_taker_fee_fraction(0.10)
-        fa.resolve_taker_fee_fraction(0.10)  # second call, same episode: no new warning
-    stale_records = [r for r in caplog.records if "evidence is stale" in r.message]
-    assert len(stale_records) == 1
+@pytest.mark.parametrize(
+    "schedule",
+    [float("nan"), float("inf"), float("-inf"), -0.01, 1.01, "invalid", True, False],
+    ids=["nan", "positive-inf", "negative-inf", "negative", "above-one", "parse", "true", "false"],
+)
+def test_invalid_current_snapshot_schedule_fails_closed(schedule):
+    with pytest.raises(ValueError, match="invalid current snapshot fee schedule"):
+        fa.resolve_taker_fee_fraction(schedule)
 
-    # Recovery (fresh evidence) clears the episode flag.
-    _write(artifact_path)
-    os.utime(artifact_path, None)
-    fa._cache["mtime"] = None
+
+def test_malformed_artifact_is_ignored(artifact_path):
+    artifact_path.write_text("not-json")
     fraction, source = fa.resolve_taker_fee_fraction(0.10)
-    assert source.startswith("realized_fills_n=")
-    assert fa._stale_warned is False
-
-    # A NEW staleness episode warns again.
-    os.utime(artifact_path, (old, old))
-    fa._cache["mtime"] = None
-    caplog.clear()
-    with caplog.at_level("WARNING", logger="src.contracts.fee_authority"):
-        fa.resolve_taker_fee_fraction(0.10)
-    stale_records2 = [r for r in caplog.records if "evidence is stale" in r.message]
-    assert len(stale_records2) == 1
+    assert fraction == 0.10
+    assert source == "current_snapshot_fee_schedule"
 
 
-def test_refit_writes_valid_licensable_artifact_from_fixture_db(tmp_path):
+def test_refit_writes_diagnostic_artifact_without_fee_authority(tmp_path, monkeypatch):
     """The extracted refit() core (imported by the daemon scheduler) must produce the
     same artifact shape the CLI writes, from a plain fixture DB -- no live zeus_trades.db
     dependency."""
@@ -151,9 +128,10 @@ def test_refit_writes_valid_licensable_artifact_from_fixture_db(tmp_path):
 
     assert artifact["n_fills"] == 12
     assert artifact["observed_max_fee_fraction"] == 0.0
-    assert artifact["n_fills"] >= fa.MIN_FILLS_TO_LICENSE
     written = json.loads(out_path.read_text())
     assert written == artifact
+    monkeypatch.setattr(fa, "ARTIFACT_PATH", out_path, raising=False)
+    assert fa.resolve_taker_fee_fraction(0.05) == (0.05, "current_snapshot_fee_schedule")
     # No leftover tmp file from the atomic write.
     assert not (tmp_path / "fee_reconciliation.json.tmp").exists()
 
