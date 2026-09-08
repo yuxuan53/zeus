@@ -8011,6 +8011,14 @@ def _edli_command_recovery_cycle() -> None:
         summary,
         log_context="edli_command_recovery.live_tick",
     )
+    if any(
+        summary.get(flag)
+        for flag in ("db_budget_deferred", "db_lock_deferred", "monitor_preempted")
+    ):
+        # SCOPE: this invocation's account-wide full sweep only. DRAIN: the
+        # next cadence retries after live_tick dependencies yield. RESET: a
+        # live_tick summary with all three defer flags clear permits full work.
+        return
     full_bucket = _edli_command_recovery_full_bucket()
     global _EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET
     if full_bucket == _EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET:

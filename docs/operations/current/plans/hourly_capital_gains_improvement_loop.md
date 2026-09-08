@@ -1273,3 +1273,35 @@
   Existing long-lived report retained; no DB or venue side effects; temporary
   config removed. Evidence checked=2026-W37; basis=current canonical query
   and corrected report; until=recheck-on-use.
+
+### 2026-09-08 — deferred live recovery cannot start background sweep
+
+- Verified defect: _edli_command_recovery_cycle consumes live_tick summary
+  then starts full recovery whenever shared invocation time remains, even
+  after db_budget_deferred/db_lock_deferred/monitor_preempted. Current full
+  priming includes 40 orders (38 historical partial-remainder ENTRY orders);
+  unnecessary same-invocation work competes with the yielded monitor lane.
+  This is not established as the sole cause of monitor COVERAGE_INCOMPLETE.
+- Exact slice: src/main.py and existing tests/test_command_recovery.py.
+  Return after consuming a deferred/preempted live_tick summary, before
+  full bucket evaluation/attempt. Preserve consumption and finally cleanup,
+  do not advance LAST_FULL_BUCKET, preserve clean-live_tick full sweep.
+- SCOPE: same-invocation background sweep only. DRAIN: next ordinary cadence
+  runs live_tick first; clean completion makes background sweep eligible.
+  RESET: all three current summary flags false/absent; no persistent state.
+  Historical order truth is neither discarded nor marked terminal.
+- Acceptance: each flag's behavioral antibody fails on base; clean success
+  and next-cadence recovery remain; focused scheduler/recovery tests have no
+  new failed names, independent review and changed-surface checks. Prove
+  integration on current live, then official deployment preflight and
+  current loaded-SHA/cycle evidence before claiming runtime improvement.
+  No risk threshold, lifecycle, schema, or venue action changes. Rollback
+  is one isolated hotfix; restart remains subject to actual deploy gates.
+
+- Implementation and proof: three flag-specific antibodies fail on base and
+  pass after; scheduled recovery subset 10 passed, 629 deselected, related main
+  recovery subset 3 passed, 264 deselected. Both compile and diff checks pass;
+  planning-lock and map-maintenance pass; independent reviewer GO. Existing
+  unrelated Ruff 37 diagnostics remain. Temporary example config removed.
+  Full repository suite is not claimed. Deployment acceptance remains open
+  until official preflight and loaded-SHA/current-cycle verification.

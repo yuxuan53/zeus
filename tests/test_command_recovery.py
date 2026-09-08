@@ -1,8 +1,8 @@
 # Created: 2026-04-26
-# Lifecycle: created=2026-04-26; last_reviewed=2026-09-05; last_reused=2026-09-05
+# Lifecycle: created=2026-04-26; last_reviewed=2026-09-07; last_reused=2026-09-07
 # Purpose: Lock INV-31 command recovery behavior plus snapshot-gated command inserts.
 # Reuse: Run when command recovery, command journal schema, or executable snapshot gating changes.
-# Last reused/audited: 2026-09-05
+# Last reused/audited: 2026-09-07
 # Authority basis: docs/operations/task_2026-04-26_execution_state_truth_p1_command_bus/implementation_plan.md u00a7P1.S4
 """INV-31 anchor tests: command recovery loop.
 
@@ -37310,6 +37310,109 @@ def test_edli_command_recovery_runs_fast_tick_and_periodic_full_sweep(monkeypatc
         ("live_tick", "edli_command_recovery.live_tick"),
         ("full", "edli_command_recovery.full"),
         ("live_tick", "edli_command_recovery.live_tick"),
+    ]
+    assert main._EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET == 7
+
+
+@pytest.mark.parametrize(
+    "defer_flag",
+    ("db_budget_deferred", "db_lock_deferred", "monitor_preempted"),
+)
+def test_edli_command_recovery_deferral_skips_full_bucket_until_next_tick(
+    monkeypatch, defer_flag
+):
+    from src import main
+    from src.execution import command_recovery, venue_cancel_journal
+    from src.state import db
+
+    class _Connection:
+        def set_progress_handler(self, *_args):
+            pass
+
+        def close(self):
+            pass
+
+    scopes = []
+    consumed = []
+    summaries = [
+        {
+            "scope": "live_tick",
+            "scanned": 0,
+            "advanced": 0,
+            "stayed": 0,
+            "errors": 0,
+            defer_flag: True,
+        },
+        {
+            "scope": "live_tick",
+            "scanned": 0,
+            "advanced": 0,
+            "stayed": 0,
+            "errors": 0,
+        },
+        {
+            "scope": "full",
+            "scanned": 0,
+            "advanced": 0,
+            "stayed": 0,
+            "errors": 0,
+        },
+    ]
+
+    monkeypatch.setattr(main, "_consume_live_control_commands", lambda: None)
+    monkeypatch.setattr(main, "_settings_section", lambda *_args: {})
+    monkeypatch.setattr(main, "get_mode", lambda: "live")
+    monkeypatch.setattr(
+        main,
+        "_defer_for_held_position_monitor",
+        lambda _job_name: False,
+    )
+    monkeypatch.setattr(main, "_edli_command_recovery_full_bucket", lambda: 7)
+    monkeypatch.setattr(main, "_EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET", None)
+    monkeypatch.setattr(
+        db,
+        "get_trade_connection_read_only",
+        lambda **_kwargs: _Connection(),
+    )
+    monkeypatch.setattr(command_recovery, "capital_blocking_command_count", lambda _conn: 0)
+    monkeypatch.setattr(
+        command_recovery,
+        "terminal_exit_residual_projection_pending",
+        lambda _conn: False,
+    )
+    monkeypatch.setattr(
+        venue_cancel_journal,
+        "find_screen_redecision_cancel_obligations",
+        lambda _conn: [],
+    )
+    monkeypatch.setattr(
+        command_recovery,
+        "reconcile_unresolved_commands",
+        lambda *, scope, deadline_monotonic: scopes.append(scope)
+        or summaries.pop(0),
+    )
+    monkeypatch.setattr(
+        main,
+        "_consume_edli_command_recovery_summary",
+        lambda summary, *, log_context: consumed.append(
+            (summary["scope"], log_context)
+        )
+        or True,
+    )
+
+    main._edli_command_recovery_cycle.__wrapped__()
+
+    assert scopes == ["live_tick"]
+    assert consumed == [("live_tick", "edli_command_recovery.live_tick")]
+    assert main._EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET is None
+
+    main._edli_command_recovery_cycle.__wrapped__()
+
+    assert scopes == ["live_tick", "live_tick", "full"]
+    assert consumed == [
+        ("live_tick", "edli_command_recovery.live_tick"),
+        ("live_tick", "edli_command_recovery.live_tick"),
+        ("full", "edli_command_recovery.full"),
     ]
     assert main._EDLI_COMMAND_RECOVERY_LAST_FULL_BUCKET == 7
 
