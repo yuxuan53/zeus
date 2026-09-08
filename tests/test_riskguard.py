@@ -1,8 +1,8 @@
 # Created: 2026-03-30
-# Last reused/audited: 2026-08-27
+# Last reused/audited: 2026-09-08
 # Authority basis: docs/operations/task_2026-04-28_contamination_remediation/plan.md Batch D RiskGuard test-law remediation; Wave26 verification-noise helper alignment; PR90 current-env fallback review fix; 2026-08-15 economic-settlement trailing-loss hotfix.
 #                  2026-05-17 live lock remediation: RiskGuard trade/world DB lock degrades to fresh DATA_DEGRADED rather than stale RED.
-# Lifecycle: created=2026-03-30; last_reviewed=2026-08-27; last_reused=2026-08-27
+# Lifecycle: created=2026-03-30; last_reviewed=2026-09-08; last_reused=2026-09-08
 # Purpose: Guard RiskGuard protective metrics, policy resolution, source authority, and portfolio loader invariants.
 # Reuse: Run after RiskGuard risk details, portfolio loader, settlement source, bankroll, or risk-action changes.
 # 2026-08-17: Brier strategy-gate evidence is independent by target date.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Created: 2026-05-21
-# Last reused/audited: 2026-05-23
+# Last reused/audited: 2026-09-08
 # Authority basis: architecture/test_quality.yaml; architecture/test_topology.yaml trust policy
 #                  + architecture/money_path_ci.yaml (P2-1 fix: all relationship_tests tracked)
 """Validate money-path test quality metadata."""
@@ -52,6 +52,11 @@ def all_ci_relationship_tests() -> list[str]:
     return sorted(result)
 
 
+def _selector_path(selector: str) -> str:
+    """Return the filesystem path portion of a pytest node selector."""
+    return str(selector).split("::", 1)[0]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quality", type=Path, default=ROOT / "architecture/test_quality.yaml")
@@ -88,13 +93,19 @@ def main(argv: list[str] | None = None) -> int:
     # This catches tests/analysis/**, tests/test_p1_findings_evidence_risk.py, etc.
     money_path_tests = set(tracked_money_path_tests())
     for test in all_ci_relationship_tests():
-        if test in money_path_tests:
+        if _selector_path(test) in money_path_tests:
             continue  # already validated above
-        if not (ROOT / test).exists():
+        if not (ROOT / _selector_path(test)).exists():
             failures.append(f"{test}: referenced in money_path_ci.yaml relationship_tests but missing on disk")
 
-    if args.collect and entries:
-        collect_targets = [test for test in entries if (ROOT / test).exists()]
+    if args.collect:
+        collect_targets: list[str] = []
+        seen_targets: set[str] = set()
+        for target in [*entries, *all_ci_relationship_tests()]:
+            target = str(target)
+            if target not in seen_targets:
+                seen_targets.add(target)
+                collect_targets.append(target)
         if collect_targets:
             proc = subprocess.run(
                 [sys.executable, "-m", "pytest", "--collect-only", "-q", *collect_targets],

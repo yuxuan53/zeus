@@ -1,4 +1,4 @@
-# Lifecycle: created=2026-05-21; last_reviewed=2026-05-21; last_reused=2026-05-21
+# Lifecycle: created=2026-05-21; last_reviewed=2026-09-08; last_reused=2026-09-08
 # Purpose: Self-defense tests for money-path semantic CI helper scripts.
 # Reuse: Run when changing scripts/ci money-path classifier/coverage/test-quality gates.
 # Authority basis: architecture/money_path_objects.yaml; architecture/money_path_ci.yaml; architecture/test_quality.yaml
@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
+
+from scripts.ci import assert_test_quality as quality_gate
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -353,3 +356,74 @@ def test_strategy_profile_registry_change_routes_to_strategy_authority(tmp_path:
         f"Neither MP-STR-001 nor MP-STR-002 in {payload['required_invariants']} — "
         "architecture/strategy_profile_registry.yaml not routed to strategy_authority segment"
     )
+
+
+def test_test_quality_relationship_node_selector_checks_its_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    selector = "tests/test_relationship.py::test_registered_node"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_relationship.py").write_text("def test_registered_node(): pass\n")
+    monkeypatch.setattr(quality_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(quality_gate, "tracked_money_path_tests", lambda: [])
+    monkeypatch.setattr(quality_gate, "all_ci_relationship_tests", lambda: [selector])
+    monkeypatch.setattr(
+        quality_gate,
+        "load_yaml",
+        lambda _path: {"money_path_test_quality": {}, "tests": {}},
+    )
+
+    assert quality_gate.main([]) == 0
+
+
+def test_test_quality_missing_relationship_node_selector_is_rejected(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    selector = "tests/test_missing.py::test_registered_node"
+    monkeypatch.setattr(quality_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(quality_gate, "tracked_money_path_tests", lambda: [])
+    monkeypatch.setattr(quality_gate, "all_ci_relationship_tests", lambda: [selector])
+    monkeypatch.setattr(
+        quality_gate,
+        "load_yaml",
+        lambda _path: {"money_path_test_quality": {}, "tests": {}},
+    )
+
+    assert quality_gate.main([]) == 1
+    assert selector in capsys.readouterr().out
+
+
+def test_test_quality_collect_keeps_node_selectors_and_rejects_collection_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    selector = "tests/test_relationship.py::test_registered_node"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_quality.py").write_text("def test_quality(): pass\n")
+    (tmp_path / "tests" / "test_relationship.py").write_text("def test_registered_node(): pass\n")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="", stderr="collection rejected")
+
+    monkeypatch.setattr(quality_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(quality_gate, "tracked_money_path_tests", lambda: [])
+    monkeypatch.setattr(quality_gate, "all_ci_relationship_tests", lambda: [selector, selector])
+    monkeypatch.setattr(
+        quality_gate,
+        "load_yaml",
+        lambda _path: {
+            "money_path_test_quality": {},
+            "tests": {"tests/test_quality.py": {}},
+        },
+    )
+    monkeypatch.setattr(quality_gate.subprocess, "run", fake_run)
+
+    assert quality_gate.main(["--collect"]) == 1
+    assert len(calls) == 1
+    command = calls[0]
+    assert "tests/test_quality.py" in command
+    assert selector in command
+    assert command.count(selector) == 1
+    assert "--collect-only" in command
+    assert "collection rejected" in capsys.readouterr().out
