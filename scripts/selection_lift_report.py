@@ -1,5 +1,5 @@
 # Created: 2026-08-24
-# Last reused or audited: 2026-08-24
+# Last reused or audited: 2026-09-07
 # Authority basis: docs/operations/current/plans/tier0_selection_lift_preregistration_2026-08-24.md
 #   (FROZEN) — reversal_plan_tier0_2026-08-24.md item 7.
 """Read-only Tier-0 ordinal selection-lift report (preregistered test).
@@ -26,7 +26,7 @@ you need to point elsewhere.
     city_date_group_id TEXT  -- groups rows into one opportunity set (one
                                  live Tier-0 auction decision)
     city TEXT, target_date TEXT
-    candidate_id TEXT, side TEXT, p0 REAL, lead_bucket TEXT,
+    candidate_id TEXT, side TEXT, action TEXT (BUY|SELL), p0 REAL, lead_bucket TEXT,
     eligible INTEGER (0/1), selected INTEGER (0/1),
     market_key TEXT   -- family/market identity for duplicate/complement
                           collapse; see src/analysis/selection_lift.py
@@ -44,6 +44,12 @@ you need to point elsewhere.
 If ``tier0_candidate_set_provenance`` does not exist, this script prints
 "provenance table absent — 0 observations" and exits 0 (no crash — the
 table's absence is the expected, correct state of the world today).
+
+The canonical ``action`` column is required. Only ``BUY`` candidates enter
+the observation builder; ``SELL`` and unknown actions are counted and
+excluded before duplicate collapse or price matching. A table without the
+column is schema-incomplete and produces zero observations with a named
+coverage reason.
 
 Evaluation lock (frozen doc, "Stopping rule"): a p-value is NEVER printed
 below 100 qualifying observations. The only exception is --pilot-power-check,
@@ -111,10 +117,20 @@ def load_opportunity_sets(
         coverage["provenance_table_absent"] = 1
         return [], dict(coverage)
 
+    columns = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM pragma_table_info(?)", (table_name,)
+        ).fetchall()
+    }
+    if "action" not in columns:
+        coverage["provenance_action_column_missing"] = 1
+        return [], dict(coverage)
+
     rows = conn.execute(
         f"""
         SELECT city_date_group_id, city, target_date, candidate_id, side, p0,
-               lead_bucket, eligible, selected, market_key, settled_y
+               action, lead_bucket, eligible, selected, market_key, settled_y
         FROM {table_name}
         """
     ).fetchall()
@@ -122,6 +138,14 @@ def load_opportunity_sets(
     groups: dict[str, list[Candidate]] = defaultdict(list)
     group_city_date: dict[str, tuple[str, str]] = {}
     for r in rows:
+        action = str(r["action"] or "").strip().upper()
+        if action != "BUY":
+            coverage[
+                "non_buy_action_excluded"
+                if action == "SELL"
+                else "unknown_action_excluded"
+            ] += 1
+            continue
         gid = r["city_date_group_id"]
         group_city_date[gid] = (r["city"], r["target_date"])
         groups[gid].append(

@@ -1,4 +1,5 @@
 # Created: 2026-08-24
+# Last reused or audited: 2026-09-07
 # Authority basis: docs/operations/current/plans/tier0_selection_lift_preregistration_2026-08-24.md
 #   (FROZEN) — reversal_plan_tier0_2026-08-24.md item 7 report deliverable.
 """Tests for scripts/selection_lift_report.py.
@@ -41,6 +42,7 @@ def _create_contract_table(conn: sqlite3.Connection) -> None:
             target_date TEXT NOT NULL,
             candidate_id TEXT NOT NULL,
             side TEXT NOT NULL,
+            action TEXT NOT NULL DEFAULT 'BUY',
             p0 REAL,
             lead_bucket TEXT,
             eligible INTEGER NOT NULL,
@@ -53,6 +55,36 @@ def _create_contract_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _create_legacy_contract_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {CANDIDATE_SET_TABLE} (
+            city_date_group_id TEXT NOT NULL,
+            city TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            p0 REAL,
+            lead_bucket TEXT,
+            eligible INTEGER NOT NULL,
+            selected INTEGER NOT NULL,
+            market_key TEXT,
+            settled_y INTEGER
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO {CANDIDATE_SET_TABLE} (
+            city_date_group_id, city, target_date, candidate_id, side, p0,
+            lead_bucket, eligible, selected, market_key, settled_y
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        ("g1", "Denver", "2026-08-01", "legacy",  "yes", 0.2, "day0", 1, 1, "m1", 1),
+    )
+    conn.commit()
+
+
 def _insert_candidate(conn: sqlite3.Connection, **kwargs) -> None:
     base = dict(
         city_date_group_id="grp",
@@ -60,6 +92,7 @@ def _insert_candidate(conn: sqlite3.Connection, **kwargs) -> None:
         target_date="2026-08-01",
         candidate_id="c",
         side="yes",
+        action="BUY",
         p0=0.2,
         lead_bucket="day0",
         eligible=1,
@@ -71,13 +104,13 @@ def _insert_candidate(conn: sqlite3.Connection, **kwargs) -> None:
     conn.execute(
         f"""
         INSERT INTO {CANDIDATE_SET_TABLE} (
-            city_date_group_id, city, target_date, candidate_id, side, p0,
-            lead_bucket, eligible, selected, market_key, settled_y
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            city_date_group_id, city, target_date, candidate_id, side, action,
+            p0, lead_bucket, eligible, selected, market_key, settled_y
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             base["city_date_group_id"], base["city"], base["target_date"],
-            base["candidate_id"], base["side"], base["p0"], base["lead_bucket"],
+            base["candidate_id"], base["side"], base["action"], base["p0"], base["lead_bucket"],
             base["eligible"], base["selected"], base["market_key"], base["settled_y"],
         ),
     )
@@ -108,6 +141,100 @@ class TestLoadOpportunitySetsPresent:
         assert len(opp_sets[0].candidates) == 2
         assert opp_sets[0].city == "Denver"
         assert opp_sets[0].date == "2026-08-01"
+
+
+class TestLoadOpportunitySetsActionProvenance:
+    def test_selected_sell_is_never_an_entry_observation(self, world_conn):
+        _create_contract_table(world_conn)
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="sell",
+            action="SELL", selected=1, settled_y=1, market_key="m-sell",
+        )
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="buy-control",
+            action="BUY", selected=0, settled_y=0, market_key="m-buy-control",
+        )
+
+        opp_sets, coverage = load_opportunity_sets(world_conn)
+        result = build_observations(opp_sets)
+
+        assert result.observations == ()
+        assert coverage == {"non_buy_action_excluded": 1}
+
+    def test_sell_controls_are_excluded_before_buy_matching(self, world_conn):
+        _create_contract_table(world_conn)
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="buy-selected",
+            action="BUY", selected=1, settled_y=1, market_key="m-buy-selected",
+        )
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="sell-control",
+            action="SELL", selected=0, settled_y=0, market_key="m-sell-control",
+        )
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="buy-control",
+            action="BUY", selected=0, settled_y=0, market_key="m-buy-control",
+        )
+
+        opp_sets, coverage = load_opportunity_sets(world_conn)
+        result = build_observations(opp_sets)
+
+        assert len(result.observations) == 1
+        assert result.observations[0].n_control == 1
+        assert coverage == {"non_buy_action_excluded": 1}
+
+    def test_unknown_action_is_excluded_before_matching(self, world_conn):
+        _create_contract_table(world_conn)
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="buy-selected",
+            action="BUY", selected=1, settled_y=1, market_key="m-buy-selected",
+        )
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="unknown",
+            action="HOLD", selected=0, settled_y=0, market_key="m-unknown",
+        )
+        _insert_candidate(
+            world_conn, city_date_group_id="g1", candidate_id="buy-control",
+            action="BUY", selected=0, settled_y=0, market_key="m-buy-control",
+        )
+
+        opp_sets, coverage = load_opportunity_sets(world_conn)
+        result = build_observations(opp_sets)
+
+        assert len(result.observations) == 1
+        assert result.observations[0].n_control == 1
+        assert coverage == {"unknown_action_excluded": 1}
+
+    @pytest.mark.parametrize("action", ["SELL", "HOLD"])
+    def test_non_buy_duplicate_cannot_replace_buy_control(self, world_conn, action):
+        _create_contract_table(world_conn)
+        _insert_candidate(
+            world_conn, candidate_id="selected", action="BUY", selected=1,
+            p0=0.20, settled_y=1, market_key="selected-market",
+        )
+        _insert_candidate(
+            world_conn, candidate_id="a-non-buy", action=action,
+            p0=0.21, settled_y=0, market_key="control-market",
+        )
+        _insert_candidate(
+            world_conn, candidate_id="z-buy", action="BUY",
+            p0=0.24, settled_y=0, market_key="control-market",
+        )
+
+        opportunity_sets, _ = load_opportunity_sets(world_conn)
+        result = build_observations(opportunity_sets)
+
+        assert len(result.observations) == 1
+        assert result.observations[0].n_control == 1
+        assert result.observations[0].control_mean == pytest.approx(-0.24)
+
+    def test_missing_action_column_fails_closed_with_named_coverage(self, world_conn):
+        _create_legacy_contract_table(world_conn)
+
+        opp_sets, coverage = load_opportunity_sets(world_conn)
+
+        assert opp_sets == []
+        assert coverage == {"provenance_action_column_missing": 1}
 
 
 class TestRenderReportTableAbsent:

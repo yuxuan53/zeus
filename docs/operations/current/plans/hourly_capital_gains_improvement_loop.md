@@ -1234,3 +1234,42 @@
   available canonical settlement, LCB95=-0.02100107852619543 (still not
   positive). This supersedes only the earlier worktree-only disposition;
   broader user profit gates and runtime-liveness findings remain unresolved.
+
+
+### 2026-09-08 — entry selection-lift action identity
+
+- Verified current evidence: canonical tier0_candidate_set_provenance contains
+  17 selected BUY and 37 selected SELL rows; eligible nonselected candidates
+  include 9 BUY and 12 SELL. The entry selection report drops action on load
+  and computes y-p0 for both directions, although that is the BUY residual.
+- Contract: this frozen entry-selection test admits only explicit BUY actions
+  from the canonical action column. SELL/unknown actions are counted and
+  excluded before duplicate/complement collapse or treatment/control matching.
+  A table without action identity yields zero observations with a named
+  coverage failure; it must never infer BUY from an older schema.
+- Slice: scripts/selection_lift_report.py and its existing
+  tests/scripts/test_selection_lift_report.py. No writer/schema/order or
+  statistical matching-window change. Existing data is not rewritten.
+- Antibodies: selected SELL cannot produce entry observations, SELL cannot
+  become a BUY control, missing/unknown action fails closed, BUY-only evidence
+  retains identical observations. New failures on base and full focused tests
+  after repair; independent review and changed-surface checks before landing.
+- SCOPE: report candidate/action. DRAIN: every report rereads canonical action.
+  RESET: complete explicit BUY provenance; this does not make missing matched
+  controls appear or qualify live entry. One isolated commit is rollback.
+
+- The existing GOAL.md is updated from selected-certificate skill scoring to
+  the current operator's settled-chain, OOS, equal-window-placebo capital
+  objective. This records requested acceptance; it does not claim runtime
+  gates are wired or grant any risk/venue authority. Current-truth redecision
+  remains required; no frozen-entry-probability interpretation is introduced.
+
+- Verification: four new cases failed on base; repaired loader plus duplicate
+  SELL/unknown same-market control cases pass, 26 focused tests total. Ruff,
+  compile, diff, planning-lock and map-maintenance pass; independent review GO.
+  Read-only live report now excludes 252 non-BUY candidates and correctly
+  shows 17 BUY selections with empty matched controls, 0 usable observations;
+  the 100-observation evaluation lock remains in force and no p-value emitted.
+  Existing long-lived report retained; no DB or venue side effects; temporary
+  config removed. Evidence checked=2026-W37; basis=current canonical query
+  and corrected report; until=recheck-on-use.
