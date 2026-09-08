@@ -1375,3 +1375,48 @@
   positions (137economically_closed+2pending_exit),117VERIFIEDrows and117/117
   exact ID-set matches. No writer invoked; elapsed21.596s, so hydration/runtime
   latency remains a measurement to track after landing, not declared solved.
+
+### 2026-09-08 — finalized payout pair convergence
+
+- Verified bug: one partial finalized read records zero slot at block A and
+  UNKNOWN other slot; complete retry at B dedups unchanged zero and appends
+  only recovered other slot. Latest pair stays mixed-block forever and
+  conditions_to_observe prunes it as terminal. Independent in-memory reproduction
+  confirmed sequence ids1,2 then None,3 and empty retry candidates. P5 currently
+  correctly rejects11 mixed-block conditions; never loosen this evidence gate.
+- Scope: src/ingest/payout_observer.py plus existing tests/test_payout_observer.py.
+  Keep single-slot append dedup default. Add explicit block-refresh comparison
+  only when a complete coherent incoming finalized pair repairs an incoherent
+  prior pair; both slot appends are one condition savepoint. Already coherent
+  identical economics stay no-op even at newer block to avoid log growth.
+- Terminal pruning uses actual latest row per slot, not latest after filtering
+  source/UNKNOWN. Require both slots finalized, resolved with consistent positive
+  denominator/sum/state, and same present block number/hash before pruning.
+  Incoherent historical terminal pairs join existing bounded finality retry
+  class; unresolved/current-risk classes keep their existing cadence.
+- Truth: finalized RPC payout observations only. No schema/settlement semantics,
+  token-slot inference, fee inference, trading authority or direct live DB write.
+  SCOPE exact condition; DRAIN existing observer cadence and bounded retry; RESET
+  complete same-block pair. Preserve INV-37 no network inside write transaction.
+- Antibodies: partial->complete converges pair, latest UNKNOWN defeats older
+  resolved pruning, existing complete pair no-growth, mixed-pair retry bounded,
+  second-slot failure rolls back first, unchanged single-slot dedup preserved.
+  Require focused base failures, complete observer tests, independent review and
+  changed-surface gates before isolated repair landing. Rollback one commit.
+
+- Token identity read-only proof: a current neg-risk filled command ca1aec06f5074100
+  was derived through CTF getCollectionId/getPositionId at finalized block93426263
+  hash0xc23acc6cb87de1e8fe718a6b741a6930456355a66a0447891f4f00455ef0bf0d.
+  On-chain NegRiskAdapter.wcol()=0x3a3bd7bb9528e159577f7c2e685cc81a765002e2.
+  Exact held token113007765751916099274154766651680526060812966584070775334865157092040180839857
+  equals derived slot0 only; slot1 differs. This proves one mapping, not the
+  whole1669-fill cohort, and no new token-map authority has been persisted.
+
+- Payout pair repair proof:4new cases fail on base; full observer47passed after
+  repair, including an additional bounded retry test for UNKNOWN after previously
+  finalized terminal history. Preserve older unresolved-evidence retry semantics
+  without promoting every failed terminal recheck into an unbounded sweep.
+  Independent fixed-contract review GO; compile/diff/planning-lock and map checks
+  pass; one pre-existing Ruff F841 at tests/test_payout_observer.py:337 remains.
+  Single-slot default dedup unchanged; condition savepoint preserves caller-owned
+  transaction and restores both new rows/supersession on failure.

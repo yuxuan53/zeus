@@ -254,9 +254,9 @@ def read_condition_payout(
 
 def _latest_observation(
     conn: sqlite3.Connection, condition_id: str, outcome_index: int
-) -> Optional[tuple[int, Optional[int], Optional[int], str, str]]:
+) -> Optional[tuple[int, Optional[int], Optional[int], str, str, Optional[int], Optional[str]]]:
     row = conn.execute(
-        "SELECT id, payout_numerator, payout_denominator, state, source "
+        "SELECT id, payout_numerator, payout_denominator, state, source, block_number, block_hash "
         "FROM payout_observations "
         "WHERE condition_id = ? AND outcome_index = ? "
         "ORDER BY id DESC LIMIT 1",
@@ -277,6 +277,7 @@ def append_observation(
     block_hash: Optional[str],
     observed_at: str,
     source: str = FINALIZED_SOURCE,
+    refresh_block: bool = False,
 ) -> Optional[int]:
     """Append one observation row, superseding the prior row iff the fact changed.
 
@@ -291,12 +292,13 @@ def append_observation(
 
     prior = _latest_observation(conn, condition_id, outcome_index)
     if prior is not None:
-        prior_id, prior_numerator, prior_denominator, prior_state, prior_source = prior
+        prior_id, prior_numerator, prior_denominator, prior_state, prior_source, prior_block, prior_hash = prior
         if (
             prior_state == state
             and prior_numerator == payout_numerator
             and prior_denominator == payout_denominator
             and prior_source == source
+            and (not refresh_block or (prior_block, prior_hash) == (block_number, block_hash))
         ):
             return None
     else:
@@ -327,6 +329,41 @@ def append_observation(
         )
     return new_id
 
+
+
+def _coherent_finalized_pair(rows: list[dict[str, Any]]) -> bool:
+    if len(rows) != 2 or {row["outcome_index"] for row in rows} != {0, 1}:
+        return False
+    for row in rows:
+        numerator, denominator, block = (
+            row["payout_numerator"], row["payout_denominator"], row["block_number"]
+        )
+        if any(type(value) is not int for value in (numerator, denominator, block)):
+            return False
+        if not (denominator > 0 and 0 <= numerator <= denominator and block >= 0):
+            return False
+        if row.get("source") != FINALIZED_SOURCE:
+            return False
+        if row["state"] != (STATE_RESOLVED_ZERO if numerator == 0 else STATE_RESOLVED_NONZERO):
+            return False
+        if not isinstance(row["block_hash"], str) or not row["block_hash"].strip():
+            return False
+    a, b = rows
+    return (
+        a["payout_denominator"] == b["payout_denominator"]
+        and a["payout_numerator"] + b["payout_numerator"] == a["payout_denominator"]
+        and (a["block_number"], a["block_hash"]) == (b["block_number"], b["block_hash"])
+    )
+
+
+def _latest_pair(conn: sqlite3.Connection, condition_id: str) -> list[dict[str, Any]]:
+    rows = []
+    fields = ("id", "payout_numerator", "payout_denominator", "state", "source", "block_number", "block_hash")
+    for index in (0, 1):
+        row = _latest_observation(conn, condition_id, index)
+        if row is not None:
+            rows.append({**dict(zip(fields, row)), "outcome_index": index})
+    return rows
 
 def conditions_to_observe(conn: sqlite3.Connection) -> list[str]:
     """Return current or unresolved condition ids that still need a chain read.
@@ -372,20 +409,24 @@ def conditions_to_observe(conn: sqlite3.Connection) -> list[str]:
     latest_ids: dict[str, int] = {}
     latest_rows = conn.execute(
         "WITH latest AS ("
-        "  SELECT id, condition_id, outcome_index,"
+        "  SELECT id, condition_id, outcome_index, payout_numerator, payout_denominator, state, source, block_number, block_hash,"
         "         ROW_NUMBER() OVER ("
         "           PARTITION BY condition_id, outcome_index ORDER BY id DESC"
         "         ) AS row_rank "
         "  FROM payout_observations WHERE outcome_index IN (0, 1)"
         ") "
-        "SELECT id, condition_id FROM latest WHERE row_rank = 1"
+        "SELECT id, condition_id, outcome_index, payout_numerator, payout_denominator, state, source, block_number, block_hash FROM latest WHERE row_rank = 1"
     ).fetchall()
-    for row_id, condition_id in latest_rows:
-        condition = str(condition_id)
-        latest_ids[condition] = max(latest_ids.get(condition, 0), int(row_id))
+    latest_pairs: dict[str, list[dict[str, Any]]] = {}
+    fields = ("id", "condition_id", "outcome_index", "payout_numerator", "payout_denominator", "state", "source", "block_number", "block_hash")
+    for row in latest_rows:
+        item = dict(zip(fields, row))
+        condition = str(item["condition_id"])
+        latest_ids[condition] = max(latest_ids.get(condition, 0), int(item["id"]))
+        latest_pairs.setdefault(condition, []).append(item)
 
     finalized_fact_counts: dict[str, int] = {}
-    finalized_terminal_counts: dict[str, int] = {}
+    finalized_unresolved_conditions: set[str] = set()
     finalized_rows = conn.execute(
         "WITH latest AS ("
         "  SELECT condition_id, outcome_index, state,"
@@ -403,9 +444,8 @@ def conditions_to_observe(conn: sqlite3.Connection) -> list[str]:
         bit = 1 << int(outcome_index)
         finalized_fact_counts.setdefault(condition, 0)
         finalized_fact_counts[condition] |= bit
-        if str(state) in {STATE_RESOLVED_ZERO, STATE_RESOLVED_NONZERO}:
-            finalized_terminal_counts.setdefault(condition, 0)
-            finalized_terminal_counts[condition] |= bit
+        if str(state) == STATE_UNRESOLVED:
+            finalized_unresolved_conditions.add(condition)
 
     historical_terminal_counts: dict[str, int] = {}
     for condition_id, outcome_index in conn.execute(
@@ -421,9 +461,13 @@ def conditions_to_observe(conn: sqlite3.Connection) -> list[str]:
     finality_retry: list[str] = []
     for condition in candidates - current_risk:
         facts = finalized_fact_counts.get(condition, 0)
-        if finalized_terminal_counts.get(condition, 0) == 0b11:
+        # SCOPE: this condition. DRAIN: bounded observer retry. RESET: both
+        # actual latest slots form one complete finalized block/payout pair.
+        if _coherent_finalized_pair(latest_pairs.get(condition, [])):
             continue
-        if facts == 0b11 or historical_terminal_counts.get(condition, 0) != 0b11:
+        if (
+            facts == 0b11 and condition in finalized_unresolved_conditions
+        ) or historical_terminal_counts.get(condition, 0) != 0b11:
             required.add(condition)
         else:
             finality_retry.append(condition)
@@ -460,37 +504,51 @@ def sweep_and_record(
     # One finalized snapshot makes the whole sweep one causal chain cut and
     # removes one block-header RPC per condition. Failure aborts before DML.
     block_marker = _get_pinned_block_marker(rpc_call, rpc_url)
-    observations: list[tuple[str, dict[str, Any]]] = []
+    observations: list[tuple[str, list[dict[str, Any]]]] = []
     for condition_id in condition_ids:
-        observations.extend(
-            (condition_id, result)
-            for result in read_condition_payout(
-                condition_id,
-                rpc_url=rpc_url,
-                rpc_call=rpc_call,
-                outcome_indices=outcome_indices,
-                block_marker=block_marker,
-            )
-        )
+        observations.append((condition_id, read_condition_payout(
+            condition_id,
+            rpc_url=rpc_url,
+            rpc_call=rpc_call,
+            outcome_indices=outcome_indices,
+            block_marker=block_marker,
+        )))
 
     appended = 0
     unchanged = 0
-    for condition_id, result in observations:
-        new_id = append_observation(
-            conn,
-            condition_id=condition_id,
-            outcome_index=result["outcome_index"],
-            payout_numerator=result["payout_numerator"],
-            payout_denominator=result["payout_denominator"],
-            state=result["state"],
-            block_number=result["block_number"],
-            block_hash=result["block_hash"],
-            observed_at=observed_at,
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    for condition_id, results in observations:
+        incoming = [{**row, "source": FINALIZED_SOURCE} for row in results]
+        refresh_block = (
+            _coherent_finalized_pair(incoming)
+            and not _coherent_finalized_pair(_latest_pair(conn, condition_id))
         )
-        if new_id is None:
-            unchanged += 1
-        else:
-            appended += 1
+        conn.execute("SAVEPOINT payout_observer_condition")
+        try:
+            for result in results:
+                new_id = append_observation(
+                    conn,
+                    condition_id=condition_id,
+                    outcome_index=result["outcome_index"],
+                    payout_numerator=result["payout_numerator"],
+                    payout_denominator=result["payout_denominator"],
+                    state=result["state"],
+                    block_number=result["block_number"],
+                    block_hash=result["block_hash"],
+                    observed_at=observed_at,
+                    refresh_block=refresh_block,
+                )
+                if new_id is None:
+                    unchanged += 1
+                else:
+                    appended += 1
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT payout_observer_condition")
+            conn.execute("RELEASE SAVEPOINT payout_observer_condition")
+            raise
+        conn.execute("RELEASE SAVEPOINT payout_observer_condition")
+
     return {
         "conditions": len(condition_ids),
         "appended": appended,

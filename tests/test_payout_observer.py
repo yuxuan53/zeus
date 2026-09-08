@@ -947,3 +947,80 @@ def test_no_signing_capability_import_antibody():
         if any(token.lower() in name.lower() for token in _FORBIDDEN_IMPORT_TOKENS)
     }
     assert not offending, f"payout_observer.py imports forbidden signing-capable names: {offending!r}"
+
+
+def _seed_terminal_pair_candidate(conn, condition=_CONDITION_A, phase="settled"):
+    conn.execute("CREATE TABLE IF NOT EXISTS position_current (position_id TEXT PRIMARY KEY, condition_id TEXT, phase TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS settlement_commands (command_id TEXT PRIMARY KEY, condition_id TEXT)")
+    conn.execute("INSERT INTO position_current VALUES (?, ?, ?)", (condition, condition, phase))
+
+
+def _append_pair_slot(conn, index, *, block=100, state=None, condition=_CONDITION_A):
+    state = state or (STATE_RESOLVED_ZERO if index == 0 else STATE_RESOLVED_NONZERO)
+    return append_observation(
+        conn, condition_id=condition, outcome_index=index,
+        payout_numerator=None if state == STATE_UNKNOWN else index,
+        payout_denominator=None if state == STATE_UNKNOWN else 1,
+        state=state, block_number=block, block_hash=hex(block), observed_at=str(block),
+    )
+
+
+def test_partial_then_complete_sweep_converges_finalized_block_pair(conn):
+    _seed_terminal_pair_candidate(conn)
+    _append_pair_slot(conn, 0)
+    _append_pair_slot(conn, 1, state=STATE_UNKNOWN)
+    conn.commit()
+    rpc, _ = _build_stub_rpc(denominator=1, numerators={0: 0, 1: 1}, block_number=101, block_hash="0x65")
+    result = sweep_and_record(conn, rpc_url="https://rpc.example", rpc_call=rpc)
+    latest = conn.execute("SELECT outcome_index,block_number,block_hash FROM payout_observations WHERE id IN (SELECT MAX(id) FROM payout_observations GROUP BY condition_id,outcome_index) ORDER BY outcome_index").fetchall()
+    assert [tuple(r) for r in latest] == [(0,101,"0x65"), (1,101,"0x65")]
+    assert result["appended"] == 2
+    assert conditions_to_observe(conn) == []
+
+
+def test_mixed_block_terminal_pair_is_retried_with_existing_batch_bound(conn):
+    conditions = [f"0x{n+1:064x}" for n in range(LEGACY_FINALITY_UPGRADE_BATCH_SIZE + 2)]
+    for condition in conditions:
+        _seed_terminal_pair_candidate(conn, condition)
+        _append_pair_slot(conn, 0, condition=condition)
+        _append_pair_slot(conn, 1, block=101, condition=condition)
+    assert len(conditions_to_observe(conn)) == LEGACY_FINALITY_UPGRADE_BATCH_SIZE
+
+
+def test_latest_unknown_cannot_be_pruned_using_older_terminal_pair(conn):
+    _seed_terminal_pair_candidate(conn)
+    _append_pair_slot(conn, 0)
+    _append_pair_slot(conn, 1)
+    _append_pair_slot(conn, 1, block=101, state=STATE_UNKNOWN)
+    assert conditions_to_observe(conn) == [_CONDITION_A]
+
+
+def test_coherent_current_pair_does_not_append_on_every_new_block(conn):
+    _seed_terminal_pair_candidate(conn, phase="active")
+    _append_pair_slot(conn, 0)
+    _append_pair_slot(conn, 1)
+    conn.commit()
+    rpc, _ = _build_stub_rpc(denominator=1, numerators={0: 0, 1: 1}, block_number=101, block_hash="0x65")
+    result = sweep_and_record(conn, rpc_url="https://rpc.example", rpc_call=rpc)
+    assert result == {"conditions": 1, "appended": 0, "unchanged": 2}
+    assert conn.execute("SELECT COUNT(*) FROM payout_observations").fetchone()[0] == 2
+
+
+def test_condition_pair_append_failure_rolls_back_first_slot(conn):
+    _seed_terminal_pair_candidate(conn)
+    conn.execute("CREATE TRIGGER fail_second BEFORE INSERT ON payout_observations WHEN NEW.outcome_index=1 BEGIN SELECT RAISE(ABORT, 'second_slot_failure'); END")
+    conn.commit()
+    rpc, _ = _build_stub_rpc(denominator=1, numerators={0: 0, 1: 1})
+    with pytest.raises(sqlite3.IntegrityError, match="second_slot_failure"):
+        sweep_and_record(conn, rpc_url="https://rpc.example", rpc_call=rpc)
+    assert conn.execute("SELECT COUNT(*) FROM payout_observations").fetchone()[0] == 0
+
+
+def test_unknown_after_resolved_history_stays_in_bounded_retry_class(conn):
+    for n in range(LEGACY_FINALITY_UPGRADE_BATCH_SIZE + 2):
+        condition = f"0x{n+1:064x}"
+        _seed_terminal_pair_candidate(conn, condition)
+        _append_pair_slot(conn, 0, condition=condition)
+        _append_pair_slot(conn, 1, condition=condition)
+        _append_pair_slot(conn, 1, block=101, state=STATE_UNKNOWN, condition=condition)
+    assert len(conditions_to_observe(conn)) == LEGACY_FINALITY_UPGRADE_BATCH_SIZE
