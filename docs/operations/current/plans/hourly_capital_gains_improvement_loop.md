@@ -1224,3 +1224,13 @@
   submission. Existing long-lived evaluator retained. Broader profitability
   and runtime-liveness work remains unproven; no positive economic promotion.
   Temporary test settings removed; topology friction none_observed.
+
+- Landing update, 2026-09-08T02:48:16Z: independent landing review GO;
+  merge-tree conflict-free; verified cherry-pick a41a25566 -> live 12966b58f.
+  Three landed files byte-identical to reviewed role commit. SHA256 of the
+  four unrelated pre-existing live dirty files is unchanged. No daemon
+  restart or risk/venue action. A new read-only import from landed source
+  regraded 9 retained dates in 0.138s: settled dates advanced 6 -> 7 with newly
+  available canonical settlement, LCB95=-0.02100107852619543 (still not
+  positive). This supersedes only the earlier worktree-only disposition;
+  broader user profit gates and runtime-liveness findings remain unresolved.
