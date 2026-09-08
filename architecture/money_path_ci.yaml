@@ -285,6 +285,32 @@ segments:
       - tests/integration/test_w3_solve_seam_g3.py::test_capital_proof_counterfactual_rejects_any_venue_side_effect
       - tests/integration/test_w3_solve_seam_g3.py::test_real_global_batch_has_no_synthetic_producer_and_preserves_auction_contract
       - tests/integration/test_w3_solve_seam_g3.py::test_global_batch_commits_receipts_before_external_io
+  day0_causal_observations:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/data/replacement_forecast_current_target_plan.py
+      - src/engine/position_belief.py
+    relationship_tests:
+      - tests/test_replacement_forecast_current_target_plan.py
+      - tests/engine/test_position_belief_authority.py
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_rebinds_stale_carrier_to_current_conditioning
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_compares_physical_state_not_carrier_provenance
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_binds_native_fahrenheit_to_conditioned_celsius
+  day0_remaining_grid:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/signal/day0_window.py
+      - src/engine/monitor_refresh.py
+    relationship_tests:
+      - tests/test_day0_remaining_day_pricing.py
+      - tests/test_day0_window.py
+  global_sqlite_deadline:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/engine/global_auction_universe.py
+    relationship_tests:
+      - tests/integration/test_w3_solve_seam_g3.py::test_bounded_sqlite_preserves_error_identity_at_timeout_precision
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_work_deadline_bounds_selection_schema_lock_before_network
   post_fill_observation:
     invariant_ids: [MP-EXT-001, MP-EXT-002, MP-SCH-001, MP-SCH-002]
     files:

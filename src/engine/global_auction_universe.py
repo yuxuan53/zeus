@@ -163,6 +163,29 @@ def _shared_work_sqlite_serialization(
             _SHARED_WORK_SQLITE_FENCE.release()
 
 
+def _check_sqlite_error_budget(
+    exc: sqlite3.OperationalError,
+    work_context: WorkContext,
+    *,
+    stage: str,
+) -> None:
+    # SCOPE: this work cut. DRAIN: retry with a fresh deadline and snapshot.
+    # RESET: the next context with a full timeout unit uses normal SQLite handling.
+    remaining = work_context.checkpoint(f"{stage}:sql_error")
+    code = getattr(exc, "sqlite_errorcode", None)
+    if (
+        isinstance(code, int)
+        and code & 0xFF == sqlite3.SQLITE_BUSY
+        and remaining < 0.001
+    ):
+        # SQLite's integer-millisecond timeout cannot spend this last fraction.
+        raise WorkDeferred(
+            WorkDeferredCode.DEADLINE,
+            stage=f"{stage}:sqlite_timeout_precision",
+            remaining_s=remaining,
+        ) from exc
+
+
 @contextmanager
 def bounded_work_sqlite(
     conn: sqlite3.Connection,
@@ -216,10 +239,10 @@ def bounded_work_sqlite(
             try:
                 try:
                     yield conn
-                except sqlite3.OperationalError:
+                except sqlite3.OperationalError as exc:
                     if deferred:
                         raise deferred[0]
-                    work_context.checkpoint(f"{stage}:sql_error")
+                    _check_sqlite_error_budget(exc, work_context, stage=stage)
                     raise
                 if deferred:
                     raise deferred[0]
@@ -284,10 +307,10 @@ def bounded_work_sqlite(
     try:
         try:
             yield read_conn
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
             if deferred:
                 raise deferred[0]
-            work_context.checkpoint(f"{stage}:sql_error")
+            _check_sqlite_error_budget(exc, work_context, stage=stage)
             raise
         if deferred:
             raise deferred[0]
