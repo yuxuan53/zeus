@@ -2309,6 +2309,317 @@ def test_trade_at_exchange_missing_locally_emits_trade_fact_if_order_linkable_el
     assert row["subject_id"] == "trade-ghost"
 
 
+def test_initial_linked_taker_fact_uses_weighted_maker_legs(conn):
+    """The initial REST fact must retain exact taker cost, not the rounded top line."""
+
+    from src.execution.exchange_reconcile import _append_linkable_trade_fact_if_missing
+
+    order_id = "ord-taker-initial"
+    trade_id = "trade-taker-initial"
+    seed_command(conn, venue_order_id=order_id, size=11.6, price=0.10)
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "id": trade_id,
+        "status": "CONFIRMED",
+        "market": "condition-m5",
+        "trader_side": "TAKER",
+        "side": "BUY",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": order_id,
+        "size": "11.6",
+        "price": "0.09",
+        "maker_orders": [
+            {"asset_id": f"{YES_TOKEN}-no", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+            {"asset_id": f"{YES_TOKEN}-no", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+        ],
+    }
+
+    assert _append_linkable_trade_fact_if_missing(
+        conn,
+        command,
+        raw,
+        trade_id,
+        NOW,
+        state="CONFIRMED",
+        context="periodic",
+        matched_order_id=order_id,
+    ) is None
+    fact = conn.execute(
+        "SELECT filled_size, fill_price, fee_paid_micro FROM venue_trade_facts WHERE trade_id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert fact is not None
+    assert Decimal(fact["filled_size"]) == Decimal("11.6")
+    assert Decimal(fact["fill_price"]) == Decimal("1.08") / Decimal("11.6")
+    assert fact["fee_paid_micro"] is None
+
+
+@pytest.mark.parametrize("existing_state", ["MATCHED", "MINED", "CONFIRMED"])
+@pytest.mark.parametrize("explicit_correction", [False, True])
+def test_initial_exact_taker_preserves_current_fact_and_resets_after_correction(
+    conn, existing_state, explicit_correction
+):
+    from src.execution.exchange_reconcile import (
+        _append_fill_economic_correction,
+        _append_linkable_trade_fact_if_missing,
+        _trade_fact_economic_conflict,
+    )
+    from src.state.venue_command_repo import append_trade_fact
+
+    order_id = "ord-taker-existing"
+    trade_id = "trade-taker-existing"
+    seed_command(conn, venue_order_id=order_id, size=11.6, price=0.10)
+    command = dict(conn.execute(
+        "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+    ).fetchone())
+    append_trade_fact(
+        conn, trade_id=trade_id, venue_order_id=order_id,
+        command_id=command["command_id"], state=existing_state,
+        filled_size="11.6", fill_price="0.09", source="REST", observed_at=NOW,
+        raw_payload_hash="a" * 64, raw_payload_json={"source": "rounded_taker_topline"},
+    )
+    expected_facts = [(existing_state, "11.6", "0.09")]
+    incoming_state = existing_state if explicit_correction else "CONFIRMED"
+    events_before = event_types(conn)
+    raw = {
+        "id": trade_id, "status": incoming_state, "market": "condition-m5",
+        "trader_side": "TAKER", "side": "BUY", "asset_id": YES_TOKEN,
+        "taker_order_id": order_id, "size": "11.6", "price": "0.09",
+        "maker_orders": [
+            {"asset_id": f"{YES_TOKEN}-no", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+            {"asset_id": f"{YES_TOKEN}-no", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+        ],
+    }
+    kwargs = dict(state=incoming_state, context="periodic", matched_order_id=order_id)
+    assert _append_linkable_trade_fact_if_missing(
+        conn, command, raw, trade_id, NOW + timedelta(seconds=1), **kwargs
+    ) is not None
+    assert event_types(conn) == events_before
+    if explicit_correction:
+        prior = dict(conn.execute("SELECT * FROM venue_trade_facts WHERE trade_id = ?", (trade_id,)).fetchone())
+        exact_price = str(Decimal("1.08") / Decimal("11.6"))
+        correction_id = _append_fill_economic_correction(
+            conn, fact=prior, command=command, raw=raw, venue_order_id=order_id,
+            filled_size="11.6", fill_price=exact_price, reason="verified_test_correction",
+            observed_at=NOW + timedelta(seconds=2),
+        )
+        correction = conn.execute("SELECT raw_payload_json FROM venue_trade_facts WHERE trade_fact_id = ?", (correction_id,)).fetchone()
+        assert json.loads(correction[0])["zeus_repair"]["source_trade_fact_id"] == prior["trade_fact_id"]
+        expected_facts.append((existing_state, "11.6", exact_price))
+        assert not _trade_fact_economic_conflict(
+            conn, trade_id=trade_id, command_id=command["command_id"],
+            filled_size="11.6", fill_price=exact_price,
+        )
+        assert _append_linkable_trade_fact_if_missing(
+            conn, command, raw, trade_id, NOW + timedelta(seconds=3), **kwargs
+        ) is None
+        assert _trade_fact_economic_conflict(
+            conn, trade_id=trade_id, command_id=command["command_id"],
+            filled_size="11.6", fill_price="0.08",
+        )
+    facts = conn.execute(
+        "SELECT state, filled_size, fill_price FROM venue_trade_facts WHERE trade_id = ? ORDER BY trade_fact_id",
+        (trade_id,),
+    ).fetchall()
+    assert [tuple(row) for row in facts] == expected_facts
+
+
+@pytest.mark.parametrize(
+    ("trader_side",),
+    [("MAKER",), ("UNKNOWN",)],
+    ids=["explicit-maker", "explicit-unknown"],
+)
+def test_explicit_non_taker_side_cannot_claim_own_taker_order(conn, trader_side):
+    from src.execution.exchange_reconcile import _trade_fill_economics_binding
+
+    order_id = "ord-taker-side-conflict"
+    seed_command(conn, venue_order_id=order_id, size=8, price=0.12)
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "market": "condition-m5",
+        "trader_side": trader_side,
+        "side": "BUY",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": order_id,
+        "size": "8",
+        "price": "0.12",
+        "maker_orders": [
+            {"asset_id": f"{YES_TOKEN}-no", "side": "BUY", "matched_amount": "8", "price": "0.88"},
+        ],
+    }
+    binding = _trade_fill_economics_binding(
+        conn, command=command, raw=raw, venue_order_id=order_id
+    )
+    assert binding.state == "TAKER_UNVERIFIABLE"
+
+
+def test_foreign_taker_with_own_maker_leg_keeps_legacy_binding(conn):
+    from src.execution.exchange_reconcile import _trade_fill_economics_binding
+
+    order_id = "ord-maker-legacy"
+    seed_command(conn, venue_order_id=order_id, size=5, price=0.5)
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "market": "condition-m5",
+        "trader_side": "TAKER",
+        "side": "BUY",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": "foreign-taker",
+        "size": "5",
+        "price": "0.50",
+        "maker_orders": [
+            {"order_id": order_id, "asset_id": YES_TOKEN, "side": "SELL", "matched_amount": "5", "price": "0.50"},
+        ],
+    }
+    binding = _trade_fill_economics_binding(
+        conn, command=command, raw=raw, venue_order_id=order_id
+    )
+    assert binding.state == "LEGACY_NON_TAKER"
+
+
+@pytest.mark.parametrize(
+    ("maker_asset", "maker_side", "maker_price"),
+    [
+        (YES_TOKEN, "SELL", "0.11"),
+        (f"{YES_TOKEN}-no", "BUY", "0.89"),
+    ],
+    ids=["same_token_opposite_side", "complement_same_side"],
+)
+def test_initial_taker_binding_accepts_both_binary_maker_leg_shapes(
+    conn, maker_asset, maker_side, maker_price
+):
+    from src.execution.exchange_reconcile import _trade_fill_economics_binding
+
+    order_id = f"ord-binding-{maker_side.lower()}"
+    seed_command(conn, venue_order_id=order_id, size=8, price=0.12)
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "market": "condition-m5",
+        "trader_side": "TAKER",
+        "side": "BUY",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": order_id,
+        "size": "8",
+        "price": "0.12",
+        "maker_orders": [
+            {
+                "asset_id": maker_asset,
+                "side": maker_side,
+                "matched_amount": "8",
+                "price": maker_price,
+            }
+        ],
+    }
+
+    binding = _trade_fill_economics_binding(
+        conn, command=command, raw=raw, venue_order_id=order_id
+    )
+    assert binding.state == "EXACT_TAKER"
+    assert binding.filled_size == Decimal("8")
+    assert binding.fill_price == Decimal("0.11")
+
+
+@pytest.mark.parametrize(
+    ("maker_asset", "maker_side", "maker_price", "expected_price"),
+    [
+        (YES_TOKEN, "BUY", "0.11", "0.11"),
+        (f"{YES_TOKEN}-no", "SELL", "0.89", "0.11"),
+    ],
+    ids=["sell-same-token-opposite-side", "sell-complement-same-side"],
+)
+def test_initial_taker_binding_accepts_sell_maker_leg_shapes(
+    conn, maker_asset, maker_side, maker_price, expected_price
+):
+    from src.execution.exchange_reconcile import _trade_fill_economics_binding
+
+    order_id = f"ord-binding-sell-{maker_side.lower()}"
+    seed_command(conn, venue_order_id=order_id, size=8, price=0.12, side="SELL")
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "market": "condition-m5",
+        "trader_side": "TAKER",
+        "side": "SELL",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": order_id,
+        "size": "8",
+        "price": "0.12",
+        "maker_orders": [
+            {
+                "asset_id": maker_asset,
+                "side": maker_side,
+                "matched_amount": "8",
+                "price": maker_price,
+            }
+        ],
+    }
+    binding = _trade_fill_economics_binding(
+        conn, command=command, raw=raw, venue_order_id=order_id
+    )
+    assert binding.state == "EXACT_TAKER"
+    assert binding.filled_size == Decimal("8")
+    assert binding.fill_price == Decimal(expected_price)
+
+
+def test_initial_taker_binding_missing_legs_never_falls_back_to_top_line(conn):
+    from src.execution.exchange_reconcile import _append_linkable_trade_fact_if_missing
+
+    order_id = "ord-taker-unverifiable"
+    trade_id = "trade-taker-unverifiable"
+    seed_command(conn, venue_order_id=order_id, size=8, price=0.12)
+    command = dict(
+        conn.execute(
+            "SELECT * FROM venue_commands WHERE venue_order_id = ?", (order_id,)
+        ).fetchone()
+    )
+    raw = {
+        "id": trade_id,
+        "status": "CONFIRMED",
+        "market": "condition-m5",
+        "trader_side": "TAKER",
+        "side": "BUY",
+        "asset_id": YES_TOKEN,
+        "taker_order_id": order_id,
+        "size": "8",
+        "price": "0.09",
+    }
+
+    finding = _append_linkable_trade_fact_if_missing(
+        conn,
+        command,
+        raw,
+        trade_id,
+        NOW,
+        state="CONFIRMED",
+        context="periodic",
+        matched_order_id=order_id,
+    )
+    assert finding is not None
+    assert "exchange_trade_missing_fill_economics" in finding.evidence_json
+    assert conn.execute(
+        "SELECT COUNT(*) FROM venue_trade_facts WHERE trade_id = ?", (trade_id,)
+    ).fetchone()[0] == 0
+
+
 def _seed_terminal_no_fill_command(
     conn,
     *,
@@ -7667,8 +7978,20 @@ def test_confirmed_taker_exit_corrects_matched_point_order_price_without_drift(c
                     price="0.30",
                     fill_price="0.30",
                     status="CONFIRMED",
-                    taker_order_id="ord-exit-price",
+                    taker_order_id="foreign-taker-exit-price",
                     trader_side="TAKER",
+                    market="condition-m5",
+                    asset_id=YES_TOKEN,
+                    side="SELL",
+                    maker_orders=[
+                        {
+                            "order_id": "ord-exit-price",
+                            "asset_id": YES_TOKEN,
+                            "side": "BUY",
+                            "matched_amount": "6",
+                            "price": "0.30",
+                        }
+                    ],
                     transaction_hash="0xconfirmed",
                 )
             ]
@@ -7883,6 +8206,9 @@ def test_point_order_split_weighted_leg_price_reproduces_local_fact_is_same_econ
         fill_price="0.39",
         status="CONFIRMED",
         asset_id=YES_TOKEN,
+        side="BUY",
+        trader_side="TAKER",
+        market="condition-m5",
         taker_order_id="ord-m5",
         maker_orders=[
             {
@@ -7894,7 +8220,7 @@ def test_point_order_split_weighted_leg_price_reproduces_local_fact_is_same_econ
                 "side": "SELL",
             },
             {
-                "asset_id": "opposite-outcome-token-m5",
+                "asset_id": f"{YES_TOKEN}-no",
                 "matched_amount": "4.135",
                 "price": "0.6",
                 "order_id": "maker-yes-buy",
@@ -7950,6 +8276,9 @@ def test_point_order_split_genuine_price_drift_still_becomes_finding(conn):
         fill_price="0.39",
         status="CONFIRMED",
         asset_id=YES_TOKEN,
+        side="BUY",
+        trader_side="TAKER",
+        market="condition-m5",
         taker_order_id="ord-m5",
         maker_orders=[
             {
@@ -7961,7 +8290,7 @@ def test_point_order_split_genuine_price_drift_still_becomes_finding(conn):
                 "side": "SELL",
             },
             {
-                "asset_id": "opposite-outcome-token-m5",
+                "asset_id": f"{YES_TOKEN}-no",
                 "matched_amount": "4.135",
                 "price": "0.8",
                 "order_id": "maker-yes-buy",
@@ -8015,6 +8344,9 @@ def test_point_order_split_size_mismatch_still_becomes_finding(conn):
         fill_price="0.39",
         status="CONFIRMED",
         asset_id=YES_TOKEN,
+        side="BUY",
+        trader_side="TAKER",
+        market="condition-m5",
         taker_order_id="ord-m5",
         maker_orders=[
             {
@@ -8026,7 +8358,7 @@ def test_point_order_split_size_mismatch_still_becomes_finding(conn):
                 "side": "SELL",
             },
             {
-                "asset_id": "opposite-outcome-token-m5",
+                "asset_id": f"{YES_TOKEN}-no",
                 "matched_amount": "2.6",
                 "price": "0.6",
                 "order_id": "maker-yes-buy",
@@ -8127,6 +8459,17 @@ def test_linked_taker_confirmed_trade_top_level_price_records_fill_authority(con
                     include_fill_price=False,
                     taker_order_id="ord-m5",
                     trader_side="TAKER",
+                    market="condition-m5",
+                    asset_id=YES_TOKEN,
+                    side="BUY",
+                    maker_orders=[
+                        {
+                            "asset_id": YES_TOKEN,
+                            "side": "SELL",
+                            "matched_amount": "10",
+                            "price": "0.51",
+                        }
+                    ],
                 )
             ]
         ),
@@ -9935,6 +10278,17 @@ def test_unresolved_position_drift_refresh_resolves_late_confirmed_entry_without
                     include_fill_price=False,
                     taker_order_id="ord-late-confirmed",
                     trader_side="TAKER",
+                    market="condition-m5",
+                    asset_id=token,
+                    side="BUY",
+                    maker_orders=[
+                        {
+                            "asset_id": token,
+                            "side": "SELL",
+                            "matched_amount": "5",
+                            "price": "0.50",
+                        }
+                    ],
                 )
             ],
             positions=[position(token_id=token, size="5")],
@@ -9944,10 +10298,10 @@ def test_unresolved_position_drift_refresh_resolves_late_confirmed_entry_without
     )
 
     # The two targeted debts clear, but the failed canonical entry projection
-    # records a new blocking finding; the refresh must not report global green.
+    # records blocking findings; the refresh must not report global green.
     assert result["status"] == "blocked"
     assert result["remaining"] == 0
-    assert result["all_remaining"] == 1
+    assert result["all_remaining"] == 2
     resolved = conn.execute(
         "SELECT resolution, resolved_by FROM exchange_reconcile_findings WHERE finding_id = ?",
         (stale.finding_id,),
@@ -10024,6 +10378,17 @@ def test_unresolved_reconcile_refresh_resolves_unrecorded_trade_without_position
                     include_fill_price=False,
                     taker_order_id="ord-unrecorded-only",
                     trader_side="TAKER",
+                    market="condition-m5",
+                    asset_id="unrecorded-only-token",
+                    side="BUY",
+                    maker_orders=[
+                        {
+                            "asset_id": "unrecorded-only-token",
+                            "side": "SELL",
+                            "matched_amount": "7",
+                            "price": "0.42",
+                        }
+                    ],
                 )
             ],
             positions=[],
@@ -10033,10 +10398,11 @@ def test_unresolved_reconcile_refresh_resolves_unrecorded_trade_without_position
     )
 
     # Linking this trade clears the requested finding, while the missing
-    # canonical entry projection remains a distinct blocker.
+    # canonical entry projection remains a distinct blocker alongside the
+    # existing unrelated fixture debt.
     assert result["status"] == "blocked"
     assert result["remaining"] == 0
-    assert result["all_remaining"] == 1
+    assert result["all_remaining"] == 2
     resolved = conn.execute(
         "SELECT resolution, resolved_by FROM exchange_reconcile_findings WHERE finding_id = ?",
         (stale.finding_id,),

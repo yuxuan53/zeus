@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from src.control import ws_gap_guard
 from src.execution.command_bus import CommandState, IN_FLIGHT_STATES
+from src.execution.exchange_reconcile import _trade_fill_economics_binding
 from src.state.db import get_trade_connection_with_world
 from src.state.venue_command_repo import (
     append_event,
@@ -941,7 +942,23 @@ class PolymarketUserChannelIngestor:
             observed = _parse_dt(message.get("timestamp") or message.get("last_update"))
             _raw_matchtime = message.get("matchtime") or message.get("matchTime") or message.get("match_time")
             venue_matchtime = _parse_dt(_raw_matchtime) if _raw_matchtime else None
-            size_raw, price_raw = _trade_fill_economics_for_command(message, venue_order_id)
+            exact_taker = False
+            if status in TRADE_FILL_ECONOMICS_STATUSES:
+                binding = _trade_fill_economics_binding(
+                    conn,
+                    command=command,
+                    raw=message,
+                    venue_order_id=venue_order_id,
+                )
+                exact_taker = binding.state == "EXACT_TAKER"
+                if exact_taker:
+                    size_raw, price_raw = binding.filled_size, binding.fill_price
+                elif binding.state == "TAKER_UNVERIFIABLE":
+                    size_raw, price_raw = None, None
+                else:
+                    size_raw, price_raw = _trade_fill_economics_for_command(message, venue_order_id)
+            else:
+                size_raw, price_raw = _trade_fill_economics_for_command(message, venue_order_id)
             missing = _missing_trade_fill_economics(status, size=size_raw, price=price_raw)
             if missing:
                 self._append_command_event_if_legal(
@@ -1004,7 +1021,7 @@ class PolymarketUserChannelIngestor:
                     latest_fact,
                     filled_size=filled_size,
                     fill_price=fill_price,
-                    price_tick_size=price_tick_size,
+                    price_tick_size=None if exact_taker else price_tick_size,
                 )
                 if same_fill_economics and str(latest_fact.get("state") or "") == status:
                     conn.commit()

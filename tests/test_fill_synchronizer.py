@@ -25,6 +25,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +72,51 @@ def _seed_command(conn: sqlite3.Connection, *, command_id: str, venue_order_id: 
             NOW.isoformat(),
             NOW.isoformat(),
         ),
+    )
+    conn.commit()
+
+
+def _seed_taker_command(conn: sqlite3.Connection, *, command_id: str, venue_order_id: str) -> None:
+    from src.contracts.venue_submission_envelope import VenueSubmissionEnvelope
+    from src.state.venue_command_repo import insert_submission_envelope
+
+    envelope = VenueSubmissionEnvelope(
+        sdk_package="py-clob-client-v2",
+        sdk_version="test",
+        host="https://clob-v2.polymarket.com",
+        chain_id=137,
+        funder_address="0xfunder",
+        condition_id="condition-fill-sync",
+        question_id="question-fill-sync",
+        yes_token_id=YES_TOKEN,
+        no_token_id="no-token-fill-sync",
+        selected_outcome_token_id=YES_TOKEN,
+        outcome_label="YES",
+        side="BUY",
+        price=Decimal("0.10"),
+        size=Decimal("11.6"),
+        order_type="FAK",
+        post_only=False,
+        tick_size=Decimal("0.01"),
+        min_order_size=Decimal("0.01"),
+        neg_risk=False,
+        fee_details={},
+        canonical_pre_sign_payload_hash="d" * 64,
+        signed_order=None,
+        signed_order_hash=None,
+        raw_request_hash="e" * 64,
+        raw_response_json=None,
+        order_id=venue_order_id,
+        trade_ids=(),
+        transaction_hashes=(),
+        error_code=None,
+        error_message=None,
+        captured_at=NOW.isoformat(),
+    )
+    insert_submission_envelope(conn, envelope, envelope_id=f"{command_id}-env")
+    conn.execute(
+        "UPDATE venue_commands SET envelope_id = ?, market_id = ?, token_id = ?, size = ?, price = ? WHERE command_id = ?",
+        (f"{command_id}-env", "condition-fill-sync", YES_TOKEN, 11.6, 0.10, command_id),
     )
     conn.commit()
 
@@ -125,6 +171,42 @@ def _observation_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 class TestBasicAttribution:
+    @pytest.mark.parametrize("exact_taker", [False, True])
+    def test_decimal_format_replay_is_idempotent_before_and_inside_writer(
+        self, conn, monkeypatch, exact_taker
+    ):
+        from src.ingest.fill_synchronizer import _pending_fill_sync_writes, _prepare_fill_sync
+        from src.state.venue_command_repo import append_trade_fact
+
+        monkeypatch.setattr(
+            "src.execution.command_recovery.reconcile_authenticated_entry_trade_facts",
+            lambda _conn, *, command_id: {"advanced": 0, "errors": 0},
+        )
+        _seed_command(conn, command_id="cmd-format", venue_order_id="ord-format")
+        raw = _trade(trade_id="trade-format", order_id="ord-format", size="5", price="0.5")
+        if exact_taker:
+            _seed_taker_command(conn, command_id="cmd-format", venue_order_id="ord-format")
+            raw.update(
+                market="condition-fill-sync", trader_side="TAKER", side="BUY",
+                asset_id=YES_TOKEN, taker_order_id="ord-format",
+                maker_orders=[{"asset_id": "no-token-fill-sync", "side": "BUY",
+                               "matched_amount": "5", "price": "0.5"}],
+            )
+        append_trade_fact(
+            conn, trade_id="trade-format", venue_order_id="ord-format",
+            command_id="cmd-format", state="CONFIRMED", filled_size="5.0",
+            fill_price="0.500", source="REST", observed_at=NOW,
+            raw_payload_hash="c" * 64, raw_payload_json={"source": "prior_wire_format"},
+        )
+        result = sync_fills(conn, FakeSyncAdapter([raw]), observed_at=NOW)
+        assert result["appended"] == 0
+        assert result["skipped_idempotent"] == 1
+        assert len(_trade_rows(conn)) == 1
+        prepared = _prepare_fill_sync(conn, FakeSyncAdapter([raw]), source="test", observed_at=NOW)
+        pending, skipped = _pending_fill_sync_writes(conn, prepared)
+        assert not pending.trades
+        assert skipped["skipped_idempotent"] == 1
+
     def test_linkable_trade_is_appended_as_trade_fact(self, conn):
         _seed_command(conn, command_id="cmd-1", venue_order_id="ord-1")
         adapter = FakeSyncAdapter([_trade(trade_id="trade-1", order_id="ord-1")])
@@ -137,6 +219,152 @@ class TestBasicAttribution:
         assert len(rows) == 1
         assert rows[0]["trade_id"] == "trade-1"
         assert rows[0]["command_id"] == "cmd-1"
+
+    def test_initial_taker_fact_uses_weighted_maker_legs(self, conn, monkeypatch):
+        monkeypatch.setattr(
+            "src.execution.command_recovery.reconcile_authenticated_entry_trade_facts",
+            lambda _conn, *, command_id: {"advanced": 0, "errors": 0},
+        )
+        _seed_command(conn, command_id="cmd-taker", venue_order_id="ord-taker")
+        _seed_taker_command(conn, command_id="cmd-taker", venue_order_id="ord-taker")
+        raw = _trade(trade_id="trade-taker", order_id="ord-taker", size="11.6", price="0.09")
+        raw.update(
+            {
+                "market": "condition-fill-sync",
+                "trader_side": "TAKER",
+                "side": "BUY",
+                "asset_id": YES_TOKEN,
+                "taker_order_id": "ord-taker",
+                "maker_orders": [
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+                ],
+            }
+        )
+        result = sync_fills(conn, FakeSyncAdapter([raw]), observed_at=NOW)
+
+        assert result["appended"] == 1
+        row = _trade_rows(conn)[0]
+        assert Decimal(row["filled_size"]) == Decimal("11.6")
+        assert Decimal(row["fill_price"]) == Decimal("1.08") / Decimal("11.6")
+        assert row["fee_paid_micro"] is None
+
+    def test_sync_does_not_append_exact_taker_revision_over_existing_fact(
+        self, conn, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "src.execution.command_recovery.reconcile_authenticated_entry_trade_facts",
+            lambda _conn, *, command_id: {"advanced": 0, "errors": 0},
+        )
+        _seed_command(conn, command_id="cmd-taker-revision", venue_order_id="ord-taker-revision")
+        _seed_taker_command(conn, command_id="cmd-taker-revision", venue_order_id="ord-taker-revision")
+        from src.state.venue_command_repo import append_trade_fact
+
+        append_trade_fact(
+            conn,
+            trade_id="trade-taker-revision",
+            venue_order_id="ord-taker-revision",
+            command_id="cmd-taker-revision",
+            state="MATCHED",
+            filled_size="11.6",
+            fill_price="0.09",
+            source="REST",
+            observed_at=NOW,
+            raw_payload_hash="a" * 64,
+            raw_payload_json={"source": "rounded_taker_topline"},
+        )
+        raw = _trade(
+            trade_id="trade-taker-revision",
+            order_id="ord-taker-revision",
+            size="11.6",
+            price="0.09",
+        )
+        raw.update(
+            {
+                "market": "condition-fill-sync",
+                "trader_side": "TAKER",
+                "side": "BUY",
+                "asset_id": YES_TOKEN,
+                "taker_order_id": "ord-taker-revision",
+                "maker_orders": [
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+                ],
+            }
+        )
+
+        result = sync_fills(conn, FakeSyncAdapter([raw]), observed_at=NOW + timedelta(seconds=1))
+
+        assert result["appended"] == 0
+        assert result["unattributable_count"] == 1
+        facts = _trade_rows(conn)
+        assert [(row["state"], row["fill_price"]) for row in facts] == [("MATCHED", "0.09")]
+
+    def test_sync_writer_rechecks_stale_exact_taker_revision(self, conn, monkeypatch):
+        monkeypatch.setattr(
+            "src.execution.command_recovery.reconcile_authenticated_entry_trade_facts",
+            lambda _conn, *, command_id: {"advanced": 0, "errors": 0},
+        )
+        _seed_command(conn, command_id="cmd-taker-stale", venue_order_id="ord-taker-stale")
+        _seed_taker_command(conn, command_id="cmd-taker-stale", venue_order_id="ord-taker-stale")
+        raw = _trade(
+            trade_id="trade-taker-stale",
+            order_id="ord-taker-stale",
+            size="11.6",
+            price="0.09",
+        )
+        raw.update(
+            {
+                "market": "condition-fill-sync",
+                "trader_side": "TAKER",
+                "side": "BUY",
+                "asset_id": YES_TOKEN,
+                "taker_order_id": "ord-taker-stale",
+                "maker_orders": [
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+                    {"asset_id": "no-token-fill-sync", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+                ],
+            }
+        )
+        from src.ingest.fill_synchronizer import (
+            _pending_fill_sync_writes,
+            _persist_prepared_fill_sync,
+            _prepare_fill_sync,
+        )
+        from src.state.schema.fill_sync_watermarks_schema import ensure_table as ensure_watermark_table
+        from src.state.schema.wallet_fill_observations_schema import ensure_table as ensure_observation_table
+        from src.state.venue_command_repo import append_trade_fact
+
+        ensure_watermark_table(conn)
+        ensure_observation_table(conn)
+        prepared = _prepare_fill_sync(
+            conn, FakeSyncAdapter([raw]), source="test", observed_at=NOW
+        )
+        pending, _ = _pending_fill_sync_writes(conn, prepared)
+        assert len(pending.trades) == 1
+        append_trade_fact(
+            conn,
+            trade_id="trade-taker-stale",
+            venue_order_id="ord-taker-stale",
+            command_id="cmd-taker-stale",
+            state="MATCHED",
+            filled_size="11.6",
+            fill_price="0.09",
+            source="REST",
+            observed_at=NOW,
+            raw_payload_hash="b" * 64,
+            raw_payload_json={"source": "rounded_taker_topline"},
+        )
+        conn.commit()
+        conn.execute("BEGIN")
+        summary = _persist_prepared_fill_sync(conn, pending)
+        conn.commit()
+
+        assert summary["appended"] == 0
+        assert summary["unattributable_count"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM venue_trade_facts WHERE trade_id = 'trade-taker-stale'"
+        ).fetchone()[0] == 1
 
     def test_zeus_fill_lands_in_both_lanes_with_consistent_economics(self, conn):
         """packet I / wave-1.5: a Zeus-attributed fill must land in BOTH

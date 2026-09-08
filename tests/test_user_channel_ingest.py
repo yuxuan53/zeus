@@ -122,7 +122,7 @@ def _envelope(
         price=price,
         size=size,
         order_type="GTC",
-        post_only=False,
+        post_only=True,
         tick_size=Decimal("0.01"),
         min_order_size=Decimal("5"),
         neg_risk=False,
@@ -175,6 +175,26 @@ def _entry_submit_payload() -> dict:
 
 
 def _seed_acknowledged_command(c) -> None:
+    c.execute("ATTACH DATABASE ':memory:' AS world")
+    c.execute(
+        """
+        CREATE TABLE world.decision_certificates (
+            certificate_hash TEXT PRIMARY KEY,
+            certificate_type TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            verifier_status TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    c.execute(
+        """
+        INSERT INTO world.decision_certificates
+            (certificate_hash, certificate_type, mode, verifier_status, payload_json)
+        VALUES ('cert-ws', 'ActionableTradeCertificate', 'LIVE', 'VERIFIED', ?)
+        """,
+        (json.dumps({"condition_id": "condition-ws", "token_id": "yes-token-ws", "direction": "buy_yes"}),),
+    )
     insert_snapshot(c, _snapshot())
     insert_submission_envelope(c, _envelope(), envelope_id="env-ws")
     _seed_trade_decision_runtime_alias(c, trade_id=1, runtime_trade_id="1")
@@ -198,6 +218,7 @@ def _seed_acknowledged_command(c) -> None:
         expected_min_order_size=Decimal("5"),
         expected_neg_risk=False,
         venue_order_id="ord-ws",
+        decision_certificate_hash="cert-ws",
     )
     append_event(
         c,
@@ -477,6 +498,18 @@ def _trade_message(status: str = "MATCHED", **overrides):
         "timestamp": NOW.isoformat(),
     }
     msg.update(overrides)
+    msg.setdefault("asset_id", "yes-token-ws")
+    msg.setdefault("side", "BUY")
+    if "maker_orders" not in overrides:
+        maker_side = "SELL" if msg["side"] == "BUY" else "BUY"
+        msg["maker_orders"] = [
+            {
+                "asset_id": "yes-token-ws",
+                "side": maker_side,
+                "matched_amount": msg["size"],
+                "price": msg["price"],
+            }
+        ]
     return msg
 
 
@@ -996,6 +1029,14 @@ def test_ws_lifecycle_accepts_tick_equivalent_rest_fill_price_without_review(con
             "CONFIRMED",
             size="5.116278",
             price="0.43",
+            maker_orders=[
+                {
+                    "asset_id": "yes-token-ws",
+                    "side": "SELL",
+                    "matched_amount": "5.116278",
+                    "price": "0.4299998944545233859457988796",
+                }
+            ],
             transaction_hash="0xconfirmed",
             confirmation_count=3,
         )
@@ -1085,6 +1126,8 @@ def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
         expected_min_order_size=Decimal("5"),
         expected_neg_risk=False,
         venue_order_id="ord-other",
+        q_version="q-other",
+        decision_certificate_hash="cert-ws",
     )
     append_event(
         conn,
@@ -1105,7 +1148,15 @@ def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
         _trade_message(
             "CONFIRMED",
             taker_order_id=other_order,
-            maker_orders=[{"order_id": other_order, "matched_amount": "5", "price": "0.50"}],
+            maker_orders=[
+                {
+                    "order_id": other_order,
+                    "asset_id": "yes-token-ws",
+                    "side": "SELL",
+                    "matched_amount": "5",
+                    "price": "0.50",
+                }
+            ],
         )
     )
 
@@ -1169,17 +1220,30 @@ def test_fractional_matched_trade_preserves_exact_lot_size(conn):
 
 def test_exit_sell_confirmed_trade_does_not_mint_positive_exposure_lot(conn):
     """EXIT/SELL WS trade facts confirm venue side effects but are not entries."""
+    from dataclasses import replace
+
+    insert_submission_envelope(
+        conn,
+        replace(_envelope(), side="SELL", order_type="FAK", post_only=False),
+        envelope_id="env-ws-exit",
+    )
     conn.execute(
         """
         UPDATE venue_commands
-           SET intent_kind = 'EXIT', side = 'SELL'
+           SET intent_kind = 'EXIT', side = 'SELL', envelope_id = 'env-ws-exit'
          WHERE command_id = 'cmd-ws'
         """
     )
     conn.commit()
 
     result = _ingestor(conn).handle_message(
-        _trade_message("CONFIRMED", size="10", transaction_hash="0xexit", confirmation_count=3)
+        _trade_message(
+            "CONFIRMED",
+            size="10",
+            side="SELL",
+            transaction_hash="0xexit",
+            confirmation_count=3,
+        )
     )
 
     assert result["command_event"] == "FILL_CONFIRMED"
@@ -1695,6 +1759,99 @@ def test_maker_order_trade_fact_uses_matched_zeus_order_economics(conn):
     assert Decimal(str(lot["shares"])) == Decimal("12.12")
     assert Decimal(lot["entry_price_avg"]) == Decimal("0.10")
     assert _command_state(conn) == "FILLED"
+
+
+def test_initial_taker_trade_fact_uses_weighted_maker_legs(conn, monkeypatch):
+    from dataclasses import replace
+
+    insert_submission_envelope(
+        conn,
+        replace(_envelope(), size=Decimal("11.6"), price=Decimal("0.10")),
+        envelope_id="env-ws-taker",
+    )
+    conn.execute(
+        "UPDATE venue_commands SET envelope_id = ?, size = ?, price = ? WHERE command_id = 'cmd-ws'",
+        ("env-ws-taker", 11.6, 0.10),
+    )
+    conn.commit()
+
+    monkeypatch.setenv("ZEUS_MODE", "live")
+    result = _ingestor(conn).handle_message(
+        _trade_message(
+            "CONFIRMED",
+            size="11.6",
+            price="0.09",
+            trader_side="TAKER",
+            side="BUY",
+            asset_id="yes-token-ws",
+            taker_order_id="ord-ws",
+            maker_orders=[
+                {"asset_id": "no-token-ws", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+                {"asset_id": "no-token-ws", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+            ],
+            transaction_hash="0xtaker-initial",
+            confirmation_count=3,
+        )
+    )
+
+    assert result["command_event"] == "FILL_CONFIRMED"
+    row = _rows(conn, "venue_trade_facts")[-1]
+    assert Decimal(row["filled_size"]) == Decimal("11.6")
+    assert Decimal(row["fill_price"]) == Decimal("1.08") / Decimal("11.6")
+    assert row["fee_paid_micro"] is None
+
+
+def test_exact_taker_revision_is_not_downgraded_to_tick_equivalent_old_price(conn, monkeypatch):
+    from dataclasses import replace
+
+    insert_submission_envelope(
+        conn,
+        replace(_envelope(), size=Decimal("11.6"), price=Decimal("0.10")),
+        envelope_id="env-ws-taker-revision",
+    )
+    conn.execute(
+        "UPDATE venue_commands SET envelope_id = ?, size = ?, price = ? WHERE command_id = 'cmd-ws'",
+        ("env-ws-taker-revision", 11.6, 0.10),
+    )
+    append_trade_fact(
+        conn,
+        trade_id="trade-ws-revision",
+        venue_order_id="ord-ws",
+        command_id="cmd-ws",
+        state="MATCHED",
+        filled_size="11.6",
+        fill_price="0.09",
+        source="REST",
+        observed_at=NOW,
+        raw_payload_hash=HASH_A,
+        raw_payload_json={"source": "rounded_taker_topline"},
+    )
+    conn.commit()
+
+    monkeypatch.setenv("ZEUS_MODE", "live")
+    result = _ingestor(conn).handle_message(
+        _trade_message(
+            "CONFIRMED",
+            id="trade-ws-revision",
+            size="11.6",
+            price="0.09",
+            trader_side="TAKER",
+            side="BUY",
+            asset_id="yes-token-ws",
+            taker_order_id="ord-ws",
+            maker_orders=[
+                {"asset_id": "no-token-ws", "side": "BUY", "matched_amount": "8", "price": "0.91"},
+                {"asset_id": "no-token-ws", "side": "BUY", "matched_amount": "3.6", "price": "0.90"},
+            ],
+            transaction_hash="0xrevision",
+            confirmation_count=3,
+        )
+    )
+
+    assert result["command_event"] == "REVIEW_REQUIRED"
+    assert result["reason"] == "ws_trade_lifecycle_regression_or_economic_drift"
+    facts = _rows(conn, "venue_trade_facts")
+    assert [(row["state"], row["fill_price"]) for row in facts] == [("MATCHED", "0.09")]
 
 
 def test_ws_path_emits_equivalent_command_events_when_enabled(conn):

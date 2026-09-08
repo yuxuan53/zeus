@@ -92,7 +92,10 @@ from src.execution.exchange_reconcile import (
     _local_commands_by_order,
     _missing_trade_fill_economics,
     _raw,
+    _same_trade_fill_economics,
     _stable_subject,
+    _trade_fact_economic_conflict,
+    _trade_fill_economics_binding,
     _trade_fill_price,
     _trade_filled_size,
     _trade_id,
@@ -201,26 +204,23 @@ def _fact_already_recorded(
     filled_size: str,
     fill_price: str,
 ) -> bool:
-    """True if an identical revision of this trade fact is already durable.
+    """Match one lifecycle revision by economic value, independent of wire format."""
 
-    Scoped to the exact (trade_id, command_id, state, filled_size, fill_price)
-    tuple — a genuinely NEW lifecycle revision (e.g. MATCHED -> CONFIRMED, or a
-    corrected fill_price) is still appended as its own row; only a byte-for-byte
-    repeat observation is rejected. ``append_trade_fact`` itself always inserts
-    (it is an append-only log with no upsert), so this check is what makes
-    re-running a sync cycle over the same venue response idempotent.
-    """
-
-    row = conn.execute(
+    rows = conn.execute(
         """
-        SELECT 1 FROM venue_trade_facts
+        SELECT filled_size, fill_price FROM venue_trade_facts
          WHERE trade_id = ? AND command_id = ? AND state = ?
-           AND filled_size = ? AND fill_price = ?
-         LIMIT 1
         """,
-        (trade_id, command_id, state, filled_size, fill_price),
-    ).fetchone()
-    return row is not None
+        (trade_id, command_id, state),
+    ).fetchall()
+    return any(
+        _same_trade_fill_economics(
+            {"filled_size": row[0], "fill_price": row[1]},
+            filled_size=filled_size,
+            fill_price=fill_price,
+        )
+        for row in rows
+    )
 
 
 def _wallet_observation_disposition(order_ids: list[str], command: dict[str, Any] | None) -> str:
@@ -427,6 +427,7 @@ def _prepare_fill_sync(
 
 
 def _pending_fill_sync_writes(
+    conn: sqlite3.Connection,
     prepared: _PreparedFillSync,
 ) -> tuple[_PreparedFillSync, dict[str, int]]:
     """Remove fully durable venue rows before acquiring the TRADE writer.
@@ -468,12 +469,33 @@ def _pending_fill_sync_writes(
         elif command is None or not order_id:
             classification = "foreign_fill_count"
         else:
-            filled_size = _trade_filled_size(raw, order_id)
-            fill_price = _trade_fill_price(raw, order_id)
+            binding = _trade_fill_economics_binding(
+                conn,
+                command=command,
+                raw=raw,
+                venue_order_id=order_id,
+            )
+            if binding.state == "EXACT_TAKER":
+                filled_size = binding.filled_size
+                fill_price = binding.fill_price
+            elif binding.state == "TAKER_UNVERIFIABLE":
+                filled_size = None
+                fill_price = None
+            else:
+                filled_size = _trade_filled_size(raw, order_id)
+                fill_price = _trade_fill_price(raw, order_id)
             if _missing_trade_fill_economics(
                 state=state,
                 filled_size=filled_size,
                 fill_price=fill_price,
+            ):
+                classification = "unattributable_count"
+            elif binding.state == "EXACT_TAKER" and _trade_fact_economic_conflict(
+                conn,
+                trade_id=trade_id,
+                command_id=str(command["command_id"]),
+                filled_size=str(filled_size),
+                fill_price=str(fill_price),
             ):
                 classification = "unattributable_count"
             else:
@@ -484,7 +506,14 @@ def _pending_fill_sync_writes(
                     str(filled_size),
                     str(fill_price),
                 )
-                fact_pending = fact_key not in recorded_facts
+                fact_pending = fact_key not in recorded_facts and not _fact_already_recorded(
+                    conn,
+                    trade_id=trade_id,
+                    command_id=str(command["command_id"]),
+                    state=state,
+                    filled_size=str(filled_size),
+                    fill_price=str(fill_price),
+                )
                 if fact_pending:
                     recorded_facts.add(fact_key)
                 else:
@@ -573,8 +602,21 @@ def _persist_prepared_fill_sync(
             continue
 
         command_id = str(command["command_id"])
-        filled_size = _trade_filled_size(raw, order_id)
-        fill_price = _trade_fill_price(raw, order_id)
+        binding = _trade_fill_economics_binding(
+            conn,
+            command=command,
+            raw=raw,
+            venue_order_id=order_id,
+        )
+        if binding.state == "EXACT_TAKER":
+            filled_size = binding.filled_size
+            fill_price = binding.fill_price
+        elif binding.state == "TAKER_UNVERIFIABLE":
+            filled_size = None
+            fill_price = None
+        else:
+            filled_size = _trade_filled_size(raw, order_id)
+            fill_price = _trade_fill_price(raw, order_id)
         missing = _missing_trade_fill_economics(
             state=state, filled_size=filled_size, fill_price=fill_price
         )
@@ -591,6 +633,19 @@ def _persist_prepared_fill_sync(
             filled_size_s,
             fill_price_s,
         )
+        if (
+            binding.state == "EXACT_TAKER"
+            and fact_key not in recorded_facts
+            and _trade_fact_economic_conflict(
+                conn,
+                trade_id=trade_id,
+                command_id=command_id,
+                filled_size=filled_size_s,
+                fill_price=fill_price_s,
+            )
+        ):
+            unattributable_count += 1
+            continue
         if fact_key in recorded_facts or _fact_already_recorded(
             conn,
             trade_id=trade_id,
@@ -785,7 +840,7 @@ def _sync_fills_coordinated(
             source=source,
             observed_at=observed_at,
         )
-        pending, skipped_summary = _pending_fill_sync_writes(prepared)
+        pending, skipped_summary = _pending_fill_sync_writes(reader, prepared)
     finally:
         if reader is not None:
             reader.close()

@@ -2361,6 +2361,145 @@ def _trade_payload_for_maker_economics(raw: Mapping[str, Any]) -> Mapping[str, A
     return raw
 
 
+@dataclass(frozen=True)
+class TradeFillEconomicsBinding:
+    """Result of binding one raw fill to its command/envelope economics."""
+
+    state: Literal["EXACT_TAKER", "LEGACY_NON_TAKER", "TAKER_UNVERIFIABLE"]
+    filled_size: Decimal | None = None
+    fill_price: Decimal | None = None
+
+
+def _trade_fill_economics_binding(
+    conn: sqlite3.Connection,
+    *,
+    command: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    venue_order_id: str,
+) -> TradeFillEconomicsBinding:
+    """Bind initial fill economics to the exact command and submission envelope.
+
+    A local maker observation keeps the established per-maker parsing path. A
+    taker observation is exact only when its envelope identity and every raw
+    identity field agree and the existing leg calculator covers the taker size;
+    a recognized taker with incomplete proof is never allowed to use its
+    rounded top-level size/price.
+    """
+
+    order_id = str(venue_order_id or "").strip()
+    raw_trader_side = str(
+        _first_present(raw, "trader_side", "traderSide", default="") or ""
+    ).strip().upper()
+    raw_taker_order = str(
+        _first_present(raw, "taker_order_id", "takerOrderId", default="") or ""
+    ).strip()
+    if (
+        raw_taker_order == order_id
+        and raw_trader_side
+        and raw_trader_side != "TAKER"
+    ):
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+    if (
+        order_id
+        and raw_taker_order != order_id
+        and _selected_maker_order(raw, order_id) is not None
+    ):
+        return TradeFillEconomicsBinding("LEGACY_NON_TAKER")
+    is_taker = raw_trader_side == "TAKER" or bool(order_id and raw_taker_order == order_id)
+    if not is_taker:
+        return TradeFillEconomicsBinding("LEGACY_NON_TAKER")
+
+    envelope_id = str(command.get("envelope_id") or "").strip()
+    if not order_id or not envelope_id:
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+    command_order_id = str(command.get("venue_order_id") or "").strip()
+    if command_order_id != order_id:
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+    try:
+        row = conn.execute(
+            """
+            SELECT condition_id, selected_outcome_token_id,
+                   yes_token_id, no_token_id, side
+              FROM venue_submission_envelopes
+             WHERE envelope_id = ?
+            """,
+            (envelope_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+    if row is None:
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+
+    envelope = dict(row) if isinstance(row, sqlite3.Row) else {
+        "condition_id": row[0],
+        "selected_outcome_token_id": row[1],
+        "yes_token_id": row[2],
+        "no_token_id": row[3],
+        "side": row[4],
+    }
+    condition_id = str(envelope.get("condition_id") or "").strip()
+    selected_token = str(envelope.get("selected_outcome_token_id") or "").strip()
+    yes_token = str(envelope.get("yes_token_id") or "").strip()
+    no_token = str(envelope.get("no_token_id") or "").strip()
+    envelope_side = str(envelope.get("side") or "").strip().upper()
+    command_token = str(command.get("token_id") or "").strip()
+    command_side = str(command.get("side") or "").strip().upper()
+    raw_condition = str(
+        _first_present(raw, "market", "condition_id", "conditionId", default="") or ""
+    ).strip()
+    raw_token = str(
+        _first_present(raw, "asset_id", "assetId", "token_id", "tokenId", default="") or ""
+    ).strip()
+    raw_side = str(_first_present(raw, "side", default="") or "").strip().upper()
+    if (
+        not condition_id
+        or not selected_token
+        or not yes_token
+        or not no_token
+        or yes_token == no_token
+        or selected_token not in {yes_token, no_token}
+        or command_token != selected_token
+        or command_side != envelope_side
+        or envelope_side not in {"BUY", "SELL"}
+        or raw_condition != condition_id
+        or raw_token != selected_token
+        or raw_side != envelope_side
+        or raw_taker_order != order_id
+    ):
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+
+    bound_raw = dict(raw)
+    if raw_trader_side != "TAKER":
+        bound_raw["trader_side"] = "TAKER"
+    bound_raw["asset_id"] = raw_token
+    bound_raw["side"] = raw_side
+    bound_raw["taker_order_id"] = raw_taker_order
+    if envelope_side == "BUY":
+        economics = _taker_buy_trade_economics(
+            bound_raw,
+            venue_order_id=order_id,
+            selected_token_id=selected_token,
+            yes_token_id=yes_token,
+            no_token_id=no_token,
+        )
+    else:
+        economics = _taker_sell_trade_economics(
+            bound_raw,
+            venue_order_id=order_id,
+            selected_token_id=selected_token,
+            yes_token_id=yes_token,
+            no_token_id=no_token,
+        )
+    if economics is None:
+        return TradeFillEconomicsBinding("TAKER_UNVERIFIABLE")
+    filled_size, quote = economics
+    return TradeFillEconomicsBinding(
+        "EXACT_TAKER",
+        filled_size=filled_size,
+        fill_price=quote / filled_size,
+    )
+
+
 def _taker_buy_trade_economics(
     raw: Mapping[str, Any],
     *,
@@ -5188,8 +5327,18 @@ def _append_linkable_trade_fact_if_missing(
     from src.state.venue_command_repo import append_event, append_trade_fact, get_command
 
     order_id = matched_order_id or _trade_order_id(raw) or str(command["venue_order_id"])
-    filled_size_raw = _trade_filled_size(raw, order_id)
-    fill_price_raw = _trade_fill_price(raw, order_id)
+    binding = _trade_fill_economics_binding(
+        conn, command=command, raw=raw, venue_order_id=order_id
+    )
+    if binding.state == "EXACT_TAKER":
+        filled_size_raw = binding.filled_size
+        fill_price_raw = binding.fill_price
+    elif binding.state == "TAKER_UNVERIFIABLE":
+        filled_size_raw = None
+        fill_price_raw = None
+    else:
+        filled_size_raw = _trade_filled_size(raw, order_id)
+        fill_price_raw = _trade_fill_price(raw, order_id)
     missing = _missing_trade_fill_economics(
         state=state,
         filled_size=filled_size_raw,
@@ -5211,6 +5360,16 @@ def _append_linkable_trade_fact_if_missing(
         )
     filled_size = str(filled_size_raw if filled_size_raw is not None else "0")
     fill_price = str(fill_price_raw if fill_price_raw is not None else "0")
+    economic_conflict = (
+        binding.state == "EXACT_TAKER"
+        and _trade_fact_economic_conflict(
+            conn,
+            trade_id=trade_id,
+            command_id=str(command["command_id"]),
+            filled_size=filled_size,
+            fill_price=fill_price,
+        )
+    )
     latest_fact = _latest_trade_fact_for_trade_id(conn, trade_id)
     if latest_fact is not None:
         identity_mismatch = _trade_fact_identity_mismatch(
@@ -5238,12 +5397,15 @@ def _append_linkable_trade_fact_if_missing(
                 },
                 recorded_at=observed_at,
             )
-        same_fill_economics = _same_trade_fill_economics(
-            latest_fact,
-            filled_size=filled_size,
-            fill_price=fill_price,
+        same_fill_economics = (
+            not economic_conflict
+            and _same_trade_fill_economics(
+                latest_fact,
+                filled_size=filled_size,
+                fill_price=fill_price,
+            )
         )
-        same_state_point_order_split_price = not same_fill_economics and (
+        same_state_point_order_split_price = not economic_conflict and not same_fill_economics and (
             _point_order_split_weighted_price_reproduces_local_authority(
                 latest_fact,
                 raw=raw,
@@ -5354,22 +5516,32 @@ def _append_linkable_trade_fact_if_missing(
                 observed_at=observed_at,
                 context=context,
             )
-        if state in {"MATCHED", "MINED", "CONFIRMED"} and not same_fill_economics:
-            point_order_split = _point_order_aggregate_exact_trade_split_has_authority(
-                latest_fact,
-                raw=raw,
-                venue_order_id=order_id,
-                state=state,
-                filled_size=filled_size,
-                fill_price=fill_price,
+        if (
+            binding.state == "EXACT_TAKER"
+            or state in {"MATCHED", "MINED", "CONFIRMED"}
+        ) and not same_fill_economics:
+            point_order_split = False
+            if binding.state != "EXACT_TAKER":
+                point_order_split = _point_order_aggregate_exact_trade_split_has_authority(
+                    latest_fact,
+                    raw=raw,
+                    venue_order_id=order_id,
+                    state=state,
+                    filled_size=filled_size,
+                    fill_price=fill_price,
+                )
+            revision_authority = (
+                False
+                if binding.state == "EXACT_TAKER"
+                else _confirmed_price_revision_has_authority(
+                    latest_fact,
+                    raw=raw,
+                    venue_order_id=order_id,
+                    state=state,
+                    filled_size=filled_size,
+                )
             )
-            if not point_order_split and not _confirmed_price_revision_has_authority(
-                latest_fact,
-                raw=raw,
-                venue_order_id=order_id,
-                state=state,
-                filled_size=filled_size,
-            ):
+            if not point_order_split and not revision_authority:
                 return record_finding(
                     conn,
                     kind="unrecorded_trade",
@@ -7708,6 +7880,41 @@ def _same_trade_fill_economics(
     )
 
 
+def _trade_fact_economic_conflict(
+    conn: sqlite3.Connection,
+    *,
+    trade_id: str,
+    command_id: str,
+    filled_size: str,
+    fill_price: str,
+) -> bool:
+    """Compare incoming economics with this trade/command's canonical fact.
+
+    SCOPE: this exact pair. DRAIN: the existing explicit economic-correction
+    writer retains provenance and updates canonical economics. RESET: that
+    current fact agrees; obsolete append-only revisions cannot keep a veto.
+    """
+
+    rows = conn.execute(
+        "WITH " + _canonical_trade_fact_cte(
+            source_clause_sql="WHERE fact.trade_id = ? AND fact.command_id = ?"
+        ) + """
+        SELECT filled_size, fill_price
+          FROM canonical_trade_fact
+        """,
+        (trade_id, command_id),
+    ).fetchall()
+    return any(
+        not _same_decimal_value(row[0], filled_size)
+        or not _same_decimal_value_with_abs_tolerance(
+            row[1],
+            fill_price,
+            tolerance=_TRADE_PRICE_WIRE_ABS_TOLERANCE,
+        )
+        for row in rows
+    )
+
+
 def _same_decimal_value(left: Any, right: Any) -> bool:
     try:
         return _decimal(left) == _decimal(right)
@@ -7735,6 +7942,15 @@ def _confirmed_price_revision_has_authority(
     state: str,
     filled_size: str,
 ) -> bool:
+    selected_maker = _selected_maker_order(raw, venue_order_id)
+    if selected_maker is None and str(
+        _first_present(raw, "trader_side", "traderSide", default="") or ""
+    ).strip().upper() == "TAKER":
+        # Exact taker economics are admitted only after the shared command /
+        # envelope binding and complete maker-leg calculator run. This legacy
+        # revision helper has no command/envelope context and must not turn a
+        # rounded taker headline into an economic correction.
+        return False
     previous = str(fact.get("state") or "")
     if state != "CONFIRMED" or previous not in {"MATCHED", "MINED"}:
         return False
@@ -7744,7 +7960,7 @@ def _confirmed_price_revision_has_authority(
         return False
     return (
         _taker_order_price_applies(raw, venue_order_id)
-        or _selected_maker_order(raw, venue_order_id) is not None
+        or selected_maker is not None
         or _first_explicit_fill_price(raw) is not None
     )
 
