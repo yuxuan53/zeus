@@ -1,5 +1,5 @@
 # Created: 2026-08-27
-# Last reused or audited: 2026-08-27
+# Last reused or audited: 2026-09-08
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
 #   item 9 ("Market-anchored walk-forward calibrator") — live wiring, fit provider.
 """Tests for src/calibration/market_anchored_live_fit.py.
@@ -31,6 +31,11 @@ from src.calibration.market_anchored_residual import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+_TEST_CITY_TIMEZONES = {
+    **{f"city-{i}": "UTC" for i in range(100)},
+    "Warsaw": "Europe/Warsaw",
+    "Austin": "America/Chicago",
+}
 
 
 def _memory_db(rows: list[dict]) -> sqlite3.Connection:
@@ -117,14 +122,14 @@ def _settled_rows(count: int, *, settled_at: datetime | None = None) -> list[dic
 
 def test_fit_returns_none_below_min_train_rows():
     conn = _memory_db(_settled_rows(5))
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES)
 
     assert provider.artifact(now=NOW) is None
 
 
 def test_fit_produces_artifact_at_min_train_rows():
     conn = _memory_db(_settled_rows(40))
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES)
 
     artifact = provider.artifact(now=NOW)
 
@@ -137,7 +142,7 @@ def test_unreachable_database_fails_open_to_none():
     def explode():
         raise sqlite3.OperationalError("unable to open database file")
 
-    provider = MarketAnchoredFitProvider(explode, min_train_rows=1)
+    provider = MarketAnchoredFitProvider(explode, min_train_rows=1, city_timezones=_TEST_CITY_TIMEZONES)
 
     assert provider.artifact(now=NOW) is None
 
@@ -146,17 +151,17 @@ def test_rows_settling_after_the_cutoff_never_train():
     """The walk-forward law: an outcome that had not resolved cannot inform."""
 
     conn = _memory_db(_settled_rows(40, settled_at=NOW + timedelta(days=1)))
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=1)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=1, city_timezones=_TEST_CITY_TIMEZONES)
 
     assert provider.artifact(now=NOW) is None
 
-    rows = load_fit_rows(conn, training_cutoff=NOW + timedelta(days=2))
+    rows = load_fit_rows(conn, training_cutoff=NOW + timedelta(days=2), city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))
     assert len(rows) == 40
 
 
 def test_training_cutoff_is_the_fit_instant():
     conn = _memory_db(_settled_rows(40))
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES)
 
     artifact = provider.artifact(now=NOW)
 
@@ -173,7 +178,7 @@ def test_artifact_is_reused_within_ttl_then_refitted():
         return conn
 
     provider = MarketAnchoredFitProvider(
-        connect, min_train_rows=20, ttl=timedelta(hours=6)
+        connect, min_train_rows=20, ttl=timedelta(hours=6), city_timezones=_TEST_CITY_TIMEZONES
     )
 
     first = provider.artifact(now=NOW)
@@ -194,7 +199,7 @@ def test_failed_fit_is_cached_so_a_dead_db_is_not_redialled_per_candidate():
         attempts.append(1)
         raise sqlite3.OperationalError("database is locked")
 
-    provider = MarketAnchoredFitProvider(explode, min_train_rows=1)
+    provider = MarketAnchoredFitProvider(explode, min_train_rows=1, city_timezones=_TEST_CITY_TIMEZONES)
 
     assert provider.artifact(now=NOW) is None
     assert provider.artifact(now=NOW + timedelta(minutes=1)) is None
@@ -207,7 +212,7 @@ def test_rows_missing_decision_time_or_target_date_are_skipped():
     rows[1]["target_date"] = None
     conn = _memory_db(rows)
 
-    assert len(load_fit_rows(conn, training_cutoff=NOW)) == 2
+    assert len(load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))) == 2
 
 
 def test_unmodeled_lead_is_excluded_from_training():
@@ -215,7 +220,7 @@ def test_unmodeled_lead_is_excluded_from_training():
         [_row(i, settled_at=NOW - timedelta(days=3), lead_days=7) for i in range(6)]
     )
 
-    assert load_fit_rows(conn, training_cutoff=NOW) == []
+    assert load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items())) == []
 
 
 def test_graded_at_substitutes_for_a_missing_settled_at():
@@ -225,19 +230,34 @@ def test_graded_at_substitutes_for_a_missing_settled_at():
         row["settled_at"] = None
     conn = _memory_db(rows)
 
-    assert len(load_fit_rows(conn, training_cutoff=NOW)) == 2
+    assert len(load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))) == 2
+
+
+def test_malformed_or_naive_settled_at_does_not_fallback_to_graded_at():
+    rows = _settled_rows(2)
+    rows[0]["graded_at"] = rows[0]["settled_at"]
+    rows[0]["settled_at"] = "2026-08-20T00:00:00"
+    rows[1]["graded_at"] = rows[1]["settled_at"]
+    rows[1]["settled_at"] = "not-a-timestamp"
+    conn = _memory_db(rows)
+
+    assert load_fit_rows(
+        conn,
+        training_cutoff=NOW,
+        city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()),
+    ) == []
 
 
 def test_corrected_probability_shrinks_an_overconfident_q_toward_the_market():
     conn = _memory_db(_settled_rows(60))
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES)
     artifact = provider.artifact(now=NOW)
 
     applied = corrected_probability(
         artifact,
         p0=0.35,
         q_raw=0.9,
-        decision_date=date(2026, 8, 26),
+        city="city-0", decision_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         target_date=date(2026, 8, 27),
         side="YES",
     )
@@ -257,7 +277,7 @@ def test_corrected_probability_fails_closed_without_an_artifact():
             None,
             p0=0.35,
             q_raw=0.9,
-            decision_date=date(2026, 8, 26),
+            city="city-0", decision_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
             target_date=date(2026, 8, 27),
             side="YES",
         )
@@ -268,7 +288,7 @@ def test_corrected_probability_fails_closed_without_an_artifact():
 def test_corrected_probability_fails_closed_on_unmodeled_lead():
     conn = _memory_db(_settled_rows(40))
     artifact = MarketAnchoredFitProvider(
-        lambda: conn, min_train_rows=20
+        lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES
     ).artifact(now=NOW)
 
     assert (
@@ -276,7 +296,7 @@ def test_corrected_probability_fails_closed_on_unmodeled_lead():
             artifact,
             p0=0.35,
             q_raw=0.9,
-            decision_date=date(2026, 8, 20),
+            city="city-0", decision_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
             target_date=date(2026, 8, 27),
             side="YES",
         )
@@ -288,7 +308,7 @@ def test_corrected_probability_fails_closed_on_unmodeled_lead():
 def test_corrected_probability_fails_closed_on_non_finite_inputs(bad):
     conn = _memory_db(_settled_rows(40))
     artifact = MarketAnchoredFitProvider(
-        lambda: conn, min_train_rows=20
+        lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES
     ).artifact(now=NOW)
 
     assert (
@@ -296,7 +316,7 @@ def test_corrected_probability_fails_closed_on_non_finite_inputs(bad):
             artifact,
             p0=bad,
             q_raw=0.9,
-            decision_date=date(2026, 8, 26),
+            city="city-0", decision_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
             target_date=date(2026, 8, 27),
             side="YES",
         )
@@ -318,6 +338,8 @@ def _synthetic_artifact(*, alpha_day1: float, beta: float) -> ResidualCalibrator
         n_excluded=0,
         excluded_reasons={},
         param_hash="synthetic",
+        lead_calendar_revision="city_local_target_date_v1",
+        city_timezone_snapshot=(("city-0", "UTC"),),
     )
 
 
@@ -339,7 +361,7 @@ def test_corrected_probability_buy_no_is_the_exact_complement_of_buy_yes():
         artifact,
         p0=p0,
         q_raw=q_raw,
-        decision_date=decision_date,
+        city="city-0", decision_at=datetime.combine(decision_date, datetime.min.time(), tzinfo=timezone.utc),
         target_date=target_date,
         side="YES",
     )
@@ -347,7 +369,7 @@ def test_corrected_probability_buy_no_is_the_exact_complement_of_buy_yes():
         artifact,
         p0=1.0 - p0,
         q_raw=1.0 - q_raw,
-        decision_date=decision_date,
+        city="city-0", decision_at=datetime.combine(decision_date, datetime.min.time(), tzinfo=timezone.utc),
         target_date=target_date,
         side="NO",
     )
@@ -378,7 +400,7 @@ def test_corrected_probability_alpha_sign_flips_for_buy_no():
         artifact,
         p0=p0,
         q_raw=p0,
-        decision_date=decision_date,
+        city="city-0", decision_at=datetime.combine(decision_date, datetime.min.time(), tzinfo=timezone.utc),
         target_date=target_date,
         side="buy_yes",
     )
@@ -386,7 +408,7 @@ def test_corrected_probability_alpha_sign_flips_for_buy_no():
         artifact,
         p0=p0,
         q_raw=p0,
-        decision_date=decision_date,
+        city="city-0", decision_at=datetime.combine(decision_date, datetime.min.time(), tzinfo=timezone.utc),
         target_date=target_date,
         side="buy_no",
     )
@@ -403,7 +425,7 @@ def test_corrected_probability_rejects_an_unrecognized_side():
             artifact,
             p0=0.3,
             q_raw=0.6,
-            decision_date=date(2026, 8, 26),
+            city="city-0", decision_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
             target_date=date(2026, 8, 27),
             side="sell_no",
         )
@@ -429,7 +451,7 @@ def test_load_fit_rows_weights_by_reciprocal_claim_count():
     ]
     conn = _memory_db(claim_a + claim_b)
 
-    rows = load_fit_rows(conn, training_cutoff=NOW)
+    rows = load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))
 
     assert len(rows) == 5
     a_weights = [r.w for r in rows[:4]]
@@ -459,9 +481,9 @@ def test_duplicated_claim_window_refused_though_row_count_meets_floor():
     conn = _memory_db(rows_in)
 
     # Sanity: the row-count floor alone would have accepted this sample.
-    raw_rows = load_fit_rows(conn, training_cutoff=NOW)
+    raw_rows = load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))
     assert len(raw_rows) == 20
     assert sum(r.w for r in raw_rows) == pytest.approx(5.0)
 
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20, city_timezones=_TEST_CITY_TIMEZONES)
     assert provider.artifact(now=NOW) is None

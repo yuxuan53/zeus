@@ -1,5 +1,5 @@
 # Created: 2026-09-04
-# Last reused or audited: 2026-09-04
+# Last reused or audited: 2026-09-08
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
 #   (market-anchored calibrator, item 9) + this task's fix — the exit stop was
 #   comparing against the RAW posterior-predictive point (measured +0.170
@@ -52,6 +52,8 @@ def _stub_artifact(*, alpha_day0: float = 0.09, beta: float = 0.0) -> ResidualCa
         n_excluded=0,
         excluded_reasons={},
         param_hash="stub",
+        lead_calendar_revision="city_local_target_date_v1",
+        city_timezone_snapshot=(("Warsaw", "Europe/Warsaw"),),
     )
 
 
@@ -255,7 +257,11 @@ def _seed_conn_for_real_provider() -> sqlite3.Connection:
 
 def test_evaluate_exit_never_opens_its_own_db_connection(monkeypatch):
     conn = _seed_conn_for_real_provider()
-    provider = MarketAnchoredFitProvider(lambda: conn, min_train_rows=20)
+    provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        min_train_rows=20,
+        city_timezones={f"city-{i}": "UTC" for i in range(30)},
+    )
     # Warm the TTL cache now (real wall-clock "now"), BEFORE sqlite3.connect
     # is sabotaged below — the exit path's own `now` a moment later is well
     # inside the 6h TTL, so it must never call `_connect()` again.

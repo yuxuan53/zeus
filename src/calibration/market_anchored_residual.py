@@ -1,5 +1,5 @@
 # Created: 2026-08-24
-# Last reused or audited: 2026-08-24
+# Last reused or audited: 2026-09-08
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
 #   item 9 ("Market-anchored walk-forward calibrator") + "Key consult corrections
 #   adopted": no per-bucket isotonic, no per-city params, lead gets 3 regularized
@@ -83,6 +83,8 @@ BETA_MAX = 0.12
 # lead_bucket_of returns None and the row is excluded from fit/predict,
 # never silently folded into an existing bucket or raising a KeyError.
 LEAD_BUCKETS: tuple[str, ...] = ("day0", "day1", "day2")
+LEAD_CALENDAR_REVISION = "city_local_target_date_v1"
+UNBOUND_LEAD_CALENDAR_REVISION = "UNBOUND"
 
 # A decision date with fewer prior settled rows than this cannot support a
 # 4-parameter fit; walk_forward() excludes rows on such a date rather than
@@ -155,6 +157,8 @@ class ResidualCalibratorArtifact:
     n_excluded: int
     excluded_reasons: Mapping[str, int]
     param_hash: str
+    lead_calendar_revision: str = UNBOUND_LEAD_CALENDAR_REVISION
+    city_timezone_snapshot: tuple[tuple[str, str], ...] = ()
 
     def predict(self, p0: float, q_raw: float, lead_bucket: str | None) -> float | None:
         return apply_artifact(self, p0, q_raw, lead_bucket)
@@ -169,6 +173,8 @@ def _param_hash(
     p_clip: tuple[float, float],
     lead_buckets: tuple[str, ...],
     training_cutoff: str,
+    lead_calendar_revision: str = UNBOUND_LEAD_CALENDAR_REVISION,
+    city_timezone_snapshot: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """sha256 of the canonical parameter JSON — excludes provenance counts.
 
@@ -185,6 +191,8 @@ def _param_hash(
             "p_clip": list(p_clip),
             "lead_buckets": list(lead_buckets),
             "training_cutoff": training_cutoff,
+            "lead_calendar_revision": lead_calendar_revision,
+            "city_timezone_snapshot": [list(item) for item in city_timezone_snapshot],
         }
     )
 
@@ -280,6 +288,8 @@ def fit(
     *,
     lambda_: float,
     training_cutoff: str,
+    lead_calendar_revision: str = UNBOUND_LEAD_CALENDAR_REVISION,
+    city_timezone_snapshot: tuple[tuple[str, str], ...] = (),
 ) -> ResidualCalibratorArtifact:
     """Fit one artifact at a fixed lambda on the given rows.
 
@@ -340,6 +350,8 @@ def fit(
         p_clip=p_clip,
         lead_buckets=lead_buckets,
         training_cutoff=training_cutoff,
+        lead_calendar_revision=lead_calendar_revision,
+        city_timezone_snapshot=city_timezone_snapshot,
     )
     return ResidualCalibratorArtifact(
         alpha=alpha,
@@ -353,6 +365,8 @@ def fit(
         n_excluded=n_excluded,
         excluded_reasons=excluded_reasons,
         param_hash=param_hash,
+        lead_calendar_revision=lead_calendar_revision,
+        city_timezone_snapshot=city_timezone_snapshot,
     )
 
 

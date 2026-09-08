@@ -1,5 +1,5 @@
 # Created: 2026-08-24
-# Last reused or audited: 2026-08-24
+# Last reused or audited: 2026-09-08
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
 #   item 9 acceptance criteria (a)-(f).
 """Tests for src/calibration/market_anchored_residual.py.

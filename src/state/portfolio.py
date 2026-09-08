@@ -995,7 +995,8 @@ class Position:
                 artifact,
                 p0=p0,
                 q_raw=float(q_raw),
-                decision_date=now_utc.date(),
+                city=self.city,
+                decision_at=now_utc,
                 target_date=target_date,
                 side=self.direction.value,
             )

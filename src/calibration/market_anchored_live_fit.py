@@ -1,5 +1,5 @@
 # Created: 2026-08-27
-# Last reused or audited: 2026-08-27
+# Last reused or audited: 2026-09-08
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
 #   item 9 ("Market-anchored walk-forward calibrator") — live wiring. Row
 #   extraction mirrors scripts/calibrator_walkforward_report.py (load_rows /
@@ -29,12 +29,16 @@ from __future__ import annotations
 import sqlite3
 import threading
 from datetime import date, datetime, timedelta, timezone
+from typing import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.calibration.market_anchored_residual import (
     LAMBDA_GRID,
     MIN_TRAIN_ROWS,
     FitRow,
     ResidualCalibratorArtifact,
+    LEAD_CALENDAR_REVISION,
+    UNBOUND_LEAD_CALENDAR_REVISION,
     apply_artifact,
     fit,
     lead_bucket_of,
@@ -55,6 +59,74 @@ DEFAULT_TTL = timedelta(hours=6)
 LIVE_LAMBDA = max(LAMBDA_GRID)
 
 
+def _validated_city_timezone_snapshot(
+    city_timezones: Mapping[str, str] | None,
+) -> tuple[tuple[str, str], ...] | None:
+    """Copy exact city names and validated ZoneInfo keys immutably."""
+
+    if city_timezones is None:
+        return ()
+    if not isinstance(city_timezones, Mapping):
+        return None
+    if not city_timezones:
+        return None
+    snapshot: list[tuple[str, str]] = []
+    for city, zone_name in city_timezones.items():
+        if not isinstance(city, str) or not city or not isinstance(zone_name, str):
+            continue
+        try:
+            zone = ZoneInfo(zone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            continue
+        snapshot.append((city, zone.key))
+    return tuple(sorted(snapshot)) if snapshot else None
+
+
+def _city_local_target_date(
+    instant: datetime,
+    city: str,
+    city_timezone_snapshot: tuple[tuple[str, str], ...],
+) -> date | None:
+    """Derive a target-date lead anchor from one aware instant and city."""
+
+    if (
+        not isinstance(instant, datetime)
+        or instant.tzinfo is None
+        or instant.utcoffset() is None
+        or not isinstance(city, str)
+        or not city
+    ):
+        return None
+    zones = dict(city_timezone_snapshot)
+    zone_name = zones.get(city)
+    if zone_name is None:
+        return None
+    try:
+        return instant.astimezone(ZoneInfo(zone_name)).date()
+    except (TypeError, ValueError, ZoneInfoNotFoundError, OverflowError):
+        return None
+
+
+def _snapshot_is_valid(snapshot: object) -> bool:
+    if not isinstance(snapshot, tuple) or not snapshot:
+        return False
+    cities: set[str] = set()
+    for item in snapshot:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        city, zone_name = item
+        if not isinstance(city, str) or not city or city in cities:
+            return False
+        if not isinstance(zone_name, str) or not zone_name:
+            return False
+        try:
+            ZoneInfo(zone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            return False
+        cities.add(city)
+    return tuple(sorted(snapshot)) == snapshot
+
+
 def _parse_ts(value: object) -> datetime | None:
     """Parse an ISO8601 timestamp to tz-aware UTC, or None (never raises)."""
 
@@ -65,7 +137,7 @@ def _parse_ts(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -79,7 +151,8 @@ def _parse_date(value: object) -> date | None:
 
 
 def load_fit_rows(
-    conn: sqlite3.Connection, *, training_cutoff: datetime
+    conn: sqlite3.Connection, *, training_cutoff: datetime,
+        city_timezone_snapshot: tuple[tuple[str, str], ...] | None = None,
 ) -> list[FitRow]:
     """Extract settled training rows whose outcome preceded ``training_cutoff``.
 
@@ -115,16 +188,27 @@ def load_fit_rows(
     valid: list[tuple[dict, str, tuple, int]] = []
     for row in rows:
         record = dict(row) if not isinstance(row, dict) else row
-        settled_at = _parse_ts(record.get("settled_at")) or _parse_ts(
-            record.get("graded_at")
-        )
+        settled_at = _parse_ts(record.get("settled_at"))
+        if record.get("settled_at") is None:
+            settled_at = _parse_ts(record.get("graded_at"))
         if settled_at is None or settled_at >= training_cutoff:
             continue
         decision_at = _parse_ts(record.get("decision_posterior_computed_at"))
         target_date = _parse_date(record.get("target_date"))
         if decision_at is None or target_date is None:
             continue
-        lead_bucket = lead_bucket_of(decision_at.date(), target_date)
+        decision_date = (
+            _city_local_target_date(
+                decision_at,
+                record.get("city"),
+                city_timezone_snapshot,
+            )
+            if city_timezone_snapshot is not None
+            else None
+        )
+        if decision_date is None:
+            continue
+        lead_bucket = lead_bucket_of(decision_date, target_date)
         if lead_bucket is None:
             continue
         try:
@@ -176,11 +260,16 @@ class MarketAnchoredFitProvider:
         ttl: timedelta = DEFAULT_TTL,
         min_train_rows: int = MIN_TRAIN_ROWS,
         lambda_: float = LIVE_LAMBDA,
+        city_timezones: Mapping[str, str] | None,
     ) -> None:
         self._connect = connect
         self._ttl = ttl
         self._min_train_rows = min_train_rows
         self._lambda = lambda_
+        self._city_timezone_snapshot = _validated_city_timezone_snapshot(city_timezones)
+        self._lead_calendar_revision = (
+            LEAD_CALENDAR_REVISION if city_timezones is not None else UNBOUND_LEAD_CALENDAR_REVISION
+        )
         self._lock = threading.Lock()
         self._artifact: ResidualCalibratorArtifact | None = None
         self._fitted_at: datetime | None = None
@@ -188,6 +277,12 @@ class MarketAnchoredFitProvider:
     def artifact(self, *, now: datetime) -> ResidualCalibratorArtifact | None:
         """The current artifact, refitting when the cached one has aged out."""
 
+        if (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            return None
         now_utc = now.astimezone(timezone.utc)
         with self._lock:
             if (
@@ -204,7 +299,17 @@ class MarketAnchoredFitProvider:
             conn = self._connect()
             if conn is None:
                 return None
-            rows = load_fit_rows(conn, training_cutoff=training_cutoff)
+            if self._city_timezone_snapshot is None:
+                return None
+            rows = load_fit_rows(
+                conn,
+                training_cutoff=training_cutoff,
+                city_timezone_snapshot=(
+                    self._city_timezone_snapshot
+                    if self._lead_calendar_revision == LEAD_CALENDAR_REVISION
+                    else None
+                ),
+            )
         except Exception:  # noqa: BLE001 - an unavailable fit must never block serving
             return None
         # Each row is weighted 1/(claim count), so the training-row floor is
@@ -214,7 +319,13 @@ class MarketAnchoredFitProvider:
             return None
         cutoff_iso = training_cutoff.isoformat().replace("+00:00", "Z")
         try:
-            return fit(rows, lambda_=self._lambda, training_cutoff=cutoff_iso)
+            return fit(
+                rows,
+                lambda_=self._lambda,
+                training_cutoff=cutoff_iso,
+                lead_calendar_revision=self._lead_calendar_revision,
+                city_timezone_snapshot=self._city_timezone_snapshot,
+            )
         except Exception:  # noqa: BLE001 - a failed fit degrades to raw q, never raises
             return None
 
@@ -265,9 +376,10 @@ def corrected_probability(
     *,
     p0: float,
     q_raw: float,
-    decision_date: date,
     target_date: date,
     side: str,
+    city: str | None = None,
+    decision_at: datetime | None = None,
 ) -> tuple[float, str, float] | None:
     """Apply ``artifact`` to one candidate, or None when it cannot be applied.
 
@@ -290,6 +402,25 @@ def corrected_probability(
     """
 
     if artifact is None:
+        return None
+    artifact_revision = getattr(artifact, "lead_calendar_revision", UNBOUND_LEAD_CALENDAR_REVISION)
+    if artifact_revision == LEAD_CALENDAR_REVISION:
+        if (
+            not isinstance(decision_at, datetime)
+            or decision_at.tzinfo is None
+            or decision_at.utcoffset() is None
+            or not city
+        ):
+            return None
+        snapshot = getattr(artifact, "city_timezone_snapshot", None)
+        if not _snapshot_is_valid(snapshot):
+            return None
+        decision_date = _city_local_target_date(
+            decision_at, city, snapshot
+        )
+        if decision_date is None:
+            return None
+    else:
         return None
     lead_bucket = lead_bucket_of(decision_date, target_date)
     if lead_bucket is None:

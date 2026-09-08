@@ -2385,12 +2385,18 @@ files:
     zone: K3_extension
     authority_role: calibration_drift_detection
     why: Detects calibration degradation over time.
+  src/calibration/market_anchored_residual.py:
+    zone: K3_extension
+    authority_role: market_anchored_residual_calibrator
+    hazards:
+    - CALIBRATION_FAMILY_MIXING
+    why: "DB-agnostic market-anchored residual math and immutable artifact identity. Offline callers retain the UNBOUND calendar revision, while live artifacts bind the city-local target-date revision and sorted timezone snapshot into the parameter hash without changing the calibration formula or day0/day1/day2 policy."
   src/calibration/market_anchored_live_fit.py:
     zone: K3_extension
     authority_role: market_anchored_live_fit_provider
     hazards:
     - CALIBRATION_FAMILY_MIXING
-    why: "In-process TTL-cached fit of src/calibration/market_anchored_residual.py from settled settlement_attribution rows, for the live acting path. Deliberately writes NO artifact file: an artifact plus a separate refitter is a known local failure class (the refitter stops, the file goes stale, and every freshness check still passes) — an in-process cache cannot outlive its process, so staleness is TTL-bounded by construction. Trains only on rows settled strictly before the fit instant, so a live decision is never informed by an outcome unresolved when it was made. Every failure (too few rows, unreachable DB, unmodeled lead, non-finite input) returns None and the caller keeps its raw q."
+    why: "In-process TTL-cached fit of src/calibration/market_anchored_residual.py from settled settlement_attribution rows, for the live acting path. Deliberately writes NO artifact file: an artifact plus a separate refitter is a known local failure class (the refitter stops, the file goes stale, and every freshness check still passes) — an in-process cache cannot outlive its process, so staleness is TTL-bounded by construction. Trains only on rows settled strictly before the fit instant, so a live decision is never informed by an outcome unresolved when it was made. The live fit binds an immutable validated runtime city-timezone snapshot and derives the same city-local target-date boundary used by serving; UNBOUND or malformed calendar identity fails open. Every failure (too few rows, unreachable DB, unmodeled lead, non-finite input) returns None and the caller keeps its raw q."
     downstream:
     - src/engine/global_batch_runtime.py
   src/calibration/drift_detector.py:

@@ -6137,36 +6137,38 @@ def _selection_epoch_identity_with_preflight_exclusions(
     return digest.hexdigest()
 
 
-def _target_date_by_family(
+def _target_context_by_family(
     event_by_family: Mapping[str, object],
     *,
     payload_reader: Callable[[object], Mapping[str, object]],
-) -> dict[str, date]:
-    """Map family_key to its weather target date.
+) -> dict[str, tuple[str, date]]:
+    """Map family_key to the exact payload city and weather target date.
 
-    ``family_key`` is a hash of (city, target_date, metric), so the target date
-    cannot be read back out of it — it has to come from the event payload that
-    produced the family. A family whose payload lacks a parseable target_date is
-    omitted, which costs it the calibrator correction and nothing else.
+    The family key is opaque; neither city nor date is parsed from it. A family
+    whose event payload lacks either exact identity field is omitted, which
+    costs it the calibrator correction and nothing else.
     """
 
-    by_family: dict[str, date] = {}
+    by_family: dict[str, tuple[str, date]] = {}
     for family_key, event in event_by_family.items():
         try:
             payload = payload_reader(event)
+            city = payload.get("city")
+            if not isinstance(city, str) or not city:
+                continue
             target_date = date.fromisoformat(
                 str(payload.get("target_date") or "")[:10]
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             continue
-        by_family[str(family_key)] = target_date
+        by_family[str(family_key)] = (city, target_date)
     return by_family
 
 
 def _market_anchored_correction_resolver(
     world_conn,
     *,
-    target_date_by_family: Mapping[str, date],
+    target_context_by_family: Mapping[str, tuple[str, date]],
 ):
     """Build the per-candidate market-anchored correction resolver, or None.
 
@@ -6179,16 +6181,38 @@ def _market_anchored_correction_resolver(
     solver then keeps every raw q, which is the pre-calibrator behavior.
     """
 
-    if not target_date_by_family:
-        return None
     from src.calibration.market_anchored_live_fit import (
         MarketAnchoredFitProvider,
         corrected_probability,
         register_active_provider,
     )
     from src.contracts.payoff_q_correction import PayoffQCorrection
+    from src.config import runtime_cities_by_name
 
-    provider = MarketAnchoredFitProvider(lambda: world_conn)
+    if not target_context_by_family:
+        register_active_provider(None)
+        return None
+
+    try:
+        runtime_city_configs = runtime_cities_by_name()
+        if not isinstance(runtime_city_configs, Mapping):
+            raise TypeError("runtime city registry is not a mapping")
+        city_timezones = {
+            city: getattr(config, "timezone", "")
+            for city, config in runtime_city_configs.items()
+        }
+        provider = MarketAnchoredFitProvider(
+            lambda: world_conn,
+            city_timezones=city_timezones,
+        )
+    except (AttributeError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        register_active_provider(None)
+        _LOG.warning(
+            "MARKET_ANCHORED_CITY_SNAPSHOT_UNAVAILABLE:%s",
+            type(exc).__name__,
+        )
+        return None
+
     # Make this batch's provider reachable from Position.evaluate_exit (the
     # monitor path), which has no world connection of its own and must never
     # open one. The exit path reuses this cached provider instead of
@@ -6196,15 +6220,17 @@ def _market_anchored_correction_resolver(
     register_active_provider(provider)
 
     def resolve(candidate, raw_q: float, p0: float, decision_at_utc: datetime):
-        target_date = target_date_by_family.get(str(candidate.family_key))
-        if target_date is None:
+        target_context = target_context_by_family.get(str(candidate.family_key))
+        if target_context is None:
             return None
+        city, target_date = target_context
         artifact = provider.artifact(now=decision_at_utc)
         applied = corrected_probability(
             artifact,
             p0=p0,
             q_raw=raw_q,
-            decision_date=decision_at_utc.astimezone(timezone.utc).date(),
+            city=city,
+            decision_at=decision_at_utc,
             target_date=target_date,
             side=str(candidate.side),
         )
@@ -8043,7 +8069,7 @@ def process_current_global_batch(
             return reject(f"GLOBAL_CANDIDATE_PAYOFF_Q_LCB_CAPS_INVALID:{exc}")
         payoff_q_correction_resolver = _market_anchored_correction_resolver(
             world_conn,
-            target_date_by_family=_target_date_by_family(
+            target_context_by_family=_target_context_by_family(
                 full_scope_event_by_family,
                 payload_reader=payload_reader,
             ),
