@@ -1,5 +1,5 @@
 # Created: 2026-07-12
-# Last audited: 2026-07-12
+# Last audited: 2026-09-08
 # Authority basis: live DB evidence — ~27 position_current rows in the last 7d
 #   had a correctly booked realized_pnl_usd/exit_price at economic close
 #   (EXIT_ORDER_FILLED, phase=economically_closed) silently clobbered to 0.0
@@ -112,11 +112,15 @@ def _insert_position_current_row(
     conn.commit()
 
 
-def _load_single_position(conn: sqlite3.Connection, position_id: str):
+def _load_single_position(conn: sqlite3.Connection, position_id: str, *, cohort=False):
     from src.state.db import query_portfolio_loader_view
     from src.state.portfolio import _position_from_projection_row
 
-    snapshot = query_portfolio_loader_view(conn)
+    snapshot = query_portfolio_loader_view(
+        conn,
+        **({"settlement_cohort_only": True,
+            "target_families": [("Milan", "2026-07-08", "high")]} if cohort else {}),
+    )
     rows = [r for r in snapshot["positions"] if r["position_id"] == position_id]
     assert len(rows) == 1, f"expected exactly one loader row for {position_id}, got {len(rows)}"
     return _position_from_projection_row(rows[0], current_mode="live")
@@ -147,7 +151,8 @@ class TestBookedCloseEconomicsSurviveSettlementReload:
         )
         conn.close()
 
-    def test_settlement_after_reload_preserves_booked_realized_pnl(self):
+    @pytest.mark.parametrize("cohort", [False, True])
+    def test_settlement_after_reload_preserves_booked_realized_pnl(self, cohort):
         """End-to-end antibody: reload an economically_closed position through
         the real loader, run it through the settlement close path, and assert
         the re-projected position_current row + SETTLED event payload still
@@ -168,7 +173,7 @@ class TestBookedCloseEconomicsSurviveSettlementReload:
             realized_pnl_usd=-6.16,
             exit_price=0.27,
         )
-        pos = _load_single_position(conn, "pos-eco-settle")
+        pos = _load_single_position(conn, "pos-eco-settle", cohort=cohort)
         assert pos.state == "economically_closed"
 
         portfolio = PortfolioState(positions=[pos])

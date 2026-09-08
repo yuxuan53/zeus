@@ -2,7 +2,7 @@
 # Lifecycle: created=2026-03-31; last_reviewed=2026-09-03; last_reused=2026-09-03
 # Purpose: Lock live-money safety invariants across fill, exit, chain, and P&L flows.
 # Reuse: Run for execution finality, live exit, chain reconciliation, and safety invariant changes.
-# Last reused/audited: 2026-09-03
+# Last reused/audited: 2026-09-08
 # Authority basis: held-monitor canonical append liveness and atomicity incidents
 """Live safety invariant tests: relationship tests, not function tests.
 
@@ -290,7 +290,8 @@ def test_monitor_selection_hydrates_sibling_value_inputs_from_canonical_projecti
     )
 
 
-def test_targeted_monitor_scopes_canonical_projection_to_runtime_exposure():
+@pytest.mark.parametrize("scope", ["runtime_exposure", "settlement_cohort"])
+def test_targeted_monitor_scopes_canonical_projection_to_runtime_exposure(scope):
     """A family wake must not scan canonical history outside its loaded subset."""
     from src.engine import cycle_runtime
 
@@ -320,7 +321,7 @@ def test_targeted_monitor_scopes_canonical_projection_to_runtime_exposure():
         chain_shares=10.0,
     )
     portfolio = _make_portfolio(pos)
-    portfolio.authority_scope = "runtime_exposure"
+    portfolio.authority_scope = scope
     statements: list[str] = []
     conn.set_trace_callback(statements.append)
 

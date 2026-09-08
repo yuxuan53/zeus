@@ -1305,3 +1305,73 @@
   unrelated Ruff 37 diagnostics remain. Temporary example config removed.
   Full repository suite is not claimed. Deployment acceptance remains open
   until official preflight and loaded-SHA/current-cycle verification.
+
+### 2026-09-08 — settlement cohort hydration repair
+
+- Class: bounded bugfix, K2 resolver and canonical read model across state/execution.
+  Authoritative inputs are TRADE position_current plus append-only events,
+  VERIFIED forecasts settlement rows or existing exact finalized payout route.
+  Current read-only reproduction: 117/117 discovered verified families rejected
+  because version guard includes economically_closed but open loader omits them;
+  136 missing IDs all economically_closed. Exact four-phase family cohort gives
+  139 positions and 117/117 matching sets. Full load does not fix this (84/117).
+- Approved implementation scope: src/state/db.py, src/state/portfolio.py,
+  src/execution/harvester_pnl_resolver.py and existing focused test files. Add
+  settlement_cohort_only, requiring explicit nonempty target_families, mutually
+  exclusive with runtime/open/monitor views. SQL phase set is exactly active,
+  day0_window, pending_exit, economically_closed. Bounded load skips full-history
+  entry audit, suppression, recent exits and world attachment; retain row hydration
+  of booked exit_price and realized_pnl. Give result explicit settlement_cohort
+  authority_scope so it cannot masquerade as complete portfolio/risk capital.
+- Resolver obtains family keys through existing canonical helper, then loads
+  that cohort on its caller connection before fingerprint/discovery; empty keys
+  never trigger unrestricted load. Existing noncanonical test fallback remains.
+  Keep ID equality and all version checks, write lease/budget/transaction boundary,
+  SettlementSemantics, high/low identity, truth source selection and mark_settled
+  unchanged. No schema, lifecycle grammar, venue submit or redemption changes.
+- Required reads: root/scoped AGENTS, REVIEW, kernel/authority/invariants, source
+  rationale, settlement_semantics boot profile, current source/data pointers and
+  targeted loader/resolver source/tests. Current data snapshot is stale and is
+  not current source proof. This repairs cohort identity, not unit/rounding/source
+  policy; preserve actual source semantics, especially HIGH/LOW and Hong Kong.
+- Protected laws INV-01/02/08/37/47. SCOPE is four-phase members of exact families;
+  DRAIN existing harvester cadence and writer budget; RESET each becomes settled
+  and leaves next cohort. Missing sibling/poison row still fails equality.
+- Antibodies: pending_exit dust plus economically_closed siblings settle together;
+  booked realized exit economics survive reload and settlement; terminal siblings
+  excluded; no new open/runtime-view exposure; strict empty/unbounded/mixed-mode
+  rejection; no all-history metadata query or extra connection. Existing tests
+  for concurrent changes still reject stale candidates. Require failing-on-base
+  behavioral tests, focused resolver/loader plus applicable state required checks,
+  independent review and planning/map checks before verified hotfix cherry-pick.
+  Rollback isolated commit; keep entry pause and re-verify loaded SHA and actual
+  settlement events after deployment. Settlement events do not prove chain PnL.
+
+- Plan critic dispositions: add src/engine/cycle_runtime.py and existing monitor
+  test to scope; only full_portfolio may request unrestricted canonical monitor
+  rows. All other scopes remain ID-bounded. Empty settlement keys return existing
+  awaiting_truth_writer with no strict loader/write; noncanonical nonempty keys
+  also use exact cohort on caller connection. Loader/query/hydration failure must
+  never fall back to partial open portfolio. Existing noncanonical portfolio-key
+  discovery remains for legacy/test inputs only; no unrestricted history load.
+
+- Settlement cohort repair verification: ten new behavior/contract cases failed
+  on original HEAD, including HIGH/LOW resolver zero-settled defect, omitted
+  booked sibling and unrestricted monitor query. Fixed resolver23passed, booked
+  close7passed, bounded monitor2passed, cohort-loader9passed; related settlement
+  suites17passed. Full test_db105passed/22failed vs clean base96passed/same22failed;
+  failure nodeid difference empty. All16 required state/engine suites:135passed,
+  40failed,4skipped; same40failed on clean base, no new failed nodeids. Residual
+  baseline failures include existing savepoint, Day0, structural linter, observation
+  mocks and scheduler decorators; no broad clean-suite claim. Source compile,
+  diff, planning-lock and changed-surface map checks pass. Ruff same20baseline
+  diagnostics. Independent final review GO on4source+4test surfaces.
+- An initially added runtime/open mutual-exclusion rule was out of scope and
+  removed before final verification; only new settlement-cohort mode is exclusive.
+  All source changes are bounded read/hydration/consumer scope, no schema or
+  direct live truth mutation. Existing20/22/40failure surfaces remain unchanged.
+
+- Final read-only live-data probe using repaired loader:118family keys,139cohort
+  positions (137economically_closed+2pending_exit),117VERIFIEDrows and117/117
+  exact ID-set matches. No writer invoked; elapsed21.596s, so hydration/runtime
+  latency remains a measurement to track after landing, not declared solved.

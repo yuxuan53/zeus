@@ -1,5 +1,5 @@
 # Created: 2026-05-04
-# Last reused/audited: 2026-08-21
+# Last reused/audited: 2026-09-08
 # Authority basis: IOC forward-port (Fix C: allowed_discovery_modes_inverse) — 2026-05-23
 """Heavy runtime helpers extracted from cycle_runner.
 
@@ -4890,7 +4890,7 @@ def _monitoring_phase_positions(
         if str(getattr(pos, "trade_id", "") or "")
     }
     position_ids = None
-    if getattr(portfolio, "authority_scope", "full_portfolio") == "runtime_exposure":
+    if getattr(portfolio, "authority_scope", "full_portfolio") != "full_portfolio":
         position_ids = tuple(by_position_id)
     canonical_rows = _canonical_monitor_position_rows(
         conn,

@@ -1,4 +1,4 @@
-# Lifecycle: created=2026-04-30; last_reviewed=2026-08-13; last_reused=2026-08-13
+# Lifecycle: created=2026-04-30; last_reviewed=2026-09-08; last_reused=2026-09-08
 # Authority basis: docs/operations/task_2026-04-30_two_system_independence/design.md §5 Phase 1.5; docs/archive/2026-Q2/task_2026-05-16_deep_alignment_audit/REPORT.md Finding #4
 # W2 (2026-06-03): repointed from forecasts.settlements → forecasts.settlement_outcomes.
 """Trading-side P&L resolver (Phase 1.5 harvester split).
@@ -657,6 +657,25 @@ def resolve_pnl_for_settled_markets(trade_conn, forecasts_conn) -> dict:
         open_positions_only=True,
     )
     settlement_keys = _open_position_settlement_keys(trade_conn, portfolio)
+    if not settlement_keys:
+        if trade_conn.in_transaction:
+            trade_conn.rollback()
+        return {
+            "status": "awaiting_truth_writer",
+            "open_position_keys_checked": 0,
+            "positions_settled": 0,
+            "decision_log_rows_written": 0,
+            "errors": 0,
+        }
+    portfolio = load_portfolio(
+        connection=trade_conn,
+        settlement_cohort_only=True,
+        target_families=settlement_keys,
+    )
+    # SCOPE: selected settlement families. DRAIN: canonical loader recovers on
+    # the existing harvester cadence. RESET: authoritative cohort loads again.
+    if getattr(portfolio, "portfolio_loader_degraded", False) is True:
+        raise RuntimeError("SETTLEMENT_COHORT_NOT_AUTHORITATIVE")
     canonical = _is_canonical_trade_connection(trade_conn)
     position_versions = (
         _canonical_position_versions(trade_conn, settlement_keys)

@@ -1,5 +1,5 @@
 # Created: prior to 2026-04-26
-# Last reused or audited: 2026-08-14
+# Last reused or audited: 2026-09-08
 # Authority basis: Zeus DB schema + world_write_mutex CATEGORY ANTIBODY.
 #   2026-06-08 thepath/audit-realign Fitz #5 lock-CATEGORY kill: _apply_busy_timeout
 #   helper + SQL-level PRAGMA busy_timeout in _connect()/get_connection() so a
@@ -12453,7 +12453,14 @@ def query_portfolio_loader_view(
     open_positions_only: bool = False,
     target_families: Iterable[tuple[str, str, str]] | None = None,
     monitor_bootstrap_only: bool = False,
+    settlement_cohort_only: bool = False,
 ) -> dict:
+    if settlement_cohort_only:
+        if runtime_exposure_only or open_positions_only or monitor_bootstrap_only:
+            raise ValueError("settlement_cohort_only excludes runtime/open/monitor modes")
+        target_families = tuple(target_families or ())
+        if not target_families:
+            raise ValueError("settlement_cohort_only requires nonempty target_families")
     if monitor_bootstrap_only and not open_positions_only:
         raise ValueError("monitor_bootstrap_only requires open_positions_only=True")
     if conn is None:
@@ -12530,6 +12537,10 @@ def query_portfolio_loader_view(
         runtime_open_predicate = f"phase IN ({placeholders})"
         params.extend(OPEN_EXPOSURE_PHASES)
         predicates.append(runtime_open_predicate)
+    if settlement_cohort_only:
+        predicates.append(
+            "phase IN ('active', 'day0_window', 'pending_exit', 'economically_closed')"
+        )
     where_clause = f"WHERE {' AND '.join(predicates)}" if predicates else ""
 
     position_current_env_expr = (

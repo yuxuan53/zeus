@@ -1,5 +1,5 @@
 # Created: 2026-06-03
-# Last reused or audited: 2026-08-13
+# Last reused or audited: 2026-09-08
 # Authority basis: 守護 blocker — settlement_outcomes (VERIFIED truth) -> resolver ->
 #   position settled. Relationship test across the
 #   settlement_outcomes -> position_current boundary that the
@@ -937,3 +937,104 @@ def test_exact_condition_no_settles_only_matching_position(trade_conn, monkeypat
 
     assert settled == 1
     assert settled_calls == [("cape-17-yes", 0.0, "SETTLEMENT")]
+
+
+@pytest.mark.parametrize("metric", ["high", "low"])
+def test_resolver_hydrates_closed_siblings_with_pending_exit_dust(
+    trade_conn, forecasts_conn_with_verified_settlement, monkeypatch, metric
+):
+    from src.execution import harvester as hv
+    from src.execution import harvester_pnl_resolver as resolver
+    from src.state.portfolio import compute_settlement_close
+
+    forecasts_conn_with_verified_settlement.execute(
+        "UPDATE settlement_outcomes SET temperature_metric=?", (metric,)
+    )
+    forecasts_conn_with_verified_settlement.commit()
+    for position_id, phase in (("dust", "pending_exit"), ("closed", "economically_closed"), ("terminal", "settled")):
+        trade_conn.execute(
+            """INSERT INTO position_current (
+                position_id, trade_id, phase, market_id, city, cluster, target_date,
+                bin_label, direction, unit, shares, size_usd, cost_basis_usd,
+                entry_price, p_posterior, strategy_key, chain_state,
+                temperature_metric, updated_at, exit_price, realized_pnl_usd
+            ) VALUES (?, ?, ?, 'market', 'Shanghai', 'Asia', '2026-05-29',
+                      '27-28°C', 'buy_yes', 'C', 0.0027, 0.00135, 0.00135,
+                      0.5, 0.7, 'center_buy', 'synced', ?, 'before-writer', 0.27, -6.16)""",
+            (position_id, position_id, phase, metric),
+        )
+    trade_conn.commit()
+    monkeypatch.setattr(resolver, "_is_canonical_trade_connection", lambda _c: True)
+    monkeypatch.setattr(resolver, "_read_venue_resolved_settlement_rows", lambda *a, **kw: [])
+    monkeypatch.setattr("src.state.strategy_tracker.get_tracker", lambda: MagicMock())
+    monkeypatch.setattr("src.state.strategy_tracker.save_tracker", lambda *a, **kw: None)
+    monkeypatch.setattr("src.state.portfolio.save_portfolio", lambda *a, **kw: None)
+    monkeypatch.setattr("src.state.decision_chain.store_settlement_records", lambda *a, **kw: None)
+    monkeypatch.setattr("src.state.canonical_write.commit_then_export", lambda conn, *, db_op, json_exports: db_op())
+
+    @contextmanager
+    def writer(conn, *, canonical):
+        assert conn is trade_conn and canonical
+        conn.execute("BEGIN IMMEDIATE")
+        yield time.monotonic() + 5
+
+    monkeypatch.setattr(resolver, "_settlement_writer_transaction", writer)
+    closed_positions = []
+
+    def settle(conn, portfolio, *args, **kwargs):
+        assert conn is trade_conn
+        assert portfolio.authority_scope == "settlement_cohort"
+        assert {p.trade_id for p in portfolio.positions} == {"dust", "closed"}
+        for pos in list(portfolio.positions):
+            closed_positions.append(compute_settlement_close(portfolio, pos.trade_id, 1.0, "SETTLEMENT"))
+        return len(closed_positions)
+
+    monkeypatch.setattr(hv, "_settle_positions", settle)
+    result = resolver.resolve_pnl_for_settled_markets(trade_conn, forecasts_conn_with_verified_settlement)
+    assert result["positions_settled"] == 2
+    booked = next(p for p in closed_positions if p.trade_id == "closed")
+    assert booked.pnl == pytest.approx(-6.16)
+    assert booked.exit_price == pytest.approx(0.27)
+    assert all(p.state == "settled" for p in closed_positions)
+
+
+def test_resolver_empty_keys_never_loads_unbounded_settlement_cohort(trade_conn, monkeypatch):
+    from src.execution import harvester_pnl_resolver as resolver
+    from src.state.portfolio import PortfolioState
+    calls = []
+
+    def load(**kwargs):
+        calls.append(kwargs)
+        assert kwargs == {"connection": trade_conn, "open_positions_only": True}
+        return PortfolioState(positions=[])
+
+    monkeypatch.setattr("src.state.portfolio.load_portfolio", load)
+    result = resolver.resolve_pnl_for_settled_markets(trade_conn, MagicMock())
+    assert result["status"] == "awaiting_truth_writer"
+    assert result["open_position_keys_checked"] == 0
+    assert len(calls) == 1
+
+
+def test_resolver_refuses_to_settle_degraded_cohort_hydration(
+    trade_conn, forecasts_conn_with_verified_settlement, monkeypatch
+):
+    from src.execution import harvester as hv
+    from src.execution import harvester_pnl_resolver as resolver
+    from src.state.portfolio import PortfolioState
+
+    portfolio, _position = _winning_position()
+    degraded = PortfolioState(
+        positions=[], portfolio_loader_degraded=True, authority="degraded"
+    )
+    calls = iter((portfolio, degraded))
+    monkeypatch.setattr(
+        "src.state.portfolio.load_portfolio", lambda *args, **kwargs: next(calls)
+    )
+    monkeypatch.setattr(
+        hv, "_settle_positions",
+        lambda *args, **kwargs: pytest.fail("degraded cohort must not settle"),
+    )
+    with pytest.raises(RuntimeError, match="SETTLEMENT_COHORT_NOT_AUTHORITATIVE"):
+        resolver.resolve_pnl_for_settled_markets(
+            trade_conn, forecasts_conn_with_verified_settlement
+        )

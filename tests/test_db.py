@@ -1,5 +1,5 @@
 # Created: 2026-03-30
-# Last reused/audited: 2026-08-21
+# Last reused/audited: 2026-09-08
 # Lifecycle: created=2026-03-30; last_reviewed=2026-08-21; last_reused=2026-08-21
 # Purpose: Protect DB schema bootstrap contracts, daily revision-history DDL, and fact-smoke authority labels.
 # Reuse: Audit touched schema assertions and high-sensitivity skip metadata before closeout.
@@ -6159,3 +6159,96 @@ def test_update_trade_lifecycle_promotes_pending_row_to_entered(tmp_path):
     assert row["entered_at_ts"] == "2026-04-01T01:05:00Z"
     assert row["chain_state"] == "synced"
     assert row["order_status_text"] == "filled"
+
+
+@pytest.mark.parametrize("metric", ["high", "low"])
+def test_settlement_cohort_loader_is_bounded_and_preserves_closed_economics(tmp_path, monkeypatch, metric):
+    from src.state import portfolio as portfolio_module
+    from src.state.db import query_portfolio_loader_view
+
+    conn = get_connection(tmp_path / "settlement-cohort.db")
+    init_schema(conn)
+    phases = ("active", "day0_window", "pending_exit", "economically_closed",
+              "settled", "voided", "admin_closed", "pending_entry")
+    for phase in phases:
+        _insert_current_position_for_fill_authority_view_test(conn, position_id=phase, phase=phase)
+    conn.execute("UPDATE position_current SET temperature_metric=?", (metric,))
+    conn.execute("UPDATE position_current SET exit_price=0.27,realized_pnl_usd=-6.16 WHERE phase='economically_closed'")
+    _insert_current_position_for_fill_authority_view_test(conn, position_id="unrelated", phase="economically_closed")
+    conn.execute("UPDATE position_current SET city='Other' WHERE position_id='unrelated'")
+    conn.commit()
+    families = [("NYC", "2026-04-01", metric)]
+    expected = {"active", "day0_window", "pending_exit", "economically_closed"}
+    view = query_portfolio_loader_view(conn, settlement_cohort_only=True, target_families=families)
+    assert {r["position_id"] for r in view["positions"]} == expected
+    statements = []
+    conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(portfolio_module, "_query_edli_entry_proof_review_reasons", lambda *a, **kw: pytest.fail("full-history audit"))
+    state = portfolio_module.load_portfolio(connection=conn, settlement_cohort_only=True, target_families=families)
+    assert state.authority_scope == "settlement_cohort"
+    assert {p.trade_id for p in state.positions} == expected
+    closed = next(p for p in state.positions if p.trade_id == "economically_closed")
+    assert closed.exit_price == pytest.approx(0.27)
+    assert closed.pnl == pytest.approx(-6.16)
+    assert not any("ATTACH DATABASE" in statement for statement in statements)
+    open_view = query_portfolio_loader_view(conn, open_positions_only=True, target_families=families)
+    assert "economically_closed" not in {r["position_id"] for r in open_view["positions"]}
+    conn.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {}, {"target_families": []},
+    {"target_families": [("NYC", "2026-04-01", "high")], "open_positions_only": True},
+    {"target_families": [("NYC", "2026-04-01", "high")], "monitor_bootstrap_only": True},
+])
+def test_settlement_cohort_loader_rejects_unbounded_or_mixed_modes(kwargs):
+    from src.state.db import query_portfolio_loader_view
+    from src.state.portfolio import load_portfolio
+    with pytest.raises(ValueError, match="settlement_cohort_only"):
+        query_portfolio_loader_view(None, settlement_cohort_only=True, **kwargs)
+    with pytest.raises(ValueError, match="settlement_cohort_only"):
+        load_portfolio(settlement_cohort_only=True, **kwargs)
+
+
+def test_settlement_cohort_loader_rejects_runtime_exposure_mode():
+    from src.state.db import query_portfolio_loader_view
+
+    with pytest.raises(ValueError, match="settlement_cohort_only"):
+        query_portfolio_loader_view(
+            None, settlement_cohort_only=True, runtime_exposure_only=True,
+            target_families=[("NYC", "2026-04-01", "high")],
+        )
+
+
+def test_settlement_cohort_poison_hydration_fails_closed(tmp_path):
+    from src.state.portfolio import load_portfolio
+
+    conn = get_connection(tmp_path / "settlement-cohort-poison.db")
+    init_schema(conn)
+    _insert_current_position_for_fill_authority_view_test(
+        conn, position_id="poison", phase="economically_closed"
+    )
+    conn.execute("UPDATE position_current SET p_posterior='poison' WHERE position_id='poison'")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="SETTLEMENT_COHORT_ROW_INVALID"):
+        load_portfolio(
+            connection=conn,
+            settlement_cohort_only=True,
+            target_families=[("NYC", "2026-04-01", "high")],
+        )
+    conn.close()
+
+
+def test_degraded_loader_returns_fail_closed_state(tmp_path):
+    from src.state.portfolio import load_portfolio
+
+    conn = get_connection(tmp_path / "degraded-loader.db")
+    state = load_portfolio(
+        connection=conn,
+        settlement_cohort_only=True,
+        target_families=[("NYC", "2026-04-01", "high")],
+    )
+    assert state.positions == []
+    assert state.portfolio_loader_degraded is True
+    assert state.authority == "degraded"
+    conn.close()

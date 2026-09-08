@@ -1280,7 +1280,7 @@ class PortfolioState:
     # Names which canonical subset this read model carries. Runtime exposure
     # snapshots intentionally omit recovery/operator facts and must not be
     # mistaken for a complete portfolio view.
-    authority_scope: Literal["full_portfolio", "runtime_exposure"] = "full_portfolio"
+    authority_scope: Literal["full_portfolio", "runtime_exposure", "settlement_cohort"] = "full_portfolio"
 
     @property
     def initial_bankroll(self) -> float:
@@ -2227,14 +2227,22 @@ def load_portfolio(
     path: Optional[Path] = None,
     *,
     open_positions_only: bool = False,
+    settlement_cohort_only: bool = False,
     target_families: Collection[tuple[str, str, str]] | None = None,
     monitor_bootstrap_only: bool = False,
     connection: sqlite3.Connection | None = None,
     deadline_monotonic: float | None = None,
 ) -> PortfolioState:
     """Load canonical portfolio truth, optionally limited to runtime-open rows."""
-    if target_families is not None and not open_positions_only:
-        raise ValueError("target_families requires open_positions_only=True")
+    if settlement_cohort_only:
+        if open_positions_only or monitor_bootstrap_only:
+            raise ValueError("settlement_cohort_only excludes open/monitor modes")
+        target_families = tuple(target_families or ())
+        if not target_families:
+            raise ValueError("settlement_cohort_only requires nonempty target_families")
+    bounded_load = open_positions_only or settlement_cohort_only
+    if target_families is not None and not bounded_load:
+        raise ValueError("target_families requires open_positions_only or settlement_cohort_only")
     if monitor_bootstrap_only and not open_positions_only:
         raise ValueError("monitor_bootstrap_only requires open_positions_only=True")
     if (
@@ -2305,7 +2313,7 @@ def load_portfolio(
     entry_proof_review_reasons: dict[str, str] = {}
     try:
         attached = _attached_schema_names(conn)
-        if not open_positions_only and "world" not in attached and ZEUS_WORLD_DB_PATH.exists():
+        if not bounded_load and "world" not in attached and ZEUS_WORLD_DB_PATH.exists():
             try:
                 conn.execute("ATTACH DATABASE ? AS world", (str(ZEUS_WORLD_DB_PATH),))
             except sqlite3.OperationalError:
@@ -2316,17 +2324,18 @@ def load_portfolio(
         snapshot = query_portfolio_loader_view(
             conn,
             open_positions_only=open_positions_only,
+            settlement_cohort_only=settlement_cohort_only,
             target_families=target_families,
             monitor_bootstrap_only=monitor_bootstrap_only,
         )
-        if not open_positions_only:
+        if not bounded_load:
             entry_proof_review_reasons = _query_edli_entry_proof_review_reasons(
                 conn,
                 list(snapshot.get("positions", [])),
             )
             ignored_tokens = query_token_suppression_tokens(conn)
             chain_only_quarantines = query_chain_only_quarantine_rows(conn)
-        if not open_positions_only and snapshot.get("status") in ("ok", "partial_stale", "empty"):
+        if not bounded_load and snapshot.get("status") in ("ok", "partial_stale", "empty"):
             try:
                 settlement_rows = query_authoritative_settlement_rows(
                     conn,
@@ -2392,6 +2401,10 @@ def load_portfolio(
                 _position_from_projection_row(row, current_mode=current_mode)
             )
         except Exception as exc:  # noqa: BLE001 — poison row, contained loudly
+            if settlement_cohort_only:
+                # SCOPE: selected settlement cohort. DRAIN: canonical row repair
+                # and next harvester cadence. RESET: every cohort row hydrates.
+                raise RuntimeError("SETTLEMENT_COHORT_ROW_INVALID") from exc
             logger.error(
                 "load_portfolio: POISON projection row quarantined (position_id=%s "
                 "city=%s phase=%s chain_state=%s): %s",
@@ -2456,6 +2469,7 @@ def load_portfolio(
         chain_only_facts=chain_only_facts,
         authority="canonical_db",
         authority_scope=(
+            "settlement_cohort" if settlement_cohort_only else
             "runtime_exposure" if open_positions_only else "full_portfolio"
         ),
     )
