@@ -49,8 +49,8 @@ class Day0AdmissionContext:
     edge_survives_one_bin_stress: bool
     # diurnal-residual nowcast veto (gate 9). ``nowcast_q_held`` is the station
     # residual nowcast's probability that the HELD token pays; ``decision_price_held``
-    # is the same decision-time all-in price p0 the market-anchored correction anchors
-    # on. Both None on every candidate the artifact cannot serve — the gate is then
+    # is the selected order's all-in unit cost, separate from the gross calibration
+    # anchor p0. Both None on every candidate the artifact cannot serve — the gate is then
     # inert, which is its dormant default.
     nowcast_q_held: float | None = None
     nowcast_basis: str | None = None
@@ -167,8 +167,8 @@ def day0_live_admission_rejection_reason(ctx: Day0AdmissionContext) -> str | Non
     # windows, and the live day0_nowcast_entry positions in that set lost $292 on $962
     # over 30 days.
     #
-    # The comparison is against p0, the decision-time all-in price of the token we would
-    # HOLD — the same anchor the market-anchored correction uses — so the rule reads
+    # The comparison is against the selected order's all-in held-token cost, including
+    # fees independently of the gross market-anchored calibration input, so the rule reads
     # exactly as "the nowcast says this token is worth no more than its price". Both
     # inputs absent (artifact dormant, unparseable bin, no running extreme) leaves the
     # gate inert by construction.

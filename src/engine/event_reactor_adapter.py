@@ -22233,22 +22233,40 @@ def _day0_in_final_localday_noentry_window(
 def _day0_held_token_decision_price(
     actionable_payload: Mapping[str, object],
 ) -> float | None:
-    """p0 — the decision-time all-in unit cost of the token this candidate would HOLD.
+    """Return the sealed all-in held-token cost used by the Day0 seam.
 
-    Same anchor the market-anchored correction shrinks toward, read from the sealed
-    per-candidate record when one exists and from the global solve's expected fill price
-    otherwise. Both live in the qkernel economics cert, so this never re-prices anything.
+    Global expected cost and target shares are the economic authority. A
+    correction's p0 is a gross probability anchor and cannot authorize a cost
+    gate; only a legacy correction with no basis marker may supply its historical
+    all-in p0 when no sealed cost fields exist.
     """
 
     economics = actionable_payload.get("qkernel_execution_economics")
     if not isinstance(economics, Mapping):
         return None
+    has_cost = "global_expected_cost_usd" in economics
+    has_shares = "global_target_shares" in economics
+    if has_cost or has_shares:
+        if not (has_cost and has_shares):
+            return None
+        cost = _optional_float(economics.get("global_expected_cost_usd"))
+        shares = _optional_float(economics.get("global_target_shares"))
+        if (
+            cost is None
+            or shares is None
+            or cost <= 0.0
+            or shares <= 0.0
+            or not math.isfinite(cost / shares)
+            or cost / shares <= 0.0
+        ):
+            return None
+        return cost / shares
     correction = economics.get("market_anchored_correction")
     if isinstance(correction, Mapping) and correction.get("applied") is True:
         p0 = _optional_float(correction.get("p0"))
-        if p0 is not None:
+        if p0 is not None and correction.get("p0_basis") is None:
             return p0
-    return _optional_float(economics.get("global_expected_fill_price_before_fee"))
+    return None
 
 
 def _day0_nowcast_gap_native(

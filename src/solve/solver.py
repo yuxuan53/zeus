@@ -7051,14 +7051,13 @@ def select_global_single_order(
             or candidate.settlement_locked_exact_payoff
         ):
             return None
-        # p0 is the decision-time all-in unit cost of THIS token: what the
-        # market charges for the claim, i.e. its implied probability the claim
-        # pays. It shares the held-token space with raw_q, so the two are
-        # directly comparable in the calibrator's logit residual.
+        # p0 is the decision-time gross unit fill price of THIS token: the
+        # market's probability anchor for the claim. Fees stay on the economic
+        # cost curve and are excluded from the calibrator's logit residual.
         curve = candidate.economic_cost_curve
         if not curve.levels:
             return None
-        p0 = float(curve.fee_model.all_in_price(curve.levels[0].price))
+        p0 = float(curve.levels[0].price)
         if not math.isfinite(p0) or not 0.0 < p0 < 1.0:
             return None
         try:

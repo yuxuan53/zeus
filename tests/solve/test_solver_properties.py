@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 import math
 from types import SimpleNamespace
@@ -29,6 +29,14 @@ from src.contracts.execution_intent import (
     quantize_submit_shares_for_venue,
     quantize_submit_shares_for_venue_at_most,
     venue_submit_amount_precision_error,
+)
+from src.calibration.market_anchored_live_fit import corrected_probability
+from src.calibration.market_anchored_residual import (
+    CLIP_D,
+    LEAD_BUCKETS,
+    P_CLIP_HI,
+    P_CLIP_LO,
+    ResidualCalibratorArtifact,
 )
 from src.solve import solver as S
 ALPHA = 0.05
@@ -6293,8 +6301,8 @@ def test_correction_naming_a_superseded_raw_q_is_refused():
     assert decision == baseline
 
 
-def test_correction_resolver_receives_the_raw_q_and_the_all_in_market_price():
-    """p0 is the fee-inclusive unit cost of this token, in the same space as q."""
+def test_correction_resolver_receives_the_raw_q_and_gross_market_price():
+    """p0 anchors calibration to the gross forecast/book probability price."""
 
     seen = []
     candidate = _global_candidate(
@@ -6302,7 +6310,7 @@ def test_correction_resolver_receives_the_raw_q_and_the_all_in_market_price():
         family="args-family",
         side="YES",
         q=0.90,
-        levels=(("0.35", "100"),),
+        levels=(("0.35", "1000000"),),
         fee="0.02",
     )
 
@@ -6316,8 +6324,154 @@ def test_correction_resolver_receives_the_raw_q_and_the_all_in_market_price():
     raw_q, p0, at = seen[0]
     assert raw_q == pytest.approx(0.90)
     curve = candidate.economic_cost_curve
-    assert p0 == pytest.approx(
-        float(curve.fee_model.all_in_price(curve.levels[0].price))
-    )
-    assert p0 > 0.35  # fee-inclusive, strictly above the raw level price
+    assert p0 == pytest.approx(float(curve.levels[0].price))
+    assert p0 == pytest.approx(0.35)  # fees stay on the economic cost curve
     assert at == _DECISION_AT
+
+
+@pytest.mark.parametrize("side", ("YES", "NO"))
+def test_correction_anchor_is_fee_invariant_and_corrected_q_stays_invariant(side):
+    seen: list[tuple[float, float]] = []
+    corrected: list[float] = []
+    certificates = []
+    artifact = ResidualCalibratorArtifact(
+        alpha={"day0": 0.05, "day1": 0.10, "day2": 0.15},
+        beta=0.0,
+        lambda_=10.0,
+        clip_d=CLIP_D,
+        p_clip=(P_CLIP_LO, P_CLIP_HI),
+        lead_buckets=LEAD_BUCKETS,
+        training_cutoff="2026-07-09T00:00:00Z",
+        n_train=543,
+        n_excluded=0,
+        excluded_reasons={},
+        param_hash="gross-anchor-artifact",
+        lead_calendar_revision="city_local_target_date_v1",
+        city_timezone_snapshot=(("Chicago", "UTC"),),
+    )
+
+    for fee in ("0", "0.02", "0.05"):
+        candidate = _global_candidate(
+            candidate_id=f"gross-anchor-{fee}",
+            family=f"gross-anchor-{fee}",
+            side=side,
+            q=0.90,
+            levels=(("0.35", "1000000"),),
+            fee=fee,
+        )
+
+        def record(candidate, raw_q, p0, at):
+            seen.append((raw_q, p0))
+            applied = corrected_probability(
+                artifact,
+                p0=p0,
+                q_raw=raw_q,
+                city="Chicago",
+                decision_at=at,
+                target_date=date(2026, 7, 11),
+                side=candidate.side,
+            )
+            assert applied is not None
+            corrected.append(applied[0])
+            correction = _correction_for(
+                candidate,
+                raw_q=raw_q,
+                corrected_q=applied[0],
+                p0=p0,
+            )
+            certificates.append(correction)
+            return correction
+
+        decision = _global_select(
+            (candidate,),
+            payoff_q_correction_resolver=record,
+            cap="1000",
+        )
+        assert decision.payoff_q_correction is not None or side == "NO"
+
+    assert [raw_q for raw_q, _p0 in seen] == pytest.approx([0.90] * 3)
+    assert [p0 for _raw_q, p0 in seen] == pytest.approx([0.35] * 3)
+    assert corrected == pytest.approx([corrected[0]] * 3)
+    assert all(
+        correction.as_cert_fields()["p0_basis"] == "GROSS_NATIVE_TOKEN_PRICE"
+        for correction in certificates
+    )
+
+
+def test_fee_changes_all_in_cost_and_reduces_unconstrained_stake_and_ev():
+    decisions = []
+    for fee in ("0", "0.02", "0.05"):
+        candidate = _global_candidate(
+            candidate_id=f"fee-economics-{fee}",
+            family=f"fee-economics-{fee}",
+            side="YES",
+            q=0.55,
+            levels=(("0.35", "1000000"),),
+            fee=fee,
+        )
+        decisions.append(
+            _global_select(
+                (candidate,),
+                floor="10000",
+                ceiling="10000",
+                cash="10000",
+                cap="10000",
+            )
+        )
+
+    assert all(decision.candidate is not None for decision in decisions)
+    unit_costs = [decision.cost_usd / decision.shares for decision in decisions]
+    assert unit_costs == pytest.approx(
+        [Decimal("0.35"), Decimal("0.35455"), Decimal("0.361375")]
+    )
+    assert decisions[0].shares > decisions[1].shares > decisions[2].shares
+    expected_ev = [
+        decision.expected_terminal_wealth.expected_ev_usd
+        for decision in decisions
+    ]
+    assert expected_ev[0] > expected_ev[1] > expected_ev[2]
+    assert decisions[0].shares < Decimal("10000")
+
+
+@pytest.mark.parametrize("side", ("YES", "NO"))
+def test_fee_inclusive_near_breakeven_rejects_both_sides(side):
+    no_fee = _global_candidate(
+        candidate_id=f"near-breakeven-no-fee-{side}",
+        family=f"near-breakeven-no-fee-{side}",
+        side=side,
+        q=0.36,
+        levels=(("0.35", "1000000"),),
+        fee="0",
+    )
+    fee = _global_candidate(
+        candidate_id=f"near-breakeven-fee-{side}",
+        family=f"near-breakeven-fee-{side}",
+        side=side,
+        q=0.36,
+        levels=(("0.35", "1000000"),),
+        fee="0.05",
+    )
+
+    admitted = _global_select(
+        (no_fee,),
+        floor="1000",
+        ceiling="1000",
+        cash="1000",
+        cap="1000",
+    )
+    rejected = _global_select(
+        (fee,),
+        floor="1000",
+        ceiling="1000",
+        cash="1000",
+        cap="1000",
+    )
+
+    assert admitted.candidate is no_fee
+    assert admitted.expected_terminal_wealth is not None
+    assert admitted.expected_terminal_wealth.expected_ev_usd > 0.0
+    assert rejected.candidate is None
+    assert rejected.no_trade_reason == "NO_CURRENT_EXECUTABLE_POSITIVE_ORDER"
+    assert rejected.rejection_reasons[fee.candidate_id] == (
+        "NON_POSITIVE_EXPECTED_OBJECTIVE"
+    )

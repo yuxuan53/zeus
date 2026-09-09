@@ -31,8 +31,8 @@
 #     src.cron.settlement_attribution.open_world_with_forecasts (WORLD main +
 #     forecasts ATTACHed read-only, INV-37).
 #   - Market-implied probability semantic reused from
-#     src.strategy.live_inference.market_anchor (the all-in execution price IS the
-#     market's implied probability of the held token paying).
+#     src.strategy.live_inference.market_anchor (the gross fill price IS the
+#     market's implied probability of the held token paying; fees are separate).
 """settlement_skill_attribution — grade every settled position into a skill category.
 
 WHY THIS EXISTS
@@ -355,8 +355,9 @@ def _q_in_bin_from_position(direction: str, q_held: Optional[float]) -> Optional
 def _market_in_bin_prob(direction: str, avg_fill_price: Optional[float]) -> Optional[float]:
     """Market-implied probability the settle lands IN the traded bin.
 
-    The all-in execution price IS the market's implied probability the held token
-    pays (market_anchor semantic). Map via the Direction Law:
+    The gross fill price IS the market's implied probability the held token pays
+    (market_anchor semantic); fees are separate economic costs. Map via the
+    Direction Law:
       - buy_yes: the held YES token pays iff settled_in_bin → market P(in_bin) = price.
       - buy_no:  the held NO token pays iff NOT settled_in_bin → market P(in_bin) = 1 - price.
     Returns None when the fill price is absent.

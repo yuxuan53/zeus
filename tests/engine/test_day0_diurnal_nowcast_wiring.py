@@ -1,5 +1,5 @@
 # Created: 2026-09-04
-# Last reused or audited: 2026-09-04
+# Last reused or audited: 2026-09-09
 # Authority basis: diurnal-residual study 2026-09-04 (REPORT.md §5) — the veto is only
 #   real if the reactor actually assembles the nowcast context at the live submit seam
 #   and stamps the verdict where an audit can find it.
@@ -102,6 +102,8 @@ def _action_payload(
         "live_authority_status": "live",
         "qkernel_execution_economics": {
             "global_expected_fill_price_before_fee": "0.90",
+            "global_expected_cost_usd": "0.90",
+            "global_target_shares": "1",
         },
     }
 
@@ -205,6 +207,8 @@ def test_admission_seam_admits_when_the_price_is_below_the_nowcast(
     payload = _action_payload(bin_label=FLOOR_RANGE_BIN)
     payload["qkernel_execution_economics"] = {
         "global_expected_fill_price_before_fee": "0.05",
+        "global_expected_cost_usd": "0.05",
+        "global_target_shares": "1",
     }
     stamp_day0_diurnal_nowcast(
         payload, event_payload=_event().payload, decision_time=DECISION_TIME
@@ -221,6 +225,43 @@ def test_admission_seam_admits_when_the_price_is_below_the_nowcast(
     assert reason is None
 
 
+@pytest.mark.parametrize("direction", ["buy_yes", "buy_no"])
+def test_admission_seam_vetoes_fee_cost_above_nowcast_with_lower_gross_anchor(
+    installed_nowcast, direction,
+) -> None:
+    # Each side survives the existing +1 quantum stress before reaching the cost gate.
+    bin_label = (
+        FLOOR_RANGE_BIN if direction == "buy_yes" else
+        "Will the highest temperature in Manila be between 34-35°C on July 2?"
+    )
+    payload = _action_payload(direction=direction, bin_label=bin_label)
+    stamp_day0_diurnal_nowcast(
+        payload, event_payload=_event().payload, decision_time=DECISION_TIME
+    )
+    q_held = payload[DAY0_NOWCAST_Q_HELD_KEY]
+    gross = q_held - 0.01
+    all_in = q_held + 0.01
+    payload["qkernel_execution_economics"] = {
+        "global_expected_fill_price_before_fee": str(gross),
+        "global_expected_cost_usd": str(all_in * 5),
+        "global_target_shares": "5",
+        "market_anchored_correction": {
+            "applied": True,
+            "p0": gross,
+            "p0_basis": "GROSS_NATIVE_TOKEN_PRICE",
+        },
+    }
+    assert gross < q_held < all_in
+    assert _day0_live_submit_admission_rejection_reason(
+        event=_event(),
+        actionable_payload=payload,
+        authority_witness=_witness(),
+        order_mode="maker",
+        decision_time=DECISION_TIME,
+    ) == "DAY0_DIURNAL_NOWCAST_VETO"
+    assert _day0_held_token_decision_price(payload) == pytest.approx(all_in)
+
+
 def test_sealed_market_anchored_p0_wins_over_the_global_fill_price() -> None:
     payload = _action_payload()
     payload["qkernel_execution_economics"] = {
@@ -233,7 +274,43 @@ def test_sealed_market_anchored_p0_wins_over_the_global_fill_price() -> None:
     payload["qkernel_execution_economics"]["market_anchored_correction"] = {
         "applied": False
     }
-    assert _day0_held_token_decision_price(payload) == pytest.approx(0.40)
+    # The pre-basis correction is a legacy all-in p0 fallback; an uncorrected
+    # gross fill price alone is not a sealed economic cost authority.
+    assert _day0_held_token_decision_price(payload) is None
+
+
+def test_gross_correction_basis_cannot_substitute_for_sealed_cost() -> None:
+    payload = _action_payload()
+    economics = payload["qkernel_execution_economics"]
+    economics.pop("global_expected_cost_usd")
+    economics.pop("global_target_shares")
+    economics["market_anchored_correction"] = {
+        "applied": True,
+        "p0": 0.77,
+        "p0_basis": "GROSS_NATIVE_TOKEN_PRICE",
+    }
+    assert _day0_held_token_decision_price(payload) is None
+    economics["market_anchored_correction"]["p0_basis"] = "FOREIGN_PRICE_BASIS"
+    assert _day0_held_token_decision_price(payload) is None
+
+    economics["global_expected_cost_usd"] = "0.90"
+    economics["global_target_shares"] = "1"
+    assert _day0_held_token_decision_price(payload) == pytest.approx(0.90)
+
+    for invalid in (
+        {"global_expected_cost_usd": "0.90"},
+        {"global_target_shares": "1"},
+        {"global_expected_cost_usd": "not-a-number", "global_target_shares": "1"},
+        {"global_expected_cost_usd": "0.90", "global_target_shares": "not-a-number"},
+        {"global_expected_cost_usd": "0", "global_target_shares": "1"},
+        {"global_expected_cost_usd": "0.90", "global_target_shares": "0"},
+    ):
+        invalid_payload = _action_payload()
+        invalid_economics = invalid_payload["qkernel_execution_economics"]
+        invalid_economics.pop("global_expected_cost_usd")
+        invalid_economics.pop("global_target_shares")
+        invalid_economics.update(invalid)
+        assert _day0_held_token_decision_price(invalid_payload) is None
 
 
 def test_dormant_loader_leaves_the_payload_unstamped_and_the_gate_inert(

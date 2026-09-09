@@ -39,8 +39,9 @@ class PayoffQCorrection:
     ``raw_q`` and ``corrected_q`` are both in the HELD-TOKEN space — the
     probability that the candidate's own token pays — which is the space the
     solver sizes in and the certificate asserts on. ``p0`` is the decision-time
-    all-in market unit cost of that same token, i.e. the market's implied
-    probability it pays, and is the anchor the correction shrinks toward.
+    gross native fill price of that same token, i.e. the market's implied
+    probability it pays, and is the anchor the correction shrinks toward. Fees
+    belong to the economic cost curve.
 
     The remaining fields are provenance for settlement attribution to later
     grade corrected-versus-raw decisions; nothing downstream computes from them.
@@ -110,6 +111,7 @@ class PayoffQCorrection:
             "q_raw": float(self.raw_q),
             "q_corrected": float(self.corrected_q),
             "p0": float(self.p0),
+            "p0_basis": "GROSS_NATIVE_TOKEN_PRICE",
             "lead_bucket": self.lead_bucket,
             "alpha_lead": float(self.alpha_lead),
             "beta": float(self.beta),
