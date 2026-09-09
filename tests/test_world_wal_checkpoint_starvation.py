@@ -1,5 +1,5 @@
 # Created: 2026-06-04
-# Last reused or audited: 2026-07-27
+# Last reused or audited: 2026-09-09
 # Authority basis: docs/operations/HANDOFF_2026-06-04_live_restart_arm.md
 #   + critic-proven root: zeus-world.db WAL bloat = checkpoint-starvation by
 #     long-lived reader connections pinning the WAL floor (NOT I/O under the
@@ -8,7 +8,7 @@
 #     (checkpointed_frames < log_frames) and never truncates. Correction
 #     2026-07-21 (audit finding W5-2): PASSIVE's busy field is ALWAYS 0 — it
 #     is 1 only for a blocked RESTART/FULL/TRUNCATE checkpoint, never PASSIVE.
-# Lifecycle: created=2026-06-04; last_reviewed=2026-07-27; last_reused=2026-07-27
+# Lifecycle: created=2026-06-04; last_reviewed=2026-09-09; last_reused=2026-09-09
 # Purpose: RED→GREEN relationship test for the WAL checkpoint-starvation fix.
 #   Proves the MECHANISM (a reader that never ends its read transaction pins
 #   the WAL floor so TRUNCATE returns BUSY and the WAL stays large) AND the FIX
@@ -16,6 +16,8 @@
 #   fully drained the WAL truncates the file to ~zero).
 # Reuse: run on any PR touching src/state/db.py checkpoint helpers, the EDLI
 #   reactor read-connection lifecycle, or the checkpoint scheduler job.
+#   2026-09-09 WAL retention factory reset antibody for normal and no-bootstrap
+#   connections, with physical SQLite reader-release and rollback proof.
 
 """WAL checkpoint-starvation relationship test.
 
@@ -259,6 +261,97 @@ def test_truncate_checkpointed_wal_defers_to_pinned_reader(tmp_path: Path) -> No
     assert _wal_size_bytes(world_db) >= wal_before * 0.5
     reader.close()
     writer.close()
+
+
+@pytest.mark.parametrize(
+    "without_journal_bootstrap",
+    (False, True),
+    ids=("normal_factory", "without_journal_bootstrap_factory"),
+)
+def test_factory_wal_retention_bounds_reset_after_reader_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    without_journal_bootstrap: bool,
+) -> None:
+    """Factory connections retain a bounded WAL after a pinned-reader burst.
+
+    The reader must continue seeing its old snapshot while the writer commits
+    the burst. Once the reader releases that snapshot, PASSIVE drains the WAL;
+    the next small write performs SQLite's WAL reset and applies the retained
+    allocation bound. The same writer then remains usable for row-count,
+    integrity, and rollback checks.
+    """
+    from src.state import db as db_module
+
+    db_path = tmp_path / "zeus-world.db"
+    retained_bytes = 8192
+    # ``raising=False`` keeps the baseline replay meaningful: the old source
+    # has no shared constant, so it must reach the physical WAL-size assertion
+    # rather than fail while constructing the test.
+    monkeypatch.setattr(db_module, "WAL_RETAINED_BYTES", retained_bytes, raising=False)
+
+    if without_journal_bootstrap:
+        seed = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            seed.execute("PRAGMA journal_mode=WAL")
+            seed.execute("PRAGMA wal_autocheckpoint=0")
+            seed.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            seed.execute("INSERT INTO t(payload) VALUES ('old')")
+            seed.commit()
+        finally:
+            seed.close()
+        writer = db_module.connect_existing_trade_db_without_journal_bootstrap(
+            db_path
+        )
+    else:
+        monkeypatch.setattr(db_module, "ZEUS_WORLD_DB_PATH", db_path)
+        writer = db_module.get_world_connection()
+        writer.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        writer.execute("INSERT INTO t(payload) VALUES ('old')")
+        writer.commit()
+
+    reader = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        assert writer.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("PRAGMA wal_autocheckpoint=0")
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM t").fetchone() == (1,)
+
+        for _ in range(1000):
+            writer.execute("INSERT INTO t(payload) VALUES (?)", ("x" * 400,))
+        writer.commit()
+        wal_path = Path(f"{db_path}-wal")
+        burst_bytes = wal_path.stat().st_size
+        assert burst_bytes > retained_bytes
+        starved = writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        assert starved[2] < starved[1]
+        assert reader.execute("SELECT COUNT(*) FROM t").fetchone() == (1,)
+
+        reader.rollback()
+        passive = writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        assert passive[0] == 0 and passive[1] == passive[2]
+
+        writer.execute("INSERT INTO t(payload) VALUES ('small')")
+        writer.commit()
+        assert wal_path.stat().st_size <= retained_bytes
+        assert writer.execute("PRAGMA journal_size_limit").fetchone()[0] == retained_bytes
+        expected_rows = 1002
+        assert writer.execute("SELECT COUNT(*) FROM t").fetchone()[0] == expected_rows
+
+        writer.execute("INSERT INTO t(payload) VALUES ('rolled-back')")
+        writer.rollback()
+        assert writer.execute("SELECT COUNT(*) FROM t").fetchone()[0] == expected_rows
+        assert writer.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        reader.close()
+        writer.close()
 
 
 # ---------------------------------------------------------------------------

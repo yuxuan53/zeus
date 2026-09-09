@@ -84,6 +84,7 @@ from src.state.db import (
     get_trade_connection,
     get_family_book_evidence_connection,
     get_world_connection_read_only,
+    WAL_RETAINED_BYTES,
 )
 from src.state.portfolio import load_portfolio
 
@@ -8923,7 +8924,7 @@ _WAL_STARVATION_BACKLOG_BYTES = 512 * 1024 * 1024  # 512 MiB of un-checkpointed 
 # normal checkpoint mode: only an already-fully-drained WAL at or above this
 # size gets one fail-fast reset attempt.  At most three canonical WALs can hold
 # this maintenance band between the staggered 90-second jobs.
-_WAL_IDLE_TRUNCATE_BYTES = 64 * 1024 * 1024
+_WAL_IDLE_TRUNCATE_BYTES = WAL_RETAINED_BYTES
 
 
 def _wal_allocated_bytes(db_path: Path) -> int:

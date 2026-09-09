@@ -89,6 +89,9 @@ ZEUS_WORLD_DB_PATH = STATE_DIR / "zeus-world.db"  # Shared world data (settlemen
 ZEUS_FORECASTS_DB_PATH = STATE_DIR / "zeus-forecasts.db"  # K1 split 2026-05-11: forecast/harvester-truth class
 ZEUS_BACKTEST_DB_PATH = STATE_DIR / "zeus_backtest.db"  # Derived audit output; never runtime authority
 RISK_DB_PATH = STATE_DIR / "risk_state.db"  # Single risk DB (live-only)
+# Keep a fully drained WAL's allocation bounded across its next reset.  This is
+# a SQLite connection retention hint, not an outstanding-WAL backlog limit.
+WAL_RETAINED_BYTES = 64 * 1024 * 1024
 # book_snapshot_persistence DB split (2026-08-19): family-book decision-time
 # evidence (family_book_states/family_book_observations) lives on its OWN
 # physical file, never zeus_trades.db. It was originally trade-class
@@ -308,6 +311,9 @@ def _connect(
             return conn.execute(sql)
 
         execute_with_deadline("PRAGMA journal_mode=WAL")
+        execute_with_deadline(
+            f"PRAGMA journal_size_limit = {WAL_RETAINED_BYTES}"
+        )
         execute_with_deadline("PRAGMA foreign_keys=ON")
         # 2026-05-12 antibody (cold-cache K3 partial fix): bump page cache to 1 GB
         # so the hot working set of large forecast tables stays resident across
@@ -368,6 +374,7 @@ def _connect_existing_db_without_journal_bootstrap(
     )
     try:
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA journal_size_limit = {WAL_RETAINED_BYTES}")
         conn.execute("PRAGMA foreign_keys=ON")
         _install_connection_functions(conn)
         _apply_busy_timeout(conn, busy_timeout_ms=timeout_ms)
