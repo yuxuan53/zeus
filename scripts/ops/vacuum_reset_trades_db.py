@@ -1,6 +1,8 @@
 # Created: 2026-08-25
-# Last reused or audited: 2026-08-25
+# Last reused or audited: 2026-09-09
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md item 13
+#   Slice C source-content-bound cutover repair; exercised only against tiny
+#   disposable fixtures, never against live zeus_trades.db.
 #   (bounded-by-construction storage redesign, Slice C). Writer-plane fence pattern
 #   is scripts/migrations/2026_07_quarantine_phase_retirement.py's
 #   _live_zeus_processes/_assert_writer_plane_fenced (T5 migration), reused near-
@@ -10,11 +12,9 @@
 #   output. Precondition style (open-position gate, backup-ack, FK-ordered/staged
 #   execution) follows scripts/ops/archive_pre_epoch_trades.py.
 #
-# THIS SCRIPT HAS NEVER BEEN RUN. It is documentation-grade: written, reviewed by
-# read, syntax-checked, and its precondition/assertion LOGIC unit-tested against
-# tiny fixture files (tests/test_vacuum_reset_trades_db.py) -- but --vacuum-into and
-# --swap have never executed against any real database, live or otherwise. An
-# operator runs this once, by hand, in a maintenance window.
+# This script has only been exercised against disposable tiny SQLite fixtures;
+# --vacuum-into and --swap have never executed against zeus_trades.db or any
+# live database. An operator runs this once, by hand, in a maintenance window.
 """One-time VACUUM reset for zeus_trades.db: the only way freed retention pages
 (from items 11-13's DELETE-based retention, all of which leave auto_vacuum=0's
 freelist internal rather than shrinking the file) actually return to the OS.
@@ -30,8 +30,9 @@ inspect between each:
                         write by this phase), integrity-checks DEST, converts
                         DEST to auto_vacuum=INCREMENTAL (see AUTO_VACUUM
                         CONVERSION below), and writes a receipt JSON recording
-                        DEST's path + sha256 + row counts per table + the
-                        integrity-check result. Does NOT touch the live file.
+                        DEST's path + sha256, source content/path binding, row
+                        counts per table, and the integrity-check result. Does
+                        NOT touch the live file.
   3. --swap DEST --operator-confirms-fenced
                         Requires a receipt from phase 2 proving DEST passed
                         integrity check, the writer-plane fence (see below),
@@ -41,7 +42,8 @@ inspect between each:
                         place, and re-verifies integrity on the file now at the
                         live path before declaring success. On ANY failure
                         after the live path has been touched, restores the
-                        original file from the pre-swap rename.
+                        original database and any source WAL/SHM sidecars from
+                        the pre-swap rename.
 
 PRECONDITIONS (checked by --check and re-checked by every later phase):
   - Writer-plane fenced: --operator-confirms-fenced (required, no default) PLUS
@@ -76,11 +78,11 @@ SIZE ASSERTIONS (phase 2, after VACUUM INTO):
   - DEST size > SOURCE size * MIN_PLAUSIBLE_RATIO (0.05) -- guards against a
     catastrophically incomplete copy silently passing a naive "smaller is
     good" check.
-  - Per-table row counts in DEST match the source AT THE MOMENT OF THE VACUUM
-    (a live DB can gain rows between the count and the vacuum; this compares
-    against a fresh count taken from the SAME read-only connection used for
-    VACUUM INTO, immediately before it, so no writer can race between them --
-    the source connection is opened once and reused for both).
+  - Per-table row counts in DEST match the source view used for VACUUM INTO.
+    The count and VACUUM INTO use one read-only connection, but SQLite does not
+    make those separate statements a cross-statement snapshot. A same-connection
+    data_version plus stable main/WAL content binding is checked before and
+    after VACUUM INTO, and swap revalidates that binding.
 
 AUTO_VACUUM CONVERSION: `PRAGMA auto_vacuum=INCREMENTAL` is set on the
 connection BEFORE `VACUUM INTO` runs, which (per SQLite's VACUUM semantics --
@@ -181,6 +183,97 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _stable_file_binding(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {
+            "exists": False,
+            "st_dev": None,
+            "st_ino": None,
+            "size_bytes": None,
+            "sha256": None,
+        }
+    try:
+        with open(path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+        path_after = path.stat()
+    except OSError as exc:
+        raise PreconditionError(f"REFUSED: source file binding failed for {path}: {exc}") from exc
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    identity_path = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+    )
+    if identity_before != identity_after or identity_after != identity_path:
+        raise PreconditionError(f"REFUSED: source file changed while hashing: {path}")
+    result: dict[str, object] = {
+        "exists": True,
+        "st_dev": int(after.st_dev),
+        "st_ino": int(after.st_ino),
+        "size_bytes": int(after.st_size),
+        "sha256": digest.hexdigest(),
+    }
+    return result
+
+
+def _source_file_binding(db_path: Path) -> dict[str, object]:
+    resolved = db_path.resolve()
+    main = _stable_file_binding(db_path)
+    if not main["exists"]:
+        raise PreconditionError(f"REFUSED: source database not found: {db_path}")
+    wal = Path(str(db_path) + "-wal")
+    return {
+        "resolved_path": str(resolved),
+        "main": main,
+        "wal": _stable_file_binding(wal),
+    }
+
+
+def _source_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    return Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")
+
+
+def _assert_candidate_has_no_sidecars(dest: Path) -> None:
+    present = [str(path) for path in _source_sidecar_paths(dest) if path.exists()]
+    if present:
+        raise PreconditionError(
+            "REFUSED: VACUUM INTO candidate has unexpected sidecar(s): "
+            + ", ".join(present)
+        )
+
+
+def _same_path_or_file(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def _data_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA data_version").fetchone()[0])
+
+
 # ---------------------------------------------------------------------------
 # Writer-plane fence (T5 pattern)
 # ---------------------------------------------------------------------------
@@ -232,6 +325,40 @@ def assert_writer_plane_fenced(operator_confirms_fenced: bool) -> None:
             "REFUSED: --operator-confirms-fenced was passed but a zeus "
             "daemon process is still running:\n  " + "\n  ".join(live)
         )
+
+
+def _cutover_lease_path(db_path: Path) -> Path:
+    from src.state.db_writer_lock import cutover_lease_path
+
+    return cutover_lease_path(db_path.resolve())
+
+
+def _acquire_cutover_lease(db_path: Path):
+    import fcntl
+
+    path = _cutover_lease_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise PreconditionError(
+            f"REFUSED: cutover lease is already held: {path}"
+        ) from exc
+    except OSError:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_cutover_lease(handle) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +490,10 @@ def run_vacuum_into(
     backup_manifest: Path | None,
     backup_max_age_hours: int,
 ) -> dict:
+    if _same_path_or_file(db_path, dest):
+        raise PreconditionError(
+            "REFUSED: VACUUM INTO destination must differ from source database"
+        )
     if dest.exists():
         raise PreconditionError(f"REFUSED: --vacuum-into destination already exists: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -375,12 +506,14 @@ def run_vacuum_into(
             check_backup_manifest(
                 backup_manifest, db_path=db_path, max_age_hours=backup_max_age_hours
             )
-        source_size = db_path.stat().st_size
+        source_data_version_before = _data_version(conn)
+        source_binding_before = _source_file_binding(db_path)
+        source_size = int(source_binding_before["main"]["size_bytes"])
         check_dest_free_space(dest, source_size=source_size)
 
-        # Row counts from the SAME read-only connection, immediately before
-        # VACUUM INTO -- no writer can race between this count and the vacuum
-        # itself since both go through this one connection's consistent view.
+        # The count and VACUUM INTO share one connection, but separate SQLite
+        # statements are not a cross-statement snapshot. Recheck data_version
+        # and stable main/WAL file bindings after VACUUM INTO instead.
         source_counts = {}
         for table in _TRADE_CLASS_TABLES_TO_COUNT:
             try:
@@ -392,12 +525,22 @@ def run_vacuum_into(
 
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("VACUUM INTO ?", (str(dest),))
+        source_binding_after = _source_file_binding(db_path)
+        source_data_version_after = _data_version(conn)
+        if (
+            source_data_version_before != source_data_version_after
+            or source_binding_before != source_binding_after
+        ):
+            raise PreconditionError(
+                "REFUSED: source changed during VACUUM INTO; candidate was not sealed"
+            )
     finally:
         conn.close()
 
     # Verify DEST independently.
     dest_conn = sqlite3.connect(str(dest))
     try:
+        _assert_candidate_has_no_sidecars(dest)
         integrity_rows = dest_conn.execute("PRAGMA integrity_check").fetchall()
         if integrity_rows != [("ok",)]:
             raise PreconditionError(
@@ -452,6 +595,9 @@ def run_vacuum_into(
         "source_path": str(db_path),
         "source_size_bytes": source_size,
         "source_row_counts": source_counts,
+        "source_data_version_before": source_data_version_before,
+        "source_data_version_after": source_data_version_after,
+        "source_file_binding": source_binding_after,
         "dest_path": str(dest),
         "dest_size_bytes": dest_size,
         "dest_sha256": _sha256_file(dest),
@@ -479,6 +625,29 @@ def run_swap(
     backup_max_age_hours: int,
 ) -> dict:
     assert_writer_plane_fenced(operator_confirms_fenced)
+    lease = _acquire_cutover_lease(db_path)
+    try:
+        return _run_swap_locked(
+            db_path=db_path,
+            dest=dest,
+            backup_manifest=backup_manifest,
+            backup_max_age_hours=backup_max_age_hours,
+        )
+    finally:
+        _release_cutover_lease(lease)
+
+
+def _run_swap_locked(
+    *,
+    db_path: Path,
+    dest: Path,
+    backup_manifest: Path | None,
+    backup_max_age_hours: int,
+) -> dict:
+    if _same_path_or_file(db_path, dest):
+        raise PreconditionError(
+            "REFUSED: swap source and candidate must be different files"
+        )
 
     receipt_path = dest.with_suffix(dest.suffix + ".vacuum_reset_receipt.json")
     if not receipt_path.exists():
@@ -495,7 +664,12 @@ def run_swap(
             f"REFUSED: {dest} sha256 ({actual_sha}) does not match its receipt "
             f"({receipt.get('dest_sha256')}) -- the file changed since --vacuum-into ran"
         )
-
+    _assert_candidate_has_no_sidecars(dest)
+    receipt_binding = receipt.get("source_file_binding")
+    if not isinstance(receipt_binding, dict):
+        raise PreconditionError(
+            "REFUSED: vacuum_reset receipt has no source content binding"
+        )
     # Re-verify preconditions one more time -- state can have changed since
     # --vacuum-into ran (this is a SEPARATE operator invocation, possibly
     # much later).
@@ -510,11 +684,36 @@ def run_swap(
     finally:
         conn.close()
 
+    # Closing the final precondition reader can change SQLite sidecar state.
+    # Bind the source immediately before touching the live path, while the
+    # shared cutover lease is held.
+    current_binding = _source_file_binding(db_path)
+    if current_binding != receipt_binding:
+        raise PreconditionError(
+            "REFUSED: source content/path changed since --vacuum-into ran"
+        )
+
     backup_of_live = db_path.with_suffix(
         db_path.suffix + f".pre_vacuum_reset_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     )
+    backup_sidecars = tuple(
+        Path(str(backup_of_live) + suffix) for suffix in ("-wal", "-shm")
+    )
+    source_sidecars = _source_sidecar_paths(db_path)
+    if backup_of_live.exists() or any(path.exists() for path in backup_sidecars):
+        raise PreconditionError(
+            f"REFUSED: pre-swap backup path already exists: {backup_of_live}"
+        )
+    moved_source_paths: list[tuple[Path, Path]] = []
+    candidate_move_started = False
     os.rename(db_path, backup_of_live)
+    moved_source_paths.append((db_path, backup_of_live))
     try:
+        for sidecar, backup_sidecar in zip(source_sidecars, backup_sidecars):
+            if sidecar.exists():
+                os.rename(sidecar, backup_sidecar)
+                moved_source_paths.append((sidecar, backup_sidecar))
+        candidate_move_started = True
         shutil.move(str(dest), str(db_path))
         verify_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
@@ -524,10 +723,23 @@ def run_swap(
         finally:
             verify_conn.close()
     except BaseException:
-        # Restore the original file; the swap did not complete successfully.
-        if db_path.exists() and not backup_of_live.exists():
-            pass  # dest already moved into db_path's place and failed verify; leave for operator inspection
-        else:
+        # Restore the original file and all sidecars; return the candidate to
+        # DEST when it was moved before verification failed.
+        candidate_at_live = (
+            candidate_move_started
+            and not dest.exists()
+            and db_path.exists()
+            and backup_of_live.exists()
+        )
+        if candidate_at_live:
+            for sidecar in _source_sidecar_paths(db_path):
+                if sidecar.exists():
+                    sidecar.unlink()
+            shutil.move(str(db_path), str(dest))
+        for original, backup in reversed(moved_source_paths[1:]):
+            if backup.exists():
+                os.rename(backup, original)
+        if backup_of_live.exists():
             os.rename(backup_of_live, db_path)
         raise
 

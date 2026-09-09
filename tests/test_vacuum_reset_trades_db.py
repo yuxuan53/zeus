@@ -1,6 +1,7 @@
 # Created: 2026-08-25
-# Last reused or audited: 2026-08-25
+# Last reused or audited: 2026-09-09
 # Authority basis: docs/operations/current/plans/reversal_plan_tier0_2026-08-24.md
+#   item 13 Slice C -- source-content-bound vacuum cutover acceptance.
 #   item 13 Slice C -- coverage for scripts/ops/vacuum_reset_trades_db.py's
 #   PRECONDITION AND ASSERTION LOGIC ONLY, exercised exclusively against tiny
 #   disposable fixture files under tmp_path. This script has never been run
@@ -326,6 +327,104 @@ def test_swap_full_flow_replaces_live_file(tmp_path: Path, monkeypatch) -> None:
     assert live_conn.execute("SELECT COUNT(*) FROM decision_log").fetchone()[0] == 300
 
 
+def test_quiescent_wal_mode_after_close_swaps_and_backs_up_main_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    monkeypatch.setattr(
+        "src.control.control_plane.is_entries_paused", lambda: False
+    )
+    source = tmp_path / "zeus_trades.db"
+    _make_trade_db(source, decision_log_rows=300, bloat_and_delete_rows=600)
+    wal_conn = sqlite3.connect(str(source))
+    assert wal_conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_conn.execute(
+        "UPDATE decision_log SET payload='quiescent-wal-mode' "
+        "WHERE id=(SELECT MIN(id) FROM decision_log)"
+    )
+    wal_conn.commit()
+    wal_conn.close()
+    source_wal = Path(str(source) + "-wal")
+    source_shm = Path(str(source) + "-shm")
+    assert not source_wal.exists() and not source_shm.exists()
+    original_sha = vrt._sha256_file(source)
+    dest = tmp_path / "compact.db"
+
+    vrt.run_vacuum_into(
+        db_path=source, dest=dest, backup_manifest=None, backup_max_age_hours=24
+    )
+    captured_sidecars = {
+        suffix: Path(str(source) + suffix).exists() for suffix in ("-wal", "-shm")
+    }
+    result = vrt.run_swap(
+        db_path=source,
+        dest=dest,
+        operator_confirms_fenced=True,
+        backup_manifest=None,
+        backup_max_age_hours=24,
+    )
+
+    backup = Path(result["pre_swap_backup_path"])
+    assert backup.exists() and vrt._sha256_file(backup) == original_sha
+    for suffix, existed_at_capture in captured_sidecars.items():
+        assert Path(str(backup) + suffix).exists() is existed_at_capture
+    assert not source_wal.exists() and not source_shm.exists()
+    live_conn = sqlite3.connect(str(source))
+    try:
+        assert live_conn.execute("SELECT COUNT(*) FROM decision_log").fetchone()[0] == 300
+    finally:
+        live_conn.close()
+
+
+def test_vacuum_into_refuses_real_second_connection_update_during_phase2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "src.control.control_plane.is_entries_paused", lambda: False
+    )
+    source = tmp_path / "zeus_trades.db"
+    _make_trade_db(source, decision_log_rows=300, bloat_and_delete_rows=600)
+    dest = tmp_path / "compact.db"
+    real_connect = vrt.sqlite3.connect
+    trace_seen: list[str] = []
+    writer_updates: list[int] = []
+
+    def connect_with_phase2_writer(database, *args, **kwargs):
+        conn = real_connect(database, *args, **kwargs)
+        if database == f"file:{source}?mode=ro":
+            def trace(statement: str) -> None:
+                if not statement.lstrip().upper().startswith("VACUUM INTO"):
+                    return
+                trace_seen.append(statement)
+                writer = real_connect(str(source))
+                try:
+                    changed = writer.execute(
+                        "UPDATE decision_log SET payload='phase2-writer-update' "
+                        "WHERE id=(SELECT MIN(id) FROM decision_log)"
+                    )
+                    writer.commit()
+                    writer_updates.append(changed.rowcount)
+                finally:
+                    writer.close()
+
+            conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(vrt.sqlite3, "connect", connect_with_phase2_writer)
+    with pytest.raises(vrt.PreconditionError, match="(?i)source changed"):
+        vrt.run_vacuum_into(
+            db_path=source,
+            dest=dest,
+            backup_manifest=None,
+            backup_max_age_hours=24,
+        )
+
+    assert len(trace_seen) == 1
+    assert writer_updates == [1]
+    assert dest.exists()
+    assert not dest.with_suffix(dest.suffix + ".vacuum_reset_receipt.json").exists()
+
+
 def test_swap_refuses_without_operator_confirms_fenced(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "src.control.control_plane.is_entries_paused", lambda: False
@@ -342,3 +441,360 @@ def test_swap_refuses_without_operator_confirms_fenced(tmp_path: Path, monkeypat
         )
     # Nothing was touched.
     assert source.exists()
+
+
+def _prepare_vacuum_candidate(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "source" / "zeus_trades.db"
+    source.parent.mkdir()
+    _make_trade_db(source, decision_log_rows=300, bloat_and_delete_rows=600)
+    dest = tmp_path / "candidate" / "zeus_trades_compact.db"
+    vrt.run_vacuum_into(
+        db_path=source, dest=dest, backup_manifest=None, backup_max_age_hours=24
+    )
+    return source, dest
+
+
+def _content_snapshot(path: Path) -> tuple[tuple[object, ...], ...]:
+    conn = sqlite3.connect(str(path))
+    try:
+        return tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, payload FROM decision_log ORDER BY id"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("mutation", ["update", "insert", "delete", "wal_update"])
+def test_swap_refuses_source_mutation_after_candidate_generation(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    source_inode = source.stat().st_ino
+    dest_inode = dest.stat().st_ino
+    candidate_content = _content_snapshot(dest)
+    wal_conn = None
+    try:
+        if mutation == "update":
+            conn = sqlite3.connect(str(source))
+            original_payload = conn.execute(
+                "SELECT payload FROM decision_log WHERE id=(SELECT MIN(id) FROM decision_log)"
+            ).fetchone()[0]
+            changed = conn.execute(
+                "UPDATE decision_log SET payload=? "
+                "WHERE id=(SELECT MIN(id) FROM decision_log)",
+                ("updated-after-candidate".ljust(len(original_payload), "!"),),
+            )
+            assert changed.rowcount == 1
+            conn.commit()
+            conn.close()
+        elif mutation == "insert":
+            conn = sqlite3.connect(str(source))
+            inserted = conn.execute(
+                "INSERT INTO decision_log(mode, payload) VALUES ('settlement', 'inserted-after-candidate')"
+            )
+            assert inserted.rowcount == 1
+            conn.commit()
+            conn.close()
+        elif mutation == "delete":
+            conn = sqlite3.connect(str(source))
+            changed = conn.execute(
+                "DELETE FROM decision_log WHERE id=(SELECT MIN(id) FROM decision_log)"
+            )
+            assert changed.rowcount == 1
+            conn.commit()
+            conn.close()
+        elif mutation == "wal_update":
+            wal_conn = sqlite3.connect(str(source))
+            assert wal_conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            changed = wal_conn.execute(
+                "UPDATE decision_log SET payload='wal-update-after-candidate' "
+                "WHERE id=(SELECT MIN(id) FROM decision_log)"
+            )
+            assert changed.rowcount == 1
+            wal_conn.commit()
+        else:
+            raise AssertionError(mutation)
+
+        expected_source_content = _content_snapshot(source)
+        with pytest.raises(vrt.PreconditionError, match="(?i)source|receipt"):
+            vrt.run_swap(
+                db_path=source,
+                dest=dest,
+                operator_confirms_fenced=True,
+                backup_manifest=None,
+                backup_max_age_hours=24,
+            )
+
+        assert source.exists() and source.stat().st_ino == source_inode
+        assert dest.exists() and dest.stat().st_ino == dest_inode
+        assert _content_snapshot(source) == expected_source_content
+        assert _content_snapshot(dest) == candidate_content
+    finally:
+        if wal_conn is not None:
+            wal_conn.close()
+
+
+def test_swap_refuses_same_path_replacement_with_unchanged_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    source_bytes = source.read_bytes()
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    replacement = source.with_name("replacement.db")
+    replacement.write_bytes(source_bytes)
+    os.replace(replacement, source)
+    assert source.stat().st_ino != source_inode
+
+    with pytest.raises(vrt.PreconditionError, match="(?i)source|content|path"):
+        vrt.run_swap(
+            db_path=source,
+            dest=dest,
+            operator_confirms_fenced=True,
+            backup_manifest=None,
+            backup_max_age_hours=24,
+        )
+
+    assert source.exists() and source.stat().st_ino != source_inode
+    assert source.read_bytes() == source_bytes
+    assert dest.exists() and dest.stat().st_ino == candidate_inode
+
+
+def test_swap_refuses_candidate_when_source_path_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    other_source = tmp_path / "other-source.db"
+    _make_trade_db(other_source, decision_log_rows=300, bloat_and_delete_rows=600)
+    other_inode = other_source.stat().st_ino
+    other_content = _content_snapshot(other_source)
+    candidate_inode = dest.stat().st_ino
+    candidate_content = _content_snapshot(dest)
+
+    with pytest.raises(vrt.PreconditionError, match="(?i)source|receipt"):
+        vrt.run_swap(
+            db_path=other_source,
+            dest=dest,
+            operator_confirms_fenced=True,
+            backup_manifest=None,
+            backup_max_age_hours=24,
+        )
+
+    assert source.exists()
+    assert other_source.exists() and other_source.stat().st_ino == other_inode
+    assert dest.exists() and dest.stat().st_ino == candidate_inode
+    assert _content_snapshot(other_source) == other_content
+    assert _content_snapshot(dest) == candidate_content
+
+
+def test_swap_refuses_old_receipt_without_source_content_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    receipt_path = dest.with_suffix(dest.suffix + ".vacuum_reset_receipt.json")
+    receipt = json.loads(receipt_path.read_text())
+    for key in list(receipt):
+        lowered = key.lower()
+        if "source" in lowered and any(
+            marker in lowered
+            for marker in ("sha", "hash", "digest", "binding", "fingerprint", "content")
+        ):
+            receipt.pop(key)
+    receipt_path.write_text(json.dumps(receipt))
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    source_content = _content_snapshot(source)
+    candidate_content = _content_snapshot(dest)
+
+    with pytest.raises(vrt.PreconditionError, match="(?i)source|receipt"):
+        vrt.run_swap(
+            db_path=source,
+            dest=dest,
+            operator_confirms_fenced=True,
+            backup_manifest=None,
+            backup_max_age_hours=24,
+        )
+
+    assert source.exists() and source.stat().st_ino == source_inode
+    assert dest.exists() and dest.stat().st_ino == candidate_inode
+    assert _content_snapshot(source) == source_content
+    assert _content_snapshot(dest) == candidate_content
+
+
+def test_swap_refuses_source_wal_and_preserves_candidate_without_sidecars(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    source_wal = Path(str(source) + "-wal")
+    source_shm = Path(str(source) + "-shm")
+    candidate_wal = Path(str(dest) + "-wal")
+    candidate_shm = Path(str(dest) + "-shm")
+    wal_conn = sqlite3.connect(str(source))
+    try:
+        assert wal_conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        changed = wal_conn.execute(
+            "UPDATE decision_log SET payload='wal-sidecar-update' "
+            "WHERE id=(SELECT MIN(id) FROM decision_log)"
+        )
+        assert changed.rowcount == 1
+        wal_conn.commit()
+        assert source_wal.exists() and source_shm.exists()
+        assert not candidate_wal.exists() and not candidate_shm.exists()
+
+        with pytest.raises(vrt.PreconditionError, match="(?i)source|receipt"):
+            vrt.run_swap(
+                db_path=source,
+                dest=dest,
+                operator_confirms_fenced=True,
+                backup_manifest=None,
+                backup_max_age_hours=24,
+            )
+
+        assert source.exists() and source.stat().st_ino == source_inode
+        assert source_wal.exists() and source_shm.exists()
+        assert dest.exists() and dest.stat().st_ino == candidate_inode
+        assert not candidate_wal.exists() and not candidate_shm.exists()
+    finally:
+        wal_conn.close()
+
+
+def test_swap_failure_after_source_group_rename_restores_main_and_sidecars(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source = tmp_path / "source" / "zeus_trades.db"
+    source.parent.mkdir()
+    _make_trade_db(source, decision_log_rows=300, bloat_and_delete_rows=600)
+    wal_conn = sqlite3.connect(str(source))
+    assert wal_conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_conn.execute(
+        "UPDATE decision_log SET payload='wal-before-candidate' "
+        "WHERE id=(SELECT MIN(id) FROM decision_log)"
+    )
+    wal_conn.commit()
+    dest = tmp_path / "candidate" / "zeus_trades_compact.db"
+    vrt.run_vacuum_into(
+        db_path=source, dest=dest, backup_manifest=None, backup_max_age_hours=24
+    )
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    source_wal = Path(str(source) + "-wal")
+    source_shm = Path(str(source) + "-shm")
+    candidate_wal = Path(str(dest) + "-wal")
+    candidate_shm = Path(str(dest) + "-shm")
+    rename_calls: list[tuple[Path, Path]] = []
+    move_calls: list[tuple[Path, Path]] = []
+    try:
+        assert source_wal.exists() and source_shm.exists()
+
+        real_rename = vrt.os.rename
+        real_move = vrt.shutil.move
+
+        def track_rename(src, dst):
+            rename_calls.append((Path(src), Path(dst)))
+            return real_rename(src, dst)
+
+        def fail_candidate_move(src, dst):
+            move_calls.append((Path(src), Path(dst)))
+            if Path(src) == dest:
+                raise OSError("injected candidate move failure")
+            return real_move(src, dst)
+
+        monkeypatch.setattr(vrt.os, "rename", track_rename)
+        monkeypatch.setattr(vrt.shutil, "move", fail_candidate_move)
+
+        with pytest.raises(OSError, match="injected candidate move failure"):
+            vrt.run_swap(
+                db_path=source,
+                dest=dest,
+                operator_confirms_fenced=True,
+                backup_manifest=None,
+                backup_max_age_hours=24,
+            )
+
+        moved_sidecars = {path for path, _ in rename_calls + move_calls}
+        assert source_wal in moved_sidecars and source_shm in moved_sidecars
+        assert source.exists() and source.stat().st_ino == source_inode
+        assert source_wal.exists() and source_shm.exists()
+        assert dest.exists() and dest.stat().st_ino == candidate_inode
+        assert not candidate_wal.exists() and not candidate_shm.exists()
+    finally:
+        wal_conn.close()
+
+
+def test_swap_verify_failure_removes_new_live_sidecars_when_source_had_none(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed post-move verifier must not leave sidecars on the restored source."""
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    source_wal = Path(str(source) + "-wal")
+    source_shm = Path(str(source) + "-shm")
+    assert not source_wal.exists() and not source_shm.exists()
+
+    real_connect = vrt.sqlite3.connect
+    verify_connect_calls = 0
+
+    def inject_verify_failure(database, *args, **kwargs):
+        nonlocal verify_connect_calls
+        conn = real_connect(database, *args, **kwargs)
+        if isinstance(database, str) and database == f"file:{source}?mode=ro":
+            verify_connect_calls += 1
+            if verify_connect_calls == 2:
+                conn.close()
+                source_wal.write_bytes(b"new live wal")
+                source_shm.write_bytes(b"new live shm")
+                raise OSError("injected post-move verification failure")
+        return conn
+
+    monkeypatch.setattr(vrt.sqlite3, "connect", inject_verify_failure)
+    with pytest.raises(OSError, match="injected post-move verification failure"):
+        vrt.run_swap(
+            db_path=source,
+            dest=dest,
+            operator_confirms_fenced=True,
+            backup_manifest=None,
+            backup_max_age_hours=24,
+        )
+
+    assert verify_connect_calls == 2
+    assert source.exists() and source.stat().st_ino == source_inode
+    assert dest.exists() and dest.stat().st_ino == candidate_inode
+    assert not source_wal.exists() and not source_shm.exists()
+    assert not Path(str(dest) + "-wal").exists()
+    assert not Path(str(dest) + "-shm").exists()
+
+
+def test_swap_refuses_when_shared_cutover_lease_is_held(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+    from src.state.db_writer_lock import cutover_lease_path
+
+    monkeypatch.setenv(vrt._SKIP_PROCESS_CHECK_ENV_VAR, "1")
+    source, dest = _prepare_vacuum_candidate(tmp_path)
+    lease = cutover_lease_path(source.resolve())
+    source_inode = source.stat().st_ino
+    candidate_inode = dest.stat().st_ino
+    with lease.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(vrt.PreconditionError, match="(?i)lease|cutover"):
+            vrt.run_swap(
+                db_path=source,
+                dest=dest,
+                operator_confirms_fenced=True,
+                backup_manifest=None,
+                backup_max_age_hours=24,
+            )
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    assert source.exists() and source.stat().st_ino == source_inode
+    assert dest.exists() and dest.stat().st_ino == candidate_inode
