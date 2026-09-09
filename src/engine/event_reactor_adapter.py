@@ -45670,6 +45670,11 @@ def _rebuild_decision_time_day0_carrier(
     )
     if not math.isfinite(extra_sigma_native) or extra_sigma_native < 0.0:
         raise ValueError("DAY0_HELD_SHARED_CARRIER_SIGMA_INVALID")
+    path_error_sigma_c = (
+        extra_sigma_native
+        if carrier_unit == "C"
+        else extra_sigma_native * 5.0 / 9.0
+    )
     bounds = tuple(
         (
             None if candidate.bin.low is None else float(candidate.bin.low),
@@ -45721,11 +45726,10 @@ def _rebuild_decision_time_day0_carrier(
         future_extremes_c=values_native,
         boundary_scenarios=boundary_scenarios,
         metric=str(family.metric).strip().lower(),
-        # build_day0_remaining_probability_carrier applies sigma directly to
-        # the native-unit values/bounds ("_c" suffix is historical): both
-        # sigmas must stay in carrier_unit. Converting path sigma F->C here
-        # understated Fahrenheit-market noise by 4/9 (PR#501 review finding).
-        path_error_sigma_c=extra_sigma_native,
+        # The builder's historical "_c" argument is applied directly to the
+        # native-unit values/bounds. Keep the persisted witness canonical in C,
+        # then apply the same native scale used by the consumer.
+        path_error_sigma_c=path_error_sigma_c * native_scale,
         instrument_sigma_c=float(sigma_instrument_for_city(city).to(carrier_unit).value),
         bin_bounds_c=bounds,
         n_point=ensemble_n_mc(),
@@ -45741,11 +45745,7 @@ def _rebuild_decision_time_day0_carrier(
             "_edli_day0_remaining_probability_samples": list(carrier["samples"]),
             "_edli_day0_remaining_probability_sample_count": 500,
             "_edli_day0_remaining_carrier_future_extremes_c": list(values_c),
-            "_edli_day0_remaining_carrier_path_error_sigma_c": (
-                extra_sigma_native
-                if carrier_unit == "C"
-                else extra_sigma_native * 5.0 / 9.0
-            ),
+            "_edli_day0_remaining_carrier_path_error_sigma_c": path_error_sigma_c,
             "_edli_day0_remaining_carrier_probability_cutoff_utc": cutoff,
             "_edli_day0_decision_carrier_rebuild_basis": rebuild_basis,
             "_edli_day0_remaining_path_center_sigma_native": float(

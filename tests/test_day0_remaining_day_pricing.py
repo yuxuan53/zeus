@@ -2312,6 +2312,158 @@ def test_live_day0_entry_explicitly_marks_canonical_authority(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("city_name", "unit", "metric", "sigma_mode", "authority_kind"),
+    [
+        (city, unit, metric, sigma_mode, authority_kind)
+        for city, unit in (("Tel Aviv", "C"), ("Atlanta", "F"))
+        for metric in ("high", "low")
+        for sigma_mode in ("fixed", "current")
+        for authority_kind in (
+            "entry_current_remaining_path",
+            "held_current_remaining_path",
+            "held_a_prime",
+        )
+    ],
+)
+def test_noaa_actual_producer_consumer_reuses_canonical_path_sigma(
+    city_name,
+    unit,
+    metric,
+    sigma_mode,
+    authority_kind,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each actual producer and consumer path must bind one canonical C sigma."""
+    import src.data.day0_hourly_vectors as hourly
+    import src.engine.event_reactor_adapter as era
+
+    city = runtime_cities_by_name()[city_name]
+    target_date = "2026-08-24"
+    decision_time = datetime(2026, 8, 24, 12, 30, tzinfo=UTC)
+    cutoff = decision_time.isoformat()
+    future_c = (28.5, 29.0, 30.5, 31.25)
+    station = "LLBG" if unit == "C" else "KATL"
+    boundary = 33.0 if unit == "C" else 91.4
+    bounds = (
+        [(None, 29)]
+        + [(value, value) for value in range(30, 39)]
+        + [(39, None)]
+        if unit == "C"
+        else [(None, 77)]
+        + [(value, value + 1) for value in range(78, 96, 2)]
+        + [(96, None)]
+    )
+    family = SimpleNamespace(
+        city=city_name,
+        target_date=target_date,
+        metric=metric,
+        candidates=[
+            SimpleNamespace(bin=Bin(low, high, unit, f"bin-{index}"))
+            for index, (low, high) in enumerate(bounds)
+        ],
+    )
+    payload = {
+        "metric": metric,
+        "target_date": target_date,
+        "rounded_value": boundary,
+        "settlement_source": "aviationweather_metar",
+        "evidence_finality": "PROVISIONAL_CURRENT_SNAPSHOT",
+        "_edli_day0_probability_boundary_native": boundary,
+        "_edli_day0_source_clock_predictive_sigma_native": 1.2,
+        "_edli_day0_provisional_boundary_survival_probability": 0.95,
+        "_edli_day0_provisional_revision_likelihood": _noaa_test_likelihood(
+            station=station,
+            cutoff=cutoff,
+        ),
+        "_edli_day0_remaining_vector_witness": {
+            "vector_id": "same-vector",
+            "expected_models": ["ecmwf_ifs"],
+            "actual_models": ["ecmwf_ifs"],
+            "capture_times_by_model_utc": {"ecmwf_ifs": cutoff},
+            "provider_source_cycle_time_by_model_utc": {"ecmwf_ifs": cutoff},
+            "provider_source_available_at_by_model_utc": {"ecmwf_ifs": cutoff},
+            "source_run_id_by_model": {"ecmwf_ifs": "source-run"},
+            "provider_run_id_by_model": {"ecmwf_ifs": "provider-run"},
+            "request_hash_by_model": {"ecmwf_ifs": "request-hash"},
+        },
+    }
+    entry_authority = authority_kind == "entry_current_remaining_path"
+    if authority_kind == "held_current_remaining_path":
+        payload["_edli_day0_redecision_authority_scope"] = (
+            "held_exposure_current_bundle_day0_only_v1"
+        )
+    elif authority_kind == "held_a_prime":
+        payload["_edli_day0_redecision_authority_scope"] = (
+            "held_exposure_current_day0_only_v1"
+        )
+    original_extra = era._day0_extra_member_sigma_native
+    captured_sigma = []
+
+    def capture_extra_sigma(**kwargs):
+        value = (
+            0.7
+            if sigma_mode == "fixed"
+            else original_extra(**kwargs)
+        )
+        captured_sigma.append(float(value))
+        return value
+
+    monkeypatch.setattr(era, "_day0_extra_member_sigma_native", capture_extra_sigma)
+    original_builder = hourly.build_day0_remaining_probability_carrier
+    builder_calls = []
+
+    def recording_builder(**kwargs):
+        builder_calls.append(dict(kwargs))
+        return original_builder(**kwargs)
+
+    monkeypatch.setattr(hourly, "build_day0_remaining_probability_carrier", recording_builder)
+    era._rebuild_decision_time_day0_carrier(
+        payload=payload,
+        family=family,
+        unit=unit,
+        decision_time=decision_time,
+        future_extremes_c=future_c,
+        authority_kind=authority_kind,
+        entry_authority=entry_authority,
+    )
+
+    expected_sigma_native = captured_sigma[-1]
+    expected_sigma_c = (
+        expected_sigma_native
+        if unit == "C"
+        else expected_sigma_native * 5.0 / 9.0
+    )
+    native_scale = 1.0 if unit == "C" else 9.0 / 5.0
+    assert payload["_edli_day0_remaining_carrier_path_error_sigma_c"] == expected_sigma_c
+    assert builder_calls[0]["path_error_sigma_c"] == pytest.approx(
+        expected_sigma_c * native_scale
+    )
+
+    future_native = np.asarray(
+        [
+            value * native_scale + (32.0 if unit == "F" else 0.0)
+            for value in future_c
+        ],
+        dtype=float,
+    )
+    replay = era._day0_remaining_p_raw_vector(
+        future_native,
+        city=city,
+        settlement_semantics=SettlementSemantics.for_city(city),
+        bins=[candidate.bin for candidate in family.candidates],
+        payload=payload,
+        extra_member_sigma=0.0,
+        decision_time=decision_time,
+    )
+    assert len(builder_calls) == 2
+    assert builder_calls[1]["path_error_sigma_c"] == pytest.approx(
+        expected_sigma_c * native_scale
+    )
+    assert builder_calls[1]["path_error_sigma_c"] == builder_calls[0]["path_error_sigma_c"]
+    assert replay.tolist() == pytest.approx(payload["_edli_day0_remaining_carrier_q"])
+
+
 def test_noaa_adapter_replays_real_fahrenheit_family_in_native_settlement_units():
     import src.engine.event_reactor_adapter as era
     from src.config import ensemble_n_mc, runtime_cities_by_name
