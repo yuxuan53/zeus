@@ -12,6 +12,7 @@ import math
 import sqlite3
 import sys
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 from src.config import STATE_DIR, cities_by_name, get_mode, settings
@@ -600,6 +601,17 @@ def _execute_monitoring_phase(
     defer_partial_orderbook_gaps: bool = False,
     current_riskguard_red: bool = False,
 ):
+    provider_setup_started = time.monotonic()
+    monitor_budget = _runtime._held_position_monitor_budget_seconds(
+        held_position_monitor_budget_seconds
+    )
+    overall_deadline = provider_setup_started + monitor_budget
+    from src.calibration.market_anchored_live_fit import (
+        MarketAnchoredFitProvider,
+        active_provider_scope,
+        get_shared_artifact_cache,
+    )
+
     if isinstance(conn, sqlite3.Connection):
         # SCOPE: only this short-lived held-monitor connection. DRAIN:
         # src.main's dedicated 90-second PASSIVE canonical-WAL checkpoints copy
@@ -609,20 +621,58 @@ def _execute_monitoring_phase(
         # commit so SQLite cannot overrun the held-position decision deadline.
         conn.execute("PRAGMA wal_autocheckpoint = 0")
         summary["held_monitor_wal_autocheckpoint"] = "disabled"
-    return _runtime.execute_monitoring_phase(
-        conn,
-        clob,
-        portfolio,
-        artifact,
-        tracker,
-        summary,
-        deps=sys.modules[__name__],
-        run_exit_preflight=run_exit_preflight,
-        held_position_monitor_budget_seconds=held_position_monitor_budget_seconds,
-        should_preempt_for_urgent_day0=should_preempt_for_urgent_day0,
-        defer_partial_orderbook_gaps=defer_partial_orderbook_gaps,
-        current_riskguard_red=current_riskguard_red,
-    )
+    provider = None
+    try:
+        from src.config import runtime_cities_by_name
+
+        runtime_city_configs = runtime_cities_by_name()
+        if not isinstance(runtime_city_configs, Mapping):
+            raise TypeError("runtime city registry is not a mapping")
+        city_timezones = {
+            city: getattr(config, "timezone", "")
+            for city, config in runtime_city_configs.items()
+        }
+        provider = MarketAnchoredFitProvider(
+            lambda: conn,
+            city_timezones=city_timezones,
+            schema_alias="world",
+            cache=get_shared_artifact_cache(),
+            cache_only=True,
+        )
+        from src.engine.monitor_refresh import HELD_MONITOR_PRIMARY_BELIEF_READ_MAX_SECONDS
+
+        provider.warm(
+            now=datetime.now(timezone.utc),
+            deadline_monotonic=(
+                min(
+                    overall_deadline,
+                    time.monotonic()
+                    + float(HELD_MONITOR_PRIMARY_BELIEF_READ_MAX_SECONDS),
+                )
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - calibration remains fail-open to raw q
+        logging.getLogger(__name__).warning(
+            "market-anchored monitor provider unavailable: %s",
+            type(exc).__name__,
+        )
+
+    runtime_budget = max(0.0, overall_deadline - time.monotonic())
+    with active_provider_scope(provider):
+        return _runtime.execute_monitoring_phase(
+            conn,
+            clob,
+            portfolio,
+            artifact,
+            tracker,
+            summary,
+            deps=sys.modules[__name__],
+            run_exit_preflight=run_exit_preflight,
+            held_position_monitor_budget_seconds=runtime_budget,
+            should_preempt_for_urgent_day0=should_preempt_for_urgent_day0,
+            defer_partial_orderbook_gaps=defer_partial_orderbook_gaps,
+            current_riskguard_red=current_riskguard_red,
+        )
 
 
 def run_cycle(mode: DiscoveryMode, *, edli_event_context: dict | None = None) -> dict:

@@ -13,13 +13,17 @@ expires.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+import src.calibration.market_anchored_live_fit as live_fit
 from src.calibration.market_anchored_live_fit import (
+    MarketAnchoredArtifactCache,
     MarketAnchoredFitProvider,
+    _sqlite_fit_deadline,
     corrected_probability,
     load_fit_rows,
 )
@@ -109,7 +113,7 @@ def _row(
         ).isoformat(),
         "target_date": (decision_day + timedelta(days=lead_days)).isoformat(),
         "settled_at": settled_at.isoformat(),
-        "graded_at": None,
+        "graded_at": settled_at.isoformat(),
         "city": city if city is not None else f"city-{index}",
         "temperature_metric": "high",
         "traded_bin_label": f"bin-{claim_suffix if claim_suffix is not None else index}",
@@ -255,6 +259,346 @@ def test_failed_fit_is_cached_so_a_dead_db_is_not_redialled_per_candidate():
     assert len(attempts) == 1
 
 
+def test_shared_cache_reuses_artifact_across_borrowed_connections(monkeypatch):
+    conn_a = _memory_db(_settled_rows(40))
+    conn_b = _memory_db(_settled_rows(40))
+    cache = MarketAnchoredArtifactCache()
+    fit_calls: list[int] = []
+    original_fit = live_fit.fit
+
+    def counted_fit(*args, **kwargs):
+        fit_calls.append(1)
+        return original_fit(*args, **kwargs)
+
+    monkeypatch.setattr(live_fit, "fit", counted_fit)
+    provider_a = MarketAnchoredFitProvider(
+        lambda: conn_a,
+        cache=cache,
+        db_identity=("world", 1, 1),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    provider_b = MarketAnchoredFitProvider(
+        lambda: conn_b,
+        cache=cache,
+        db_identity=("world", 1, 1),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+
+    first = provider_a.artifact(now=NOW)
+    second = provider_b.artifact(now=NOW + timedelta(hours=1))
+
+    assert first is not None
+    assert second is first
+    assert len(fit_calls) == 1
+
+
+def test_failed_borrowed_connection_does_not_poison_next_provider_cache():
+    dead = sqlite3.connect(":memory:")
+    dead.close()
+    live = _memory_db(_settled_rows(40))
+    cache = MarketAnchoredArtifactCache()
+    dead_provider = MarketAnchoredFitProvider(
+        lambda: dead,
+        cache=cache,
+        db_identity=("world", 2, 2),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    live_provider = MarketAnchoredFitProvider(
+        lambda: live,
+        cache=cache,
+        db_identity=("world", 2, 2),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+
+    assert dead_provider.artifact(now=NOW) is None
+    assert live_provider.artifact(now=NOW + timedelta(minutes=1)) is not None
+
+
+def test_expired_deadline_rejects_even_a_valid_shared_cache_hit():
+    conn = _memory_db(_settled_rows(40))
+    cache = MarketAnchoredArtifactCache()
+    provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=cache,
+        db_identity=("world", 3, 3),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    assert provider.artifact(now=NOW) is not None
+    assert (
+        provider.artifact(
+            now=NOW + timedelta(minutes=1),
+            deadline_monotonic=0.0,
+        )
+        is None
+    )
+
+
+def test_shared_cache_uses_physical_world_identity_across_main_and_world_aliases(
+    tmp_path, monkeypatch
+):
+    world_path = tmp_path / "world.db"
+    source = _memory_db(_settled_rows(40))
+    world = sqlite3.connect(world_path)
+    source.backup(world)
+    source.close()
+    world.close()
+
+    main = sqlite3.connect(world_path)
+    main.row_factory = sqlite3.Row
+    attached = sqlite3.connect(":memory:")
+    attached.row_factory = sqlite3.Row
+    attached.execute("ATTACH DATABASE ? AS world", (str(world_path),))
+    cache = MarketAnchoredArtifactCache()
+    fit_calls: list[int] = []
+    original_fit = live_fit.fit
+
+    def counted_fit(*args, **kwargs):
+        fit_calls.append(1)
+        return original_fit(*args, **kwargs)
+
+    monkeypatch.setattr(live_fit, "fit", counted_fit)
+    try:
+        main_provider = MarketAnchoredFitProvider(
+            lambda: main,
+            cache=cache,
+            schema_alias="main",
+            min_train_rows=20,
+            city_timezones=_TEST_CITY_TIMEZONES,
+        )
+        world_provider = MarketAnchoredFitProvider(
+            lambda: attached,
+            cache=cache,
+            schema_alias="world",
+            min_train_rows=20,
+            city_timezones=_TEST_CITY_TIMEZONES,
+        )
+        first = main_provider.artifact(now=NOW)
+        second = world_provider.artifact(now=NOW + timedelta(hours=1))
+        assert first is not None
+        assert second is first
+        assert fit_calls == [1]
+    finally:
+        attached.close()
+        main.close()
+
+
+def test_shared_cache_isolated_by_fit_configuration():
+    conn = _memory_db(_settled_rows(40))
+    cache = MarketAnchoredArtifactCache()
+    provider_a = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=cache,
+        db_identity=("world", 4, 4),
+        min_train_rows=20,
+        lambda_=1.0,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    provider_b = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=cache,
+        db_identity=("world", 4, 4),
+        min_train_rows=20,
+        lambda_=2.0,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+
+    first = provider_a.artifact(now=NOW)
+    second = provider_b.artifact(now=NOW)
+
+    assert first is not None
+    assert second is not None
+    assert second is not first
+
+
+def test_backward_provider_does_not_hide_newer_shared_artifact():
+    conn = _memory_db(_settled_rows(40))
+    cache = MarketAnchoredArtifactCache()
+    future_provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=cache,
+        db_identity=("world", 5, 5),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    earlier_provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=cache,
+        db_identity=("world", 5, 5),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+
+    future = future_provider.artifact(now=NOW)
+    earlier = earlier_provider.artifact(now=NOW - timedelta(hours=1))
+    recovered = earlier_provider.artifact(now=NOW)
+
+    assert future is not None
+    assert earlier is not None
+    assert earlier is not future
+    assert recovered is future
+
+
+def test_shared_cache_deadline_bounds_lock_and_late_fit_without_publish():
+    cache = MarketAnchoredArtifactCache()
+    key = ("bounded",)
+    cache._lock.acquire()
+    try:
+        started = time.monotonic()
+        result, _ = cache.get_or_fit(
+            key,
+            now=NOW,
+            ttl=timedelta(hours=1),
+            fit_current=lambda: pytest.fail("fit must not run after lock deadline"),
+            deadline_monotonic=time.monotonic() + 0.01,
+        )
+        assert result is None
+        assert time.monotonic() - started < 0.2
+    finally:
+        cache._lock.release()
+
+    def late_fit():
+        time.sleep(0.02)
+        return object()
+
+    result, _ = cache.get_or_fit(
+        key,
+        now=NOW,
+        ttl=timedelta(hours=1),
+        fit_current=late_fit,
+        deadline_monotonic=time.monotonic() + 0.005,
+    )
+    assert result is None
+    assert key not in cache._entries
+
+
+def test_cache_only_provider_serves_warmed_artifact_after_sql_deadline():
+    conn = _memory_db(_settled_rows(40))
+    provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=MarketAnchoredArtifactCache(),
+        db_identity=("world", 6, 6),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+        cache_only=True,
+    )
+    warmed = provider.warm(
+        now=NOW,
+        deadline_monotonic=time.monotonic() + 0.2,
+    )
+    assert warmed is not None
+    time.sleep(0.21)
+
+    served_after_sql_cap = provider.artifact(
+        now=NOW + timedelta(minutes=1)
+    )
+
+    assert served_after_sql_cap is warmed
+
+
+@pytest.mark.parametrize("slow_stage", ("sql", "fit"))
+def test_inmemory_warm_deadline_rejects_late_stage_and_restores_timeout(
+    monkeypatch, slow_stage
+):
+    conn = _memory_db(_settled_rows(40))
+    conn.execute("PRAGMA busy_timeout = 1234")
+    provider = MarketAnchoredFitProvider(
+        lambda: conn,
+        cache=MarketAnchoredArtifactCache(),
+        min_train_rows=20,
+        city_timezones=_TEST_CITY_TIMEZONES,
+    )
+    if slow_stage == "sql":
+        original_load = live_fit.load_fit_rows
+
+        def slow_load(*args, **kwargs):
+            time.sleep(0.02)
+            return original_load(*args, **kwargs)
+
+        monkeypatch.setattr(live_fit, "load_fit_rows", slow_load)
+    else:
+        original_fit = live_fit.fit
+
+        def slow_fit(*args, **kwargs):
+            time.sleep(0.02)
+            return original_fit(*args, **kwargs)
+
+        monkeypatch.setattr(live_fit, "fit", slow_fit)
+
+    result = provider.warm(
+        now=NOW,
+        deadline_monotonic=time.monotonic() + 0.005,
+    )
+
+    assert result is None
+    assert provider._artifact is None
+    assert provider._fitted_at is None
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1234
+
+
+def test_bounded_sqlite_fit_restores_timeout_and_preserves_outer_progress_handler():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA busy_timeout = 1234")
+    progress_calls: list[int] = []
+
+    def outer_progress_handler():
+        progress_calls.append(1)
+        return 0
+
+    conn.set_progress_handler(outer_progress_handler, 1)
+    try:
+        with _sqlite_fit_deadline(conn, time.monotonic() + 0.2):
+            conn.execute("SELECT 1").fetchone()
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1234
+        conn.execute(
+            "WITH RECURSIVE scan(value) AS (SELECT 1 UNION ALL "
+            "SELECT value + 1 FROM scan WHERE value < 1000) "
+            "SELECT SUM(value) FROM scan"
+        ).fetchone()
+        assert progress_calls
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
+
+
+def test_world_alias_reads_canonical_table_when_main_has_same_name(tmp_path):
+    world_path = tmp_path / "world.db"
+    world = sqlite3.connect(world_path)
+    world.row_factory = sqlite3.Row
+    world.execute(
+        """CREATE TABLE settlement_attribution (
+        q_in_bin REAL, market_in_bin_prob REAL, settled_in_bin INTEGER,
+        decision_posterior_computed_at TEXT, target_date TEXT,
+        settled_at TEXT, graded_at TEXT, city TEXT, temperature_metric TEXT,
+        traded_bin_label TEXT, direction TEXT)"""
+    )
+    world.execute(
+        "INSERT INTO settlement_attribution VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (0.8, 0.3, 1, "2026-08-01T00:00:00Z", "2026-08-02", "2026-08-03T00:00:00Z", "2026-08-03T00:00:00Z", "city-0", "high", "bin", "buy_yes"),
+    )
+    world.commit()
+    trade = sqlite3.connect(":memory:")
+    trade.row_factory = sqlite3.Row
+    trade.execute("CREATE TABLE settlement_attribution AS SELECT 0.1 AS q_in_bin, 0.1 AS market_in_bin_prob, 0 AS settled_in_bin, NULL AS decision_posterior_computed_at, NULL AS target_date, NULL AS settled_at, NULL AS graded_at, 'wrong' AS city, 'high' AS temperature_metric, 'bin' AS traded_bin_label, 'buy_yes' AS direction WHERE 0")
+    trade.execute("ATTACH DATABASE ? AS world", (str(world_path),))
+    try:
+        rows = load_fit_rows(
+            trade,
+            training_cutoff=datetime(2026, 8, 4, tzinfo=timezone.utc),
+            city_timezone_snapshot=(("city-0", "UTC"),),
+            schema_alias="world",
+        )
+        assert len(rows) == 1
+        assert rows[0].q_raw == 0.8
+    finally:
+        trade.close()
+        world.close()
+
+
 def test_rows_missing_decision_time_or_target_date_are_skipped():
     rows = _settled_rows(4)
     rows[0]["decision_posterior_computed_at"] = None
@@ -262,6 +606,62 @@ def test_rows_missing_decision_time_or_target_date_are_skipped():
     conn = _memory_db(rows)
 
     assert len(load_fit_rows(conn, training_cutoff=NOW, city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()))) == 2
+
+
+def test_late_grade_excludes_an_already_settled_current_attribution():
+    row = _row(0, settled_at=NOW - timedelta(days=2))
+    row["graded_at"] = (NOW + timedelta(minutes=1)).isoformat()
+    conn = _memory_db([row])
+
+    assert load_fit_rows(
+        conn,
+        training_cutoff=NOW,
+        city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()),
+    ) == []
+
+
+def test_regrade_version_is_not_reconstructed_from_an_older_grade():
+    row = _row(0, settled_at=NOW - timedelta(days=2))
+    # The current row represents a regrade written after this fit cutoff. The
+    # supersession history is intentionally outside this loader's authority.
+    row["graded_at"] = (NOW + timedelta(days=1)).isoformat()
+    conn = _memory_db([row])
+
+    assert load_fit_rows(
+        conn,
+        training_cutoff=NOW,
+        city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()),
+    ) == []
+
+
+def test_grade_at_cutoff_is_usable_but_settlement_at_cutoff_remains_strict():
+    graded_at_cutoff = _row(0, settled_at=NOW - timedelta(days=1))
+    graded_at_cutoff["graded_at"] = NOW.isoformat()
+    settled_at_cutoff = _row(1, settled_at=NOW)
+    settled_at_cutoff["graded_at"] = (NOW - timedelta(minutes=1)).isoformat()
+    conn = _memory_db([graded_at_cutoff, settled_at_cutoff])
+
+    rows = load_fit_rows(
+        conn,
+        training_cutoff=NOW,
+        city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()),
+    )
+
+    assert len(rows) == 1
+
+
+def test_missing_or_invalid_grade_cannot_be_admitted_by_old_settlement_time():
+    missing = _row(0, settled_at=NOW - timedelta(days=2))
+    missing["graded_at"] = None
+    naive = _row(1, settled_at=NOW - timedelta(days=2))
+    naive["graded_at"] = "2026-08-20T00:00:00"
+    conn = _memory_db([missing, naive])
+
+    assert load_fit_rows(
+        conn,
+        training_cutoff=NOW,
+        city_timezone_snapshot=tuple(_TEST_CITY_TIMEZONES.items()),
+    ) == []
 
 
 def test_unmodeled_lead_is_excluded_from_training():

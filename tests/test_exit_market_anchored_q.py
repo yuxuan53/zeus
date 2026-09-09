@@ -230,7 +230,7 @@ def _seed_conn_for_real_provider() -> sqlite3.Connection:
             ).isoformat(),
             "target_date": target_day.isoformat(),
             "settled_at": settled_at.isoformat(),
-            "graded_at": None,
+            "graded_at": settled_at.isoformat(),
             "city": f"city-{i}",
             "temperature_metric": "high",
             "traded_bin_label": f"bin-{i}",

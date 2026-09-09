@@ -5,8 +5,10 @@
 # Authority basis: docs/operations/current/plans/hourly_capital_gains_improvement_loop.md
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import sqlite3
+import threading
+import time
 from types import SimpleNamespace
 
 from src.calibration.market_anchored_live_fit import (
@@ -24,10 +26,12 @@ from src.calibration.market_anchored_residual import (
     fit,
 )
 from src.calibration.market_anchored_live_fit import (
+    active_provider_scope,
     get_active_provider,
     load_fit_rows,
     register_active_provider,
 )
+from src.engine import cycle_runner
 from src.engine import global_batch_runtime as runtime
 from src.state import portfolio as portfolio_module
 from src.state.portfolio import ExitContext, Position
@@ -101,7 +105,7 @@ def test_training_uses_the_same_city_local_boundary_as_serving():
                 "2026-01-02T00:30:00+00:00",
                 "2026-01-02",
                 "2026-01-03T00:00:00+00:00",
-                None,
+                "2026-01-03T00:00:00+00:00",
                 "New York",
                 "high",
                 "bin-a",
@@ -114,7 +118,7 @@ def test_training_uses_the_same_city_local_boundary_as_serving():
                 "2026-01-01T15:30:00+00:00",
                 "2026-01-02",
                 "2026-01-03T00:00:00+00:00",
-                None,
+                "2026-01-03T00:00:00+00:00",
                 "Tokyo",
                 "high",
                 "bin-b",
@@ -367,7 +371,7 @@ def test_entry_resolver_and_held_exit_use_actual_city_local_callers(monkeypatch)
     register_active_provider(None)
 
 
-def test_snapshot_failure_and_empty_context_clear_stale_provider(monkeypatch, caplog):
+def test_snapshot_failure_and_empty_context_leave_monitor_scope_untouched(monkeypatch, caplog):
     stale = object()
     register_active_provider(stale)
     assert (
@@ -376,7 +380,10 @@ def test_snapshot_failure_and_empty_context_clear_stale_provider(monkeypatch, ca
         )
         is None
     )
-    assert get_active_provider() is None
+    # Entry resolver state is batch-local; it must not mutate a caller's
+    # monitor-scoped provider.
+    assert get_active_provider() is stale
+    register_active_provider(None)
 
     register_active_provider(stale)
     monkeypatch.setattr(
@@ -389,5 +396,209 @@ def test_snapshot_failure_and_empty_context_clear_stale_provider(monkeypatch, ca
         )
         is None
     )
-    assert get_active_provider() is None
+    assert get_active_provider() is stale
+    register_active_provider(None)
     assert "MARKET_ANCHORED_CITY_SNAPSHOT_UNAVAILABLE:ValueError" in caplog.text
+
+
+def test_active_provider_scope_is_context_local_and_resets_after_exception():
+    provider = object()
+    child_values: list[object] = []
+
+    with active_provider_scope(provider):
+        assert get_active_provider() is provider
+        child = threading.Thread(target=lambda: child_values.append(get_active_provider()))
+        child.start()
+        child.join()
+    assert child_values == [None]
+    assert get_active_provider() is None
+
+    try:
+        with active_provider_scope(provider):
+            raise RuntimeError("probe")
+    except RuntimeError:
+        pass
+    assert get_active_provider() is None
+
+
+def test_cycle_runner_monitor_wrapper_uses_current_connection_and_cleans_scope(monkeypatch):
+    observed: list[object] = []
+
+    def fake_execute(*args, **kwargs):
+        observed.append(get_active_provider())
+        return False, False
+
+    monkeypatch.setattr(cycle_runner._runtime, "execute_monitoring_phase", fake_execute)
+    monkeypatch.setattr(
+        "src.config.runtime_cities_by_name",
+        lambda: {"city-0": SimpleNamespace(timezone="UTC")},
+    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert cycle_runner._execute_monitoring_phase(
+            conn,
+            None,
+            None,
+            None,
+            None,
+            {},
+            held_position_monitor_budget_seconds=10.0,
+        ) == (False, False)
+    finally:
+        conn.close()
+    assert len(observed) == 1
+    assert isinstance(observed[0], MarketAnchoredFitProvider)
+    assert observed[0]._schema_alias == "world"
+    assert get_active_provider() is None
+
+
+def test_real_world_entry_warm_close_then_monitor_refits_on_attached_trade(
+    monkeypatch, tmp_path
+):
+    """The monitor must recover a real expired entry artifact from fresh WORLD."""
+
+    entry_at = datetime.now(timezone.utc) - timedelta(hours=7)
+    target_date = entry_at.date() + timedelta(days=1)
+    world_path = tmp_path / "world.db"
+    world = sqlite3.connect(world_path)
+    world.row_factory = sqlite3.Row
+    world.execute(
+        """CREATE TABLE settlement_attribution (
+            q_in_bin REAL, market_in_bin_prob REAL, settled_in_bin INTEGER,
+            direction TEXT, decision_posterior_computed_at TEXT,
+            target_date TEXT, settled_at TEXT, graded_at TEXT,
+            city TEXT, temperature_metric TEXT, traded_bin_label TEXT
+        )"""
+    )
+    world.executemany(
+        "INSERT INTO settlement_attribution VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                0.9,
+                0.35,
+                index % 2,
+                "buy_yes",
+                (entry_at - timedelta(days=index % 3)).isoformat(),
+                target_date.isoformat(),
+                (entry_at - timedelta(days=1)).isoformat(),
+                (entry_at - timedelta(days=1)).isoformat(),
+                "Chicago",
+                "high",
+                f"bin-{index}",
+            )
+            for index in range(40)
+        ],
+    )
+    world.commit()
+    monkeypatch.setattr(
+        "src.config.runtime_cities_by_name",
+        lambda: {"Chicago": SimpleNamespace(timezone="UTC")},
+    )
+
+    entry_resolver = runtime._market_anchored_correction_resolver(
+        world,
+        target_context_by_family={"family": ("Chicago", target_date)},
+    )
+    candidate = SimpleNamespace(
+        family_key="family", bin_id="bin-0", side="YES", token_id="token-0"
+    )
+    entry_correction = entry_resolver(candidate, 0.9, 0.35, entry_at)
+    assert entry_correction is not None
+    world.close()
+
+    trade = sqlite3.connect(":memory:")
+    trade.row_factory = sqlite3.Row
+    trade.execute("ATTACH DATABASE ? AS world", (str(world_path),))
+    observed: list[tuple[object, bool, str]] = []
+
+    def fake_execute(*args, **kwargs):
+        context = ExitContext(
+            fresh_prob=0.9,
+            fresh_prob_is_fresh=True,
+            current_market_price=0.35,
+            current_market_price_is_fresh=True,
+            best_bid=0.3,
+            best_ask=0.4,
+            market_vig=1.0,
+            hours_to_settlement=12.0,
+            position_state="holding",
+            current_ci=(0.05, 0.95),
+            belief_available=True,
+        )
+        observed.append(
+            Position(
+                trade_id="current",
+                market_id="market",
+                city="Chicago",
+                cluster="family",
+                target_date=target_date.isoformat(),
+                bin_label="bin-0",
+                direction="buy_yes",
+            )._exit_q_mean_and_source(context)
+        )
+        return False, False
+
+    monkeypatch.setattr(cycle_runner._runtime, "execute_monitoring_phase", fake_execute)
+    try:
+        assert cycle_runner._execute_monitoring_phase(
+            trade,
+            None,
+            None,
+            None,
+            None,
+            {},
+            held_position_monitor_budget_seconds=10.0,
+        ) == (False, False)
+    finally:
+        trade.close()
+
+    assert len(observed) == 1
+    assert observed[0][2] == "market_anchored"
+    assert observed[0][0] != 0.9
+    assert get_active_provider() is None
+
+
+def test_cycle_runner_monitor_budget_includes_provider_setup_time(monkeypatch):
+    observed: dict[str, float] = {}
+
+    class StubProvider:
+        _schema_alias = "world"
+
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.03)
+
+        def warm(self, *, now, deadline_monotonic):
+            observed["warm_remaining"] = deadline_monotonic - time.monotonic()
+
+    monkeypatch.setattr(
+        "src.calibration.market_anchored_live_fit.MarketAnchoredFitProvider",
+        StubProvider,
+    )
+    monkeypatch.setattr(
+        cycle_runner._runtime,
+        "_held_position_monitor_budget_seconds",
+        lambda override: 0.05,
+    )
+
+    def fake_execute(*args, **kwargs):
+        observed["runtime_budget"] = kwargs["held_position_monitor_budget_seconds"]
+        return False, False
+
+    monkeypatch.setattr(cycle_runner._runtime, "execute_monitoring_phase", fake_execute)
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert cycle_runner._execute_monitoring_phase(
+            conn,
+            None,
+            None,
+            None,
+            None,
+            {},
+            held_position_monitor_budget_seconds=0.05,
+        ) == (False, False)
+    finally:
+        conn.close()
+
+    assert observed["warm_remaining"] < 0.04
+    assert observed["runtime_budget"] < 0.04
+    assert get_active_provider() is None

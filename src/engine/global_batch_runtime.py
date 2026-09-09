@@ -6184,13 +6184,12 @@ def _market_anchored_correction_resolver(
     from src.calibration.market_anchored_live_fit import (
         MarketAnchoredFitProvider,
         corrected_probability,
-        register_active_provider,
+        get_shared_artifact_cache,
     )
     from src.contracts.payoff_q_correction import PayoffQCorrection
     from src.config import runtime_cities_by_name
 
     if not target_context_by_family:
-        register_active_provider(None)
         return None
 
     try:
@@ -6204,20 +6203,15 @@ def _market_anchored_correction_resolver(
         provider = MarketAnchoredFitProvider(
             lambda: world_conn,
             city_timezones=city_timezones,
+            schema_alias="main",
+            cache=get_shared_artifact_cache(),
         )
     except (AttributeError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        register_active_provider(None)
         _LOG.warning(
             "MARKET_ANCHORED_CITY_SNAPSHOT_UNAVAILABLE:%s",
             type(exc).__name__,
         )
         return None
-
-    # Make this batch's provider reachable from Position.evaluate_exit (the
-    # monitor path), which has no world connection of its own and must never
-    # open one. The exit path reuses this cached provider instead of
-    # constructing its own or dialing sqlite directly.
-    register_active_provider(provider)
 
     def resolve(candidate, raw_q: float, p0: float, decision_at_utc: datetime):
         target_context = target_context_by_family.get(str(candidate.family_key))

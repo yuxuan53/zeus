@@ -13,10 +13,11 @@ stale, and the live path keeps acting on frozen parameters while every
 freshness check it has still passes. An in-process cache cannot outlive the
 process that fitted it, so staleness is bounded by the TTL by construction.
 
-Walk-forward law: ``training_cutoff`` is the fit instant, and only rows that
-SETTLED strictly before it are trained on. A row settling later cannot reach
-back into an artifact already fitted, so a live decision is never informed by
-an outcome that had not yet resolved when the decision was made.
+Walk-forward law: ``training_cutoff`` is the fit instant, and only rows whose
+settlement is strictly before it and whose CURRENT attribution version was
+graded at or before it are trained on. A late grade or a later regrade cannot
+reach back into an artifact already fitted, so covered historical versions are
+conservatively absent rather than reconstructed from supersession history.
 
 Fail-open is the whole contract. Too few rows, an unreadable database, a lead
 outside day0/day1/day2, a non-finite probability — every one of these returns
@@ -28,8 +29,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
+import math
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Mapping
+from contextvars import ContextVar, Token
+from pathlib import Path
+from typing import Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.calibration.market_anchored_residual import (
@@ -57,6 +63,174 @@ DEFAULT_TTL = timedelta(hours=6)
 # acting probability manufactures edge; over-regularizing shrinks toward the
 # market price, which is the plan's explicit safe direction.
 LIVE_LAMBDA = max(LAMBDA_GRID)
+
+_FIT_TABLE_BY_ALIAS = {
+    "main": "settlement_attribution",
+    "world": "world.settlement_attribution",
+}
+ArtifactCacheKey = tuple[object, ...]
+
+
+def _canonical_db_identity(
+    conn: sqlite3.Connection,
+    *,
+    schema_alias: str,
+) -> tuple[str, int, int] | None:
+    """Return the physical identity of one attached canonical database."""
+
+    if schema_alias not in _FIT_TABLE_BY_ALIAS:
+        return None
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        raw_path = next(
+            str(row[2] or "")
+            for row in rows
+            if len(row) > 2 and str(row[1]) == schema_alias
+        )
+        if not raw_path:
+            return None
+        path = Path(raw_path).resolve(strict=False)
+        stat = path.stat()
+        return str(path), int(stat.st_dev), int(stat.st_ino)
+    except (OSError, StopIteration, TypeError, ValueError, sqlite3.Error):
+        return None
+
+
+class MarketAnchoredArtifactCache:
+    """Thread-safe cache of immutable fit artifacts, never database handles."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[
+            ArtifactCacheKey,
+            tuple[ResidualCalibratorArtifact, datetime],
+        ] = {}
+
+    def get_or_fit(
+        self,
+        key: ArtifactCacheKey,
+        *,
+        now: datetime,
+        ttl: timedelta,
+        fit_current: Callable[[], ResidualCalibratorArtifact | None],
+        deadline_monotonic: float | None = None,
+    ) -> tuple[ResidualCalibratorArtifact | None, datetime | None]:
+        """Serve a live artifact or fit once using only the current connection."""
+
+        if deadline_monotonic is None:
+            acquired = self._lock.acquire()
+        else:
+            remaining = float(deadline_monotonic) - time.monotonic()
+            if not math.isfinite(remaining) or remaining <= 0:
+                return None, now
+            acquired = self._lock.acquire(timeout=remaining)
+        if not acquired:
+            return None, now
+        try:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= float(deadline_monotonic)
+            ):
+                return None, now
+            cached = self._entries.get(key)
+            if cached is not None:
+                artifact, fitted_at = cached
+                age = now - fitted_at
+                if timedelta(0) <= age < ttl:
+                    if (
+                        deadline_monotonic is not None
+                        and time.monotonic() >= float(deadline_monotonic)
+                    ):
+                        return None, now
+                    return artifact, fitted_at
+            artifact = fit_current()
+            if (
+                artifact is not None
+                and (
+                    deadline_monotonic is None
+                    or time.monotonic() < float(deadline_monotonic)
+                )
+            ):
+                if cached is None or now >= cached[1]:
+                    self._entries[key] = (artifact, now)
+                    return artifact, now
+                # This was a causal backfill earlier than a newer shared
+                # artifact.  Serve the backfill to this caller without
+                # letting its provider-local cache hide the newer artifact.
+                return artifact, None
+            # A failed current connection must not poison a different provider's
+            # cache entry. The caller may still locally cache None for its own TTL.
+            return None, now
+        finally:
+            self._lock.release()
+
+
+_SHARED_ARTIFACT_CACHE = MarketAnchoredArtifactCache()
+
+
+def get_shared_artifact_cache() -> MarketAnchoredArtifactCache:
+    """Return the process-local artifact cache; no connection is retained."""
+
+    return _SHARED_ARTIFACT_CACHE
+
+
+@contextmanager
+def _sqlite_fit_deadline(
+    conn: sqlite3.Connection,
+    deadline_monotonic: float | None,
+):
+    """Bound one borrowed SQLite read without replacing outer progress hooks."""
+
+    if deadline_monotonic is None:
+        yield conn
+        return
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise TimeoutError("market anchored SQLite fit deadline expired")
+
+    previous_busy_timeout: int | None = None
+    timer: threading.Timer | None = None
+    try:
+        try:
+            row = conn.execute("PRAGMA busy_timeout").fetchone()
+            previous_busy_timeout = int(row[0]) if row else None
+            if previous_busy_timeout is not None:
+                remaining_ms = max(
+                    1,
+                    int(max(0.0, deadline_monotonic - time.monotonic()) * 1000.0),
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout = {min(previous_busy_timeout, remaining_ms)}"
+                )
+        except Exception:  # noqa: BLE001 - the timer still bounds supported handles
+            previous_busy_timeout = None
+
+        remaining = float(deadline_monotonic) - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise TimeoutError("market anchored SQLite fit deadline expired")
+        timer = threading.Timer(
+            remaining,
+            lambda: _interrupt_connection(conn),
+        )
+        timer.daemon = True
+        timer.start()
+        yield conn
+    finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+        if previous_busy_timeout is not None:
+            try:
+                conn.execute(f"PRAGMA busy_timeout = {previous_busy_timeout}")
+            except Exception:  # noqa: BLE001 - borrowed connection may be closing
+                pass
+
+
+def _interrupt_connection(conn: sqlite3.Connection) -> None:
+    try:
+        conn.interrupt()
+    except Exception:  # noqa: BLE001 - interruption is best effort
+        pass
 
 
 def _validated_city_timezone_snapshot(
@@ -153,14 +327,16 @@ def _parse_date(value: object) -> date | None:
 def load_fit_rows(
     conn: sqlite3.Connection, *, training_cutoff: datetime,
         city_timezone_snapshot: tuple[tuple[str, str], ...] | None = None,
+        schema_alias: str = "main",
 ) -> list[FitRow]:
     """Extract settled training rows whose outcome preceded ``training_cutoff``.
 
     Predicates mirror ``load_rows`` in scripts/calibrator_walkforward_report.py
-    (q_in_bin / market_in_bin_prob / settled_in_bin / direction all NOT NULL);
-    the settled_at-before-cutoff filter is what makes the live fit
-    walk-forward-safe, and is applied in SQL so an unsettled row is never
-    materialized.
+    (q_in_bin / market_in_bin_prob / settled_in_bin / direction all NOT NULL).
+    Both the strict ``settled_at < training_cutoff`` condition and the
+    ``graded_at <= training_cutoff`` condition are applied after parsing. A
+    missing ``settled_at`` may use a valid grade time as its conservative
+    fallback; an invalid or missing grade can never make a row eligible.
 
     A claim is (city, target_date, temperature_metric, traded_bin_label,
     direction). The live table carries roughly one row per claim, but the
@@ -172,12 +348,15 @@ def load_fit_rows(
     evidence to the fit regardless of how many certified rows it produced.
     """
 
+    table = _FIT_TABLE_BY_ALIAS.get(schema_alias)
+    if table is None:
+        raise ValueError(f"unsupported calibration schema alias: {schema_alias!r}")
     rows = conn.execute(
-        """
+        f"""
         SELECT q_in_bin, market_in_bin_prob, settled_in_bin,
                decision_posterior_computed_at, target_date, settled_at, graded_at,
                city, temperature_metric, traded_bin_label, direction
-        FROM settlement_attribution
+        FROM {table}
         WHERE q_in_bin IS NOT NULL
           AND market_in_bin_prob IS NOT NULL
           AND settled_in_bin IS NOT NULL
@@ -188,9 +367,13 @@ def load_fit_rows(
     valid: list[tuple[dict, str, tuple, int]] = []
     for row in rows:
         record = dict(row) if not isinstance(row, dict) else row
-        settled_at = _parse_ts(record.get("settled_at"))
+        graded_at = _parse_ts(record.get("graded_at"))
+        if graded_at is None or graded_at > training_cutoff:
+            continue
         if record.get("settled_at") is None:
-            settled_at = _parse_ts(record.get("graded_at"))
+            settled_at = graded_at
+        else:
+            settled_at = _parse_ts(record.get("settled_at"))
         if settled_at is None or settled_at >= training_cutoff:
             continue
         decision_at = _parse_ts(record.get("decision_posterior_computed_at"))
@@ -243,15 +426,11 @@ def load_fit_rows(
 
 
 class MarketAnchoredFitProvider:
-    """TTL-cached artifact source for one world-DB connection factory.
+    """TTL-cached artifact source for one borrowed DB connection factory.
 
-    ``connect`` LENDS a connection: the provider reads through it and never
-    closes it, because on the live path it is the batch's own world connection,
-    shared with the rest of the decision and outliving this fit by a wide
-    margin. During forward time it is called at most once per TTL, so the hot
-    path normally never touches sqlite. A failed fit is cached as None for
-    that same TTL, so an unreachable database is not re-dialed once per
-    candidate.
+    The provider never stores or closes a connection.  Only successful,
+    immutable artifacts enter the shared cache; a failed current connection
+    cannot poison a later provider that has a live connection.
     """
 
     def __init__(
@@ -262,8 +441,15 @@ class MarketAnchoredFitProvider:
         min_train_rows: int = MIN_TRAIN_ROWS,
         lambda_: float = LIVE_LAMBDA,
         city_timezones: Mapping[str, str] | None,
+        schema_alias: str = "main",
+        cache: MarketAnchoredArtifactCache | None = None,
+        db_identity: tuple[object, ...] | None = None,
+        cache_only: bool = False,
     ) -> None:
+        if schema_alias not in _FIT_TABLE_BY_ALIAS:
+            raise ValueError(f"unsupported calibration schema alias: {schema_alias!r}")
         self._connect = connect
+        self._schema_alias = schema_alias
         self._ttl = ttl
         self._min_train_rows = min_train_rows
         self._lambda = lambda_
@@ -271,11 +457,29 @@ class MarketAnchoredFitProvider:
         self._lead_calendar_revision = (
             LEAD_CALENDAR_REVISION if city_timezones is not None else UNBOUND_LEAD_CALENDAR_REVISION
         )
+        self._cache = cache if cache is not None else get_shared_artifact_cache()
+        self._db_identity = db_identity
+        self._cache_only = bool(cache_only)
         self._lock = threading.Lock()
         self._artifact: ResidualCalibratorArtifact | None = None
         self._fitted_at: datetime | None = None
 
-    def artifact(self, *, now: datetime) -> ResidualCalibratorArtifact | None:
+    def _cache_key(self, db_identity: tuple[str, int, int]) -> ArtifactCacheKey:
+        return (
+            db_identity,
+            self._city_timezone_snapshot,
+            self._lead_calendar_revision,
+            float(self._lambda),
+            int(self._min_train_rows),
+            self._ttl.total_seconds(),
+        )
+
+    def artifact(
+        self,
+        *,
+        now: datetime,
+        deadline_monotonic: float | None = None,
+    ) -> ResidualCalibratorArtifact | None:
         """The current artifact, refitting when the cached one has aged out."""
 
         if (
@@ -285,35 +489,109 @@ class MarketAnchoredFitProvider:
         ):
             return None
         now_utc = now.astimezone(timezone.utc)
-        with self._lock:
+        if deadline_monotonic is not None:
+            if not math.isfinite(float(deadline_monotonic)) or time.monotonic() >= float(deadline_monotonic):
+                return None
+        if deadline_monotonic is None:
+            acquired = self._lock.acquire()
+        else:
+            remaining = float(deadline_monotonic) - time.monotonic()
+            if not math.isfinite(remaining) or remaining <= 0:
+                return None
+            acquired = self._lock.acquire(timeout=remaining)
+        if not acquired:
+            return None
+        try:
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= float(deadline_monotonic)
+            ):
+                return None
             if self._fitted_at is not None:
                 age = now_utc - self._fitted_at
                 if age < timedelta(0):
                     # A backward request is independently fit at its causal
                     # cutoff, without downgrading the newest cached result.
-                    return self._fit(now_utc)
+                    return (
+                        None
+                        if self._cache_only
+                        else self._fit(
+                            now_utc,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                    )
                 if age < self._ttl:
+                    if (
+                        deadline_monotonic is not None
+                        and time.monotonic() >= float(deadline_monotonic)
+                    ):
+                        return None
                     return self._artifact
-            self._artifact = self._fit(now_utc)
-            self._fitted_at = now_utc
-            return self._artifact
-
-    def _fit(self, training_cutoff: datetime) -> ResidualCalibratorArtifact | None:
-        try:
-            conn = self._connect()
-            if conn is None:
+            if self._cache_only:
                 return None
+            artifact, fitted_at = self._fit_cached(
+                now_utc,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if fitted_at is None:
+                return artifact
+            # A deadline miss is transient work-budget exhaustion.  Preserve
+            # the previous local state so a later caller may retry; in
+            # particular, a monitor warm-up must not turn a late fit into a
+            # six-hour cached ``None``.
+            if (
+                artifact is None
+                and deadline_monotonic is not None
+                and time.monotonic() >= float(deadline_monotonic)
+            ):
+                return None
+            self._artifact = artifact
+            self._fitted_at = fitted_at
+            return self._artifact
+        finally:
+            self._lock.release()
+
+    def warm(
+        self,
+        *,
+        now: datetime,
+        deadline_monotonic: float | None,
+    ) -> ResidualCalibratorArtifact | None:
+        """Fit/refresh once before entering a monitor's position loop."""
+
+        previous_cache_only = self._cache_only
+        self._cache_only = False
+        try:
+            return self.artifact(
+                now=now,
+                deadline_monotonic=deadline_monotonic,
+            )
+        finally:
+            self._cache_only = previous_cache_only
+
+    def _fit_connection(
+        self,
+        conn: sqlite3.Connection,
+        training_cutoff: datetime,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ResidualCalibratorArtifact | None:
+        try:
             if self._city_timezone_snapshot is None:
                 return None
-            rows = load_fit_rows(
-                conn,
-                training_cutoff=training_cutoff,
-                city_timezone_snapshot=(
-                    self._city_timezone_snapshot
-                    if self._lead_calendar_revision == LEAD_CALENDAR_REVISION
-                    else None
-                ),
-            )
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return None
+            with _sqlite_fit_deadline(conn, deadline_monotonic):
+                rows = load_fit_rows(
+                    conn,
+                    training_cutoff=training_cutoff,
+                    city_timezone_snapshot=(
+                        self._city_timezone_snapshot
+                        if self._lead_calendar_revision == LEAD_CALENDAR_REVISION
+                        else None
+                    ),
+                    schema_alias=self._schema_alias,
+                )
         except Exception:  # noqa: BLE001 - an unavailable fit must never block serving
             return None
         # Each row is weighted 1/(claim count), so the training-row floor is
@@ -321,42 +599,117 @@ class MarketAnchoredFitProvider:
         # a claim re-certified many times must not look like many claims.
         if sum(row.w for row in rows) < self._min_train_rows:
             return None
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return None
         cutoff_iso = training_cutoff.isoformat().replace("+00:00", "Z")
         try:
-            return fit(
+            artifact = fit(
                 rows,
                 lambda_=self._lambda,
                 training_cutoff=cutoff_iso,
                 lead_calendar_revision=self._lead_calendar_revision,
                 city_timezone_snapshot=self._city_timezone_snapshot,
             )
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return None
+            return artifact
         except Exception:  # noqa: BLE001 - a failed fit degrades to raw q, never raises
             return None
 
+    def _fit(
+        self,
+        training_cutoff: datetime,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ResidualCalibratorArtifact | None:
+        try:
+            conn = self._connect()
+            if conn is None:
+                return None
+        except Exception:  # noqa: BLE001 - an unavailable fit must never block serving
+            return None
+        return self._fit_connection(
+            conn,
+            training_cutoff,
+            deadline_monotonic=deadline_monotonic,
+        )
 
-# Process-wide handle to the ONE provider the live batch runtime constructs
-# against its own already-open world connection (global_batch_runtime.py
-# registers it once the connection is threaded through). This lets the
-# monitor/exit path (src.state.portfolio, which has no world connection of
-# its own and must never open one — a second connection inside the reactor
-# SAVEPOINT is a known deadlock class) reuse the SAME cached provider that
-# entries use, instead of constructing a fresh one per position or dialing
-# sqlite directly. Unset (None) until the batch runtime registers one; a
-# caller that finds it unset simply keeps its raw q (fail-open).
-_active_provider: MarketAnchoredFitProvider | None = None
+    def _fit_cached(
+        self,
+        training_cutoff: datetime,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> tuple[ResidualCalibratorArtifact | None, datetime | None]:
+        try:
+            conn = self._connect()
+            if conn is None:
+                return None, training_cutoff
+            identity = self._db_identity or _canonical_db_identity(
+                conn,
+                schema_alias=self._schema_alias,
+            )
+        except Exception:  # noqa: BLE001 - an unavailable fit must never block serving
+            return None, training_cutoff
+        if identity is None:
+            return (
+                self._fit_connection(
+                    conn,
+                    training_cutoff,
+                    deadline_monotonic=deadline_monotonic,
+                ),
+                training_cutoff,
+            )
+        return self._cache.get_or_fit(
+            self._cache_key(identity),
+            now=training_cutoff,
+            ttl=self._ttl,
+            fit_current=lambda: self._fit_connection(
+                conn,
+                training_cutoff,
+                deadline_monotonic=deadline_monotonic,
+            ),
+            deadline_monotonic=deadline_monotonic,
+        )
 
 
-def register_active_provider(provider: MarketAnchoredFitProvider | None) -> None:
-    """Register (or clear, with None) the process-wide active provider."""
+# The active provider is monitor-scope state only.  Entry selection uses its
+# batch-local provider and never registers it here.
+_active_provider: ContextVar[MarketAnchoredFitProvider | None] = ContextVar(
+    "market_anchored_active_provider",
+    default=None,
+)
 
-    global _active_provider
-    _active_provider = provider
+
+def register_active_provider(
+    provider: MarketAnchoredFitProvider | None,
+) -> Token:
+    """Set the current monitor-scope provider and return its reset token."""
+
+    return _active_provider.set(provider)
+
+
+def reset_active_provider(token: Token) -> None:
+    """Restore the provider scope represented by ``token``."""
+
+    _active_provider.reset(token)
+
+
+@contextmanager
+def active_provider_scope(provider: MarketAnchoredFitProvider | None):
+    token = register_active_provider(provider)
+    try:
+        yield provider
+    finally:
+        reset_active_provider(token)
 
 
 def get_active_provider() -> MarketAnchoredFitProvider | None:
     """The registered active provider, or None when unset."""
 
-    return _active_provider
+    return _active_provider.get()
 
 
 # side vocabulary accepted by corrected_probability. Both the candidate.side
