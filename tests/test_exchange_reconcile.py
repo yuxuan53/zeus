@@ -12875,7 +12875,7 @@ def test_cold_boot_m5_keeps_latch_and_exit_retry_blocked_without_authenticated_c
             "SELECT next_exit_retry_at FROM position_current WHERE position_id = ?",
             ("exit-ws-gap",),
         ).fetchone()[0]
-        assert result["status"] == "failed_closed"
+        assert result == {"status": "skipped", "reason": "m5_latch_not_clearable"}
         assert ws_gap_guard.status().m5_reconcile_required is True
         assert ws_gap_guard.summary(now=NOW)["entry"]["allow_submit"] is False
         assert retry_at == (NOW + timedelta(minutes=40)).isoformat()
@@ -12888,12 +12888,7 @@ def test_cold_boot_m5_keeps_latch_and_exit_retry_blocked_without_authenticated_c
             """,
             ("exit-ws-gap",),
         ).fetchone()[0] == 0
-        if read_raises:
-            assert result["error"] == "injected fresh M5 read failure"
-            assert [call[0] for call in adapter.calls] == ["get_open_orders"]
-        else:
-            assert "cannot clear ws gap without healthy subscription" in result["error"]
-            assert [call[0] for call in adapter.calls] == ["get_open_orders", "get_trades", "get_positions"]
+        assert adapter.calls == []
     finally:
         ws_gap_guard.clear_for_test(observed_at=NOW)
 
