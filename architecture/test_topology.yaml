@@ -3932,6 +3932,6 @@ test_metadata:
     cohort: law_antibody
     trust: trusted
     authority_docs: []
-    notes: Passive public book identity, atomic source/cursor recovery, revision and partial-root preservation, real SQLite lease isolation, global window fairness, hard HTTP deadlines, and independent capture-writer rejection.
+    notes: Passive public book identity, atomic source/cursor recovery, revision and partial-root preservation, real SQLite lease isolation, global window fairness, hard HTTP deadlines, independent capture-writer rejection, and protocol-scoped standalone capture CLI isolation.
     created: 2026-09-08
-    last_reused_or_audited: 2026-09-08
+    last_reused_or_audited: 2026-09-09

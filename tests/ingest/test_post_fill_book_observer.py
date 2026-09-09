@@ -1,5 +1,5 @@
 # Created: 2026-09-08
-# Last reused/audited: 2026-09-08
+# Last reused/audited: 2026-09-09
 # Authority basis: docs/operations/current/plans/hourly_capital_gains_improvement_loop.md
 from __future__ import annotations
 
@@ -1476,6 +1476,129 @@ def test_process_lock_refuses_duplicate_worker_before_opening_database(
         assert observer._LOCK.acquire(blocking=False)
         observer._LOCK.release()
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def test_capture_once_requires_protocol_id_and_does_not_register_or_fallback():
+    with pytest.raises(SystemExit) as excinfo:
+        observer.main(["capture-once"])
+    assert excinfo.value.code == 2
+
+
+def test_capture_once_calls_run_cycle_once_with_id_and_prints_sorted_counts(
+    monkeypatch, capsys
+):
+    calls: list[str] = []
+
+    def fake_run_cycle(*, protocol_id):
+        calls.append(protocol_id)
+        return {"z": 2, "skipped_locked": 1, "errors": 0}
+
+    monkeypatch.setattr(observer, "run_cycle", fake_run_cycle)
+    monkeypatch.setattr(
+        "src.state.db.get_trade_connection",
+        lambda **_: pytest.fail("capture-once must not open registration DB"),
+    )
+
+    assert observer.main(["capture-once", "--protocol-id", "p"]) == 0
+    assert calls == ["p"]
+    assert capsys.readouterr().out == '{"errors": 0, "skipped_locked": 1, "z": 2}\n'
+
+
+@pytest.mark.parametrize("field", ["errors", "protocol_failures"])
+def test_capture_once_returns_failure_for_cycle_errors(monkeypatch, capsys, field):
+    monkeypatch.setattr(
+        observer,
+        "run_cycle",
+        lambda *, protocol_id: {"errors": 0, "protocol_failures": 0, field: 1},
+    )
+
+    assert observer.main(["capture-once", "--protocol-id", "p"]) == 1
+    assert json.loads(capsys.readouterr().out)[field] == 1
+
+
+def test_register_command_keeps_existing_registration_behavior(monkeypatch, capsys):
+    class FakeConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    connection = FakeConnection()
+    acquired: list[dict[str, object]] = []
+    registered: list[dict[str, object]] = []
+
+    def get_connection(**kwargs):
+        acquired.append(kwargs)
+        return connection
+
+    def register_protocol(conn, **kwargs):
+        assert conn is connection
+        registered.append(kwargs)
+
+    monkeypatch.setattr("src.state.db.get_trade_connection", get_connection)
+    monkeypatch.setattr(observer.repo, "register_protocol", register_protocol)
+
+    assert observer.main(
+        [
+            "register",
+            "--protocol-id",
+            "p",
+            "--caller",
+            "acceptance",
+            "--horizon-seconds",
+            "60",
+            "--window-seconds",
+            "30",
+        ]
+    ) == 0
+    assert acquired == [{"write_class": "bulk"}]
+    assert registered == [
+        {
+            "protocol_id": "p",
+            "caller": "acceptance",
+            "horizon_seconds": 60,
+            "window_seconds": 30,
+        }
+    ]
+    assert connection.closed is True
+    assert capsys.readouterr().out == "registered p\n"
+
+
+def test_capture_once_registered_empty_uses_real_cycle_without_fetch(
+    tmp_path, monkeypatch, capsys
+):
+    path = tmp_path / "capture-empty.db"
+    _file_schema(path, facts=[], protocols=("p",))
+    _patch_cycle_db(monkeypatch, path)
+
+    assert observer.main(["capture-once", "--protocol-id", "p"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "protocols": 1,
+        "source_observed": 0,
+        "captured": 0,
+        "errors": 0,
+        "missed": 0,
+        "protocol_failures": 0,
+    }
+
+
+def test_capture_once_unknown_protocol_stays_isolated_from_registered_protocol(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "capture-unknown.db"
+    _file_schema(path, facts=[], protocols=("registered",))
+    _patch_cycle_db(monkeypatch, path)
+
+    with pytest.raises(ValueError, match="unknown post-fill protocol"):
+        observer.main(["capture-once", "--protocol-id", "missing"])
+
+    conn = sqlite3.connect(path)
+    try:
+        assert [row[0] for row in conn.execute(
+            "SELECT protocol_id FROM post_fill_book_protocols ORDER BY protocol_id"
+        )] == ["registered"]
+    finally:
+        conn.close()
 
 
 def test_daemon_registers_and_invokes_passive_observer_without_other_jobs(monkeypatch):

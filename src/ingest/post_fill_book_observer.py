@@ -652,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="explicit passive post-fill book protocol registration"
+        description="passive post-fill protocol registration and bounded book capture"
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
     register = subcommands.add_parser("register")
@@ -660,7 +660,18 @@ def main(argv: list[str] | None = None) -> int:
     register.add_argument("--caller", required=True)
     register.add_argument("--horizon-seconds", required=True, type=int)
     register.add_argument("--window-seconds", required=True, type=int)
+    capture = subcommands.add_parser("capture-once")
+    capture.add_argument("--protocol-id", required=True)
     args = parser.parse_args(argv)
+
+    if args.command == "capture-once":
+        counts = run_cycle(protocol_id=args.protocol_id)
+        print(json.dumps(counts, sort_keys=True))
+        return int(
+            counts.get("errors", 0) > 0
+            or counts.get("protocol_failures", 0) > 0
+        )
+
     from src.state.db import get_trade_connection
 
     conn = get_trade_connection(write_class="bulk")
