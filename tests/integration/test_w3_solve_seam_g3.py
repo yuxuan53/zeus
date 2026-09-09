@@ -29402,6 +29402,46 @@ def test_global_batch_claims_unpaged_cut_time_winner_and_continues_actuation(
             ),
             True,
         ),
+        (
+            (
+                "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:"
+                "FamilyAuthorityUnavailable:"
+                "DAY0_NOAA_PRELIMINARY_CARRIER_IDENTITY_MISMATCH"
+            ),
+            True,
+        ),
+        (
+            (
+                "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:"
+                "FamilyAuthorityUnavailable:"
+                "DAY0_NOAA_PRELIMINARY_CARRIER_Q_MISMATCH"
+            ),
+            True,
+        ),
+        (
+            (
+                "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:"
+                "FamilyAuthorityUnavailable:"
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SAMPLES_MISMATCH"
+            ),
+            True,
+        ),
+        (
+            (
+                "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:"
+                "FamilyAuthorityUnavailable:"
+                "DAY0_NOAA_PRELIMINARY_CARRIER_OPERATOR_MISMATCH"
+            ),
+            True,
+        ),
+        (
+            (
+                "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:"
+                "FamilyAuthorityUnavailable:"
+                "DAY0_NOAA_PRELIMINARY_CARRIER_SAMPLE_COUNT_MISMATCH"
+            ),
+            True,
+        ),
     ),
 )
 def test_global_batch_excludes_typed_current_q_ineligible_family(
@@ -29534,6 +29574,8 @@ def test_global_batch_excludes_typed_current_q_ineligible_family(
                     raise ValueError("GLOBAL_DAY0_RAW_PROVENANCE_MISSING")
                 if "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason:
                     raise ValueError("GLOBAL_DAY0_REPLACEMENT_CONDITIONING_MISSING")
+                if "DAY0_NOAA_PRELIMINARY_CARRIER_" in ineligible_reason:
+                    raise ValueError(ineligible_reason.rsplit(":", 1)[-1])
                 raise ValueError(
                     "GLOBAL_DAY0_SOURCE_CLOCK_BOUND_BLOCKED:"
                     "REPLACEMENT_RAW_INPUT_HWM:"
@@ -29547,31 +29589,6 @@ def test_global_batch_excludes_typed_current_q_ineligible_family(
             prepare_family,
         )
         prepare_event = captured["prepare_event"]
-        if (
-            "CONDITIONING_OBSERVATION_TIME_MISMATCH" in ineligible_reason
-            or "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason
-            or "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason
-            or "RAW_PROVENANCE_MISSING" in ineligible_reason
-            or "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason
-        ):
-            held_receipt = captured["prepare_held_event"](event_a, decision_at)
-            assert held_receipt.prepared_global_family is None
-            if "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason:
-                reason_suffix = (
-                    "GLOBAL_DAY0_PROVISIONAL_REVISION_LIKELIHOOD_UNAVAILABLE"
-                )
-            elif "RAW_PROVENANCE_MISSING" in ineligible_reason:
-                reason_suffix = "GLOBAL_DAY0_RAW_PROVENANCE_MISSING"
-            elif "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason:
-                reason_suffix = "GLOBAL_DAY0_REPLACEMENT_CONDITIONING_MISSING"
-            elif "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason:
-                reason_suffix = "GLOBAL_DAY0_CONDITIONING_OBSERVATION_MISMATCH"
-            else:
-                reason_suffix = "GLOBAL_DAY0_CONDITIONING_OBSERVATION_TIME_MISMATCH"
-            assert held_receipt.reason == (
-                "GLOBAL_HELD_PROBABILITY_PREPARE_FAILED:"
-                f"FamilyAuthorityUnavailable:{reason_suffix}"
-            )
 
     def actuate(winner, chosen, _at):
         assert winner.event_id == event_b.event_id
@@ -29600,18 +29617,6 @@ def test_global_batch_excludes_typed_current_q_ineligible_family(
         current_time_provider=lambda: decision_at,
     )
 
-    expected_prepare_calls = (
-        2
-        if (
-            "CONDITIONING_OBSERVATION_TIME_MISMATCH" in ineligible_reason
-            or "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason
-            or "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason
-            or "RAW_PROVENANCE_MISSING" in ineligible_reason
-            or "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason
-        )
-        else 1
-    )
-    assert calls["ineligible_prepare"] == expected_prepare_calls
     assert result.venue_submit_count == 1
     assert result.winner_event_id == event_b.event_id
     assert result.receipts[event_b.event_id].submitted is True
@@ -29623,6 +29628,45 @@ def test_global_batch_excludes_typed_current_q_ineligible_family(
     assert persisted["probability_ineligible_by_family"] == {
         family_a: ineligible_reason
     }
+    if through_adapter and (
+        "CONDITIONING_OBSERVATION_TIME_MISMATCH" in ineligible_reason
+        or "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason
+        or "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason
+        or "RAW_PROVENANCE_MISSING" in ineligible_reason
+        or "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason
+        or "DAY0_NOAA_PRELIMINARY_CARRIER_" in ineligible_reason
+    ):
+        held_receipt = captured["prepare_held_event"](event_a, decision_at)
+        assert held_receipt.prepared_global_family is None
+        if "DAY0_NOAA_PRELIMINARY_CARRIER_" in ineligible_reason:
+            reason_suffix = ineligible_reason.rsplit(":", 1)[-1]
+        elif "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason:
+            reason_suffix = "GLOBAL_DAY0_PROVISIONAL_REVISION_LIKELIHOOD_UNAVAILABLE"
+        elif "RAW_PROVENANCE_MISSING" in ineligible_reason:
+            reason_suffix = "GLOBAL_DAY0_RAW_PROVENANCE_MISSING"
+        elif "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason:
+            reason_suffix = "GLOBAL_DAY0_REPLACEMENT_CONDITIONING_MISSING"
+        elif "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason:
+            reason_suffix = "GLOBAL_DAY0_CONDITIONING_OBSERVATION_MISMATCH"
+        else:
+            reason_suffix = "GLOBAL_DAY0_CONDITIONING_OBSERVATION_TIME_MISMATCH"
+        assert held_receipt.reason == (
+            "GLOBAL_HELD_PROBABILITY_PREPARE_FAILED:"
+            f"FamilyAuthorityUnavailable:{reason_suffix}"
+        )
+    expected_prepare_calls = (
+        2
+        if (
+            "CONDITIONING_OBSERVATION_TIME_MISMATCH" in ineligible_reason
+            or "CONDITIONING_OBSERVATION_MISMATCH" in ineligible_reason
+            or "PROVISIONAL_REVISION_LIKELIHOOD" in ineligible_reason
+            or "RAW_PROVENANCE_MISSING" in ineligible_reason
+            or "REPLACEMENT_CONDITIONING_MISSING" in ineligible_reason
+            or "DAY0_NOAA_PRELIMINARY_CARRIER_" in ineligible_reason
+        )
+        else 1
+    )
+    assert calls["ineligible_prepare"] == expected_prepare_calls
 
 
 def test_global_batch_rejects_when_all_families_lack_current_q(monkeypatch):
@@ -29739,6 +29783,14 @@ def test_global_batch_preserves_single_family_current_q_failure(monkeypatch):
             "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:OperationalError:"
             "no such table: readiness_state"
         ),
+        (
+            "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:ValueError:"
+            "DAY0_NOAA_PRELIMINARY_CARRIER_UNREGISTERED_MISMATCH"
+        ),
+        (
+            "GLOBAL_CURRENT_PROBABILITY_PREPARE_FAILED:RuntimeError:"
+            "DAY0_NOAA_PRELIMINARY_CARRIER_IDENTITY_MISMATCH"
+        ),
     ),
 )
 def test_global_batch_rejects_unexpected_probability_prepare_failure(
@@ -29746,6 +29798,15 @@ def test_global_batch_rejects_unexpected_probability_prepare_failure(
     reason,
 ):
     import src.data.replacement_input_hwm as input_hwm
+
+    if "DAY0_NOAA_PRELIMINARY_CARRIER_" in reason:
+        carrier_reason = reason.rsplit(":", 1)[-1]
+        error = (
+            ValueError(carrier_reason)
+            if ":ValueError:" in reason
+            else RuntimeError(carrier_reason)
+        )
+        assert era._is_global_probability_family_unavailable(error) is False
 
     decision_at = _dt.datetime(2026, 7, 10, 8, 0, tzinfo=_dt.timezone.utc)
     event = _global_scope_event(city="Alpha", source_run_id="run-a")
