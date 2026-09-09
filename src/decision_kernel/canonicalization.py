@@ -218,6 +218,8 @@ def qkernel_current_state_identity_hash(economics: Mapping[str, Any]) -> str:
         fields += _QKERNEL_MAKER_REST_IDENTITY_FIELDS
     if "global_buy_fak_prefix_semantics" in economics:
         fields += _QKERNEL_BUY_FAK_PREFIX_IDENTITY_FIELDS
+    if "raw_calibration_input" in economics:
+        fields += ("raw_calibration_input",)
     return stable_hash(
         {field: economics.get(field) for field in fields}
     )

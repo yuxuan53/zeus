@@ -45,7 +45,10 @@ from src.contracts.global_auction_receipt import (
 )
 from src.contracts.strategy_capital_allocation import STRATEGY_LOG_UTILITY_BASIS
 from src.decision_kernel import claims
-from src.decision_kernel.canonicalization import stable_hash
+from src.decision_kernel.canonicalization import (
+    qkernel_current_state_identity_hash,
+    stable_hash,
+)
 from src.decision_kernel.certificate import build_certificate
 from src.solve.solver import (
     CurrentMakerFillWitness,
@@ -3622,6 +3625,299 @@ def test_global_actuation_current_band_binds_candidate_side_when_cert_omits_it(s
     )
 
     assert current["side"] == side
+
+
+def _real_global_capture_case(*, side: str, corrected: bool):
+    from tests.solve.test_solver_properties import (
+        _correction_for,
+        _global_candidate,
+        _global_select,
+        _global_probability_witness,
+    )
+
+    candidate = _global_candidate(
+        candidate_id=f"raw-capture-{side}-{corrected}",
+        family=f"raw-capture-{side}-{corrected}",
+        side=side,
+        q=0.70,
+        levels=(("0.35", "1000"),),
+        fee="0.02",
+    )
+    candidate = dataclass_replace(
+        candidate,
+        native_bid_levels=(
+            BookLevel(price=Decimal("0.06"), size=Decimal("1000")),
+        ),
+    )
+    witness = _global_probability_witness(candidate)
+    correction = (
+        _correction_for(candidate, raw_q=0.70, corrected_q=0.52, p0=0.35)
+        if corrected
+        else None
+    )
+    decision = _global_select(
+        (candidate,),
+        cap="60",
+        payoff_q_correction_resolver=(
+            (lambda *_args, **_kwargs: correction) if correction is not None else None
+        ),
+    )
+    assert decision.candidate is candidate
+    cert = _current_qkernel_cert(side=side)
+    all_in_unit_cost = float(decision.cost_usd / decision.shares)
+    cert.update(
+        payoff_q_point=0.70,
+        payoff_q_lcb=0.52 if corrected else 0.70,
+        pre_qkernel_q_lcb_5pct=0.52 if corrected else 0.70,
+        cost=all_in_unit_cost,
+        edge_lcb=(0.52 if corrected else 0.70) - all_in_unit_cost,
+    )
+    return candidate, cert, decision, witness
+
+
+@pytest.mark.parametrize("side", ("YES", "NO"))
+@pytest.mark.parametrize("corrected", (False, True))
+def test_global_producer_captures_real_buy_raw_calibration_input(side, corrected):
+    from src.solve.solver import GlobalSingleOrderCandidate
+
+    candidate, cert, decision, witness = _real_global_capture_case(
+        side=side, corrected=corrected
+    )
+    current = era._global_current_state_execution_economics(
+        cert,
+        decision=decision,
+        witness=witness,
+    )
+    capture = current["raw_calibration_input"]
+    assert isinstance(candidate, GlobalSingleOrderCandidate)
+    assert capture["capture_basis"] == "GLOBAL_CERTIFICATE_INPUT"
+    assert capture["raw_q_held"] == pytest.approx(0.70)
+    assert capture["p0_held"] == pytest.approx(0.35)
+    assert capture["p0_basis"] == "GROSS_NATIVE_TOKEN_PRICE"
+    assert capture["correction_applied"] is corrected
+    assert capture["execution_mode"] == "TAKER_LIMIT"
+    assert capture["candidate_id"] == candidate.candidate_id
+    assert capture["family_key"] == candidate.family_key
+    assert capture["condition_id"] == candidate.condition_id
+    assert capture["bin_id"] == candidate.bin_id
+    assert capture["side"] == side
+    assert capture["token_id"] == candidate.token_id
+    assert capture["probability_witness_identity"] == candidate.probability_witness_identity
+    assert capture["sample_hash"] == witness.sample_matrix_identity
+    assert capture["book_snapshot_id"] == candidate.book_snapshot_id
+    assert capture["book_hash"] == candidate.executable_cost_curve.book_hash
+    assert capture["economic_curve_identity"] == candidate.execution_curve_identity
+    assert decision.cost_usd / decision.shares > Decimal("0.35")
+    assert current["payoff_q_point"] == pytest.approx(
+        0.52 if corrected else 0.70
+    )
+    assert current["payoff_q_action"] == pytest.approx(
+        0.52 if corrected else 0.70
+    )
+    assert capture["maker_fill_witness_identity"] is None
+    assert capture["maker_proposal_identity"] is None
+
+
+def test_global_producer_captures_real_maker_proposal_identity():
+    from tests.solve.test_solver_properties import (
+        _current_maker_witness,
+        _global_candidate,
+        _global_probability_witness,
+    )
+    from src.solve.solver import family_payoff_point_q
+
+    candidate = _global_candidate(
+        candidate_id="raw-capture-maker",
+        family="raw-capture-maker",
+        side="YES",
+        q=0.70,
+        levels=(("0.35", "1000"),),
+    )
+    probability_witness = _global_probability_witness(candidate)
+    projected_q = family_payoff_point_q(
+        probability_witness, bin_id=candidate.bin_id, side="YES"
+    )
+    assert projected_q is not None
+    proposal = dataclass_replace(
+        candidate.executable_cost_curve,
+        levels=(BookLevel(price=Decimal("0.29"), size=Decimal("1000")),),
+        book_hash="maker-proposal-book",
+    )
+    witness = _current_maker_witness(
+        candidate,
+        proposal=proposal,
+        asset_epoch="raw-capture-epoch",
+        outcomes=(
+            MakerFillOutcome(
+                probability=Decimal("1"),
+                fill_fraction=Decimal("1"),
+                proceeds_per_share_usd=Decimal("-0.29"),
+            ),
+        ),
+    )
+    candidate = dataclass_replace(
+        candidate,
+        execution_mode="MAKER_REST",
+        proposal_cost_curve=proposal,
+        fill_probability=1.0,
+        fill_probability_source=witness.witness_identity,
+        rest_deadline_minutes=20.0,
+        maker_fill_witness=witness,
+        asset_epoch_identity="raw-capture-epoch",
+    )
+    cert = _current_qkernel_cert(side="YES")
+    cert.update(
+        global_execution_mode="MAKER_REST",
+        payoff_q_point=0.70,
+        payoff_q_lcb=0.70,
+        pre_qkernel_q_lcb_5pct=0.70,
+        cost=0.29,
+        edge_lcb=0.41,
+    )
+    decision = _global_decision(
+        shares="10",
+        cost="2.9",
+        q=str(projected_q),
+        candidate=candidate,
+    )
+    current = era._global_current_state_execution_economics(
+        cert,
+        decision=decision,
+        witness=probability_witness,
+        decision_time=datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc),
+    )
+    capture = current["raw_calibration_input"]
+    assert capture["execution_mode"] == "MAKER_REST"
+    assert capture["p0_held"] == pytest.approx(0.29)
+    assert candidate.executable_cost_curve.levels[0].price == Decimal("0.35")
+    assert proposal.levels[0].price == Decimal("0.29")
+    assert capture["book_hash"] == candidate.executable_cost_curve.book_hash
+    assert capture["book_hash"] != proposal.book_hash
+    assert capture["economic_curve_identity"] == executable_curve_identity(proposal)
+    assert capture["maker_fill_witness_identity"] == witness.witness_identity
+    assert capture["maker_proposal_identity"] == executable_curve_identity(proposal)
+    assert (
+        current["global_maker_fill_witness"]["proposal_identity"]
+        == capture["maker_proposal_identity"]
+    )
+
+
+def test_global_producer_does_not_capture_real_sell_candidate():
+    from tests.solve.test_solver_properties import (
+        _global_probability_witness,
+        _global_sell_candidate,
+    )
+    from src.solve.solver import family_payoff_point_q
+
+    sell = _global_sell_candidate(
+        candidate_id="raw-capture-sell",
+        family="raw-capture-sell",
+        side="YES",
+        held_q=0.70,
+        bids=(("0.40", "10"),),
+        shares="10",
+    )
+    probability_witness = _global_probability_witness(sell)
+    projected_q = family_payoff_point_q(
+        probability_witness, bin_id=sell.bin_id, side="YES"
+    )
+    assert projected_q is not None
+    cert = _current_qkernel_cert(side="YES")
+    cert.update(
+        payoff_q_point=0.70,
+        payoff_q_lcb=0.70,
+        pre_qkernel_q_lcb_5pct=0.70,
+        cost=0.40,
+        edge_lcb=0.30,
+        raw_calibration_input={"schema_version": 1, "raw_q_held": 0.99},
+    )
+    current = era._global_current_state_execution_economics(
+        cert,
+        decision=_global_decision(
+            shares="10",
+            cost="4",
+            q=str(projected_q),
+            candidate=sell,
+        ),
+        witness=probability_witness,
+    )
+    assert "raw_calibration_input" not in current
+
+
+def test_global_producer_captures_real_hardfact_endpoint():
+    from tests.solve.test_solver_properties import (
+        _global_candidate,
+        _global_probability_witness,
+    )
+
+    candidate = _global_candidate(
+        candidate_id="raw-capture-hardfact",
+        family="raw-capture-hardfact",
+        side="YES",
+        q=1.0,
+        levels=(("0.35", "1000"),),
+    )
+    candidate = dataclass_replace(candidate, settlement_locked_exact_payoff=True)
+    unit_cost = candidate.economic_cost_curve.avg_cost_for_shares(
+        Decimal("10")
+    ).value
+    cert = _current_qkernel_cert(side="YES")
+    cert.update(
+        payoff_q_point=1.0,
+        payoff_q_lcb=1.0,
+        pre_qkernel_q_lcb_5pct=1.0,
+        cost=unit_cost,
+        edge_lcb=1.0 - unit_cost,
+    )
+    current = era._global_current_state_execution_economics(
+        cert,
+        decision=_global_decision(
+            shares="10",
+            cost=str(Decimal(str(unit_cost)) * Decimal("10")),
+            q="1.0",
+            candidate=candidate,
+        ),
+        witness=_global_probability_witness(candidate),
+    )
+
+    assert current["payoff_q_point"] == 1.0
+    assert current["payoff_q_action"] == 1.0
+    assert current["raw_calibration_input"]["raw_q_held"] == 1.0
+    assert current["raw_calibration_input"]["p0_held"] == pytest.approx(0.35)
+
+
+def test_raw_calibration_input_is_hashed_but_legacy_hash_remains_compatible():
+    legacy = {
+        "source": "qkernel_spine",
+        "decision_id": "decision-golden",
+        "receipt_hash": "receipt-golden",
+        "q_version": "q-golden",
+        "sample_hash": "sample-golden",
+        "candidate_id": "candidate-golden",
+        "route_id": "route-golden",
+        "side": "YES",
+        "bin_id": "bin-golden",
+        "payoff_q_point": 0.70,
+        "payoff_q_lcb": 0.60,
+        "cost": 0.40,
+    }
+    legacy_hash = qkernel_current_state_identity_hash(legacy)
+    assert legacy_hash == (
+        "a2d7eec39d355a690422164c2432d24847fb81e14c4d3d6dade0464a5efdea4f"
+    )
+    with_capture = dict(
+        legacy,
+        raw_calibration_input={"schema_version": 1, "raw_q_held": 0.70},
+    )
+    assert qkernel_current_state_identity_hash(with_capture) != legacy_hash
+    changed_capture = dict(with_capture)
+    changed_capture["raw_calibration_input"] = {
+        "schema_version": 1,
+        "raw_q_held": 0.71,
+    }
+    assert qkernel_current_state_identity_hash(changed_capture) != (
+        qkernel_current_state_identity_hash(with_capture)
+    )
 
 
 def test_global_actuation_current_band_refuses_candidate_cert_side_mismatch():

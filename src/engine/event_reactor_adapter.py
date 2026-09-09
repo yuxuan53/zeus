@@ -15885,9 +15885,11 @@ def _global_current_state_execution_economics(
         raise ValueError("GLOBAL_CURRENT_STATE_SIDE_INVALID")
     from src.solve.solver import (
         DeterministicBinPayoffWitness,
+        GlobalSingleOrderCandidate,
         _lower_cvar,
         family_payoff_point_q,
         family_payoff_q_samples,
+        executable_curve_identity,
     )
 
     raw_point_q = cert.get("payoff_q_point")
@@ -15903,6 +15905,7 @@ def _global_current_state_execution_economics(
     )
     if payoff_samples is None or current_point_q is None:
         raise ValueError("GLOBAL_CURRENT_STATE_POINT_Q_INVALID")
+    raw_calibration_q_held = float(current_point_q)
     # The witness projection above is the RAW probability. When the solver sized
     # this order on a market-anchored correction, it sealed that correction onto
     # the decision; re-deriving it here instead would let a refit between solve
@@ -16118,6 +16121,9 @@ def _global_current_state_execution_economics(
     if (edge_expected if mean_action else edge_lcb) <= 0:
         raise ValueError("GLOBAL_CURRENT_STATE_ECONOMICS_NON_POSITIVE")
     current = dict(cert)
+    # A caller-supplied certificate may carry an older raw block, but only a
+    # current BUY GlobalSingleOrderCandidate may create this producer input.
+    current.pop("raw_calibration_input", None)
     current.update(
         {
             "source": str(cert.get("source") or "qkernel_spine"),
@@ -16269,6 +16275,41 @@ def _global_current_state_execution_economics(
                 validated_at_utc=decision_time,
             )
         )
+    if isinstance(candidate, GlobalSingleOrderCandidate):
+        curve = candidate.economic_cost_curve
+        maker_witness_payload = current.get("global_maker_fill_witness")
+        current["raw_calibration_input"] = {
+            "schema_version": 1,
+            "capture_basis": "GLOBAL_CERTIFICATE_INPUT",
+            "raw_q_held": raw_calibration_q_held,
+            "p0_held": float(curve.levels[0].price),
+            "p0_basis": "GROSS_NATIVE_TOKEN_PRICE",
+            "correction_applied": q_correction is not None,
+            "execution_mode": candidate.execution_mode,
+            "candidate_id": candidate.candidate_id,
+            "family_key": candidate.family_key,
+            "condition_id": candidate.condition_id,
+            "bin_id": candidate.bin_id,
+            "side": candidate.side,
+            "token_id": candidate.token_id,
+            "probability_witness_identity": candidate.probability_witness_identity,
+            "sample_hash": sample_hash,
+            "book_snapshot_id": candidate.book_snapshot_id,
+            "book_hash": candidate.executable_cost_curve.book_hash,
+            "economic_curve_identity": executable_curve_identity(curve),
+            "maker_fill_witness_identity": (
+                maker_witness_payload.get("witness_identity")
+                if candidate.execution_mode == "MAKER_REST"
+                and isinstance(maker_witness_payload, Mapping)
+                else None
+            ),
+            "maker_proposal_identity": (
+                maker_witness_payload.get("proposal_identity")
+                if candidate.execution_mode == "MAKER_REST"
+                and isinstance(maker_witness_payload, Mapping)
+                else None
+            ),
+        }
     current["current_state_identity_hash"] = qkernel_current_state_identity_hash(
         current
     )
