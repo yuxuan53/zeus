@@ -1,5 +1,5 @@
 # Created: 2026-07-13
-# Last reused or audited: 2026-07-13
+# Last reused or audited: 2026-09-09
 # Authority basis: docs/rebuild/local_ledger_excision_2026-07-12.md LX-T1
 #   (GATED verdict).
 # Reuse: Run when modifying src/ingest/payout_observer.py, the payout
@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import ast
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
+import src.ingest.payout_observer as payout_observer
 from src.ingest.payout_observer import (
     FINALIZED_SOURCE,
     LEGACY_FINALITY_UPGRADE_BATCH_SIZE,
@@ -906,6 +908,64 @@ class TestSweepAndRecord:
         # resolved binary condition.
         assert rpc_calls == 7
         assert result == {"conditions": 2, "appended": 4, "unchanged": 0}
+
+    @pytest.mark.parametrize(
+        ("numerators", "fail_numerator_indices", "expected_states"),
+        [
+            ({0: 100, 1: 0}, set(), {0: STATE_RESOLVED_NONZERO, 1: STATE_RESOLVED_ZERO}),
+            ({0: 100, 1: 0}, {1}, {0: STATE_RESOLVED_NONZERO, 1: STATE_UNKNOWN}),
+        ],
+        ids=["complete-finalized-pair", "numerator-failure-unknown"],
+    )
+    def test_default_observed_at_is_after_all_rpc_reads(
+        self, conn, monkeypatch, numerators, fail_numerator_indices, expected_states
+    ):
+        conn.execute(
+            "CREATE TABLE position_current ("
+            "position_id TEXT PRIMARY KEY, condition_id TEXT, phase TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE settlement_commands (command_id TEXT PRIMARY KEY, condition_id TEXT)"
+        )
+        conn.execute("INSERT INTO position_current VALUES ('p1', ?, 'settled')", (_CONDITION_A,))
+        conn.commit()
+
+        start = payout_observer.datetime.fromisoformat("2026-09-09T12:00:00+00:00")
+
+        class AdvancingDateTime(payout_observer.datetime):
+            current = start
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        monkeypatch.setattr(payout_observer, "datetime", AdvancingDateTime)
+        base_rpc, _ = _build_stub_rpc(
+            denominator=100,
+            numerators=numerators,
+            fail_numerator_indices=fail_numerator_indices,
+        )
+
+        def rpc(url, method, params):
+            assert not conn.in_transaction
+            try:
+                return base_rpc(url, method, params)
+            finally:
+                AdvancingDateTime.current += timedelta(seconds=5)
+
+        result = sweep_and_record(conn, rpc_url="https://rpc.example", rpc_call=rpc)
+        assert result == {"conditions": 1, "appended": 2, "unchanged": 0}
+        after_rpc = start + timedelta(seconds=20)
+        assert AdvancingDateTime.current == after_rpc
+        rows = conn.execute(
+            "SELECT outcome_index, state, observed_at FROM payout_observations "
+            "WHERE superseded_by IS NULL ORDER BY outcome_index"
+        ).fetchall()
+        assert [(index, state) for index, state, _ in rows] == [
+            (index, expected_states[index]) for index in (0, 1)
+        ]
+        assert all(observed_at == after_rpc.isoformat() for _, _, observed_at in rows), rows
+        assert all(observed_at > start.isoformat() for _, _, observed_at in rows)
 
 
 # ---------------------------------------------------------------------------

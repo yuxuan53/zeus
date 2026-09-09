@@ -497,7 +497,6 @@ def sweep_and_record(
 
     Caller owns the append transaction (commit/rollback), per INV-37.
     """
-    observed_at = now or datetime.now(timezone.utc).isoformat()
     condition_ids = conditions_to_observe(conn)
     if not condition_ids:
         return {"conditions": 0, "appended": 0, "unchanged": 0}
@@ -514,6 +513,7 @@ def sweep_and_record(
             block_marker=block_marker,
         )))
 
+    observed_at = now or datetime.now(timezone.utc).isoformat()
     appended = 0
     unchanged = 0
     if not conn.in_transaction:

@@ -3378,6 +3378,13 @@ files:
     why: P4 post-trade capital lane; owns chain-sync READ, settlement harvester, redeem/wrap state-machine pollers, and preserves no sell-order submission in this process. Its cold-process pUSD heartbeat prefers one authoritative chain batch for balance plus both allowances, then uses the existing bounded CLOB fallback without weakening DEGRADED fail-closed semantics. Each recurring refresh validates the already-migrated collateral schema read-only rather than contending for the global SQLite writer with repeated DDL, then persists only the new current snapshot/head facts.
     downstream:
     - src/ingest/post_trade_capital_daemon.py
+  src/ingest/payout_observer.py:
+    zone: K2_runtime
+    authority_role: finalized_chain_payout_observer
+    why: Reads condition payout vectors at one pinned finalized chain block and appends typed observations only after all RPC reads finish. The default observed_at marks completed fetching before the append transaction, not sweep start or database commit; historical rows and explicit clock overrides retain their original meaning.
+    downstream:
+    - src/ingest/post_trade_capital_daemon.py
+    - src/execution/harvester_pnl_resolver.py
   src/ingest/post_trade_capital_daemon.py:
     zone: K2_runtime
     authority_role: post_trade_capital_daemon
