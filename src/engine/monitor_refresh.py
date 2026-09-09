@@ -3997,6 +3997,7 @@ def _refresh_day0_observation(
             target_d,
             now=observation_boundary,
             temperature_metric=temperature_metric,
+            causal_window_start=observation_boundary,
         )
         if extrema is None:
             ens_result = None

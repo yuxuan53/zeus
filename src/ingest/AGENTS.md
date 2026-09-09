@@ -16,6 +16,7 @@ or lifecycle states.
 |------|-------------|--------------|
 | `forecast_live_daemon.py` | Dedicated OpenData live forecast producer scheduler | HIGH — forecast truth producer / readiness upstream |
 | `polymarket_user_channel.py` | R3 M3 Polymarket authenticated user WebSocket ingestor, gap status, and U2 fact append bridge | HIGH — live venue truth ingest |
+| `trade_match_time.py` | Shared strict native execution-time normalization for REST and WS trade facts | HIGH — execution-clock provenance |
 
 ## Domain rules
 

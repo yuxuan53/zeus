@@ -1,5 +1,5 @@
 # Created: 2026-06-12
-# Last reused or audited: 2026-07-27
+# Last reused or audited: 2026-09-08
 # Authority basis: settlement-losses incident 2026-06-12 (719/719 stale monitor
 #   refreshes on the Karachi position; entry authority = forecast_posteriors,
 #   exit authority = dead legacy day0/ens chain) + external consult
@@ -87,7 +87,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 class _BeliefReadDeadlineExceeded(TimeoutError):
-    """A bounded held-belief read exhausted its caller-owned deadline."""
+    """A bounded held-belief read exhausted its usable caller-owned budget."""
 
 
 def _remaining_read_timeout(
@@ -124,9 +124,16 @@ def _bounded_sqlite_read(conn: sqlite3.Connection, deadline_monotonic: float | N
         yield
         _remaining_read_timeout(deadline_monotonic)
     except sqlite3.OperationalError as exc:
-        if time.monotonic() >= float(deadline_monotonic):
+        remaining = float(deadline_monotonic) - time.monotonic()
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        native_busy = (
+            isinstance(error_code, int)
+            and error_code & 0xFF == sqlite3.SQLITE_BUSY
+        )
+        # Native BUSY can exhaust SQLite's integer-ms wait before the deadline.
+        if remaining <= 0.0 or (native_busy and remaining < 0.001):
             raise _BeliefReadDeadlineExceeded(
-                "held-belief SQLite read deadline elapsed"
+                "held-belief SQLite read budget exhausted"
             ) from exc
         raise
     finally:
@@ -636,10 +643,11 @@ def _observed_running_extreme_native(
 
     ``observation_prints`` is append-only audit truth; its canonical projection
     resolves a same-source-clock correction before deriving the local-day
-    MAX/MIN.  ``observation_instants`` remains the compatibility fallback for
-    databases that predate that ledger.  Reading its monotone projection first
-    made a corrected provider print impossible to retract from held belief.
+    MAX/MIN.  Held belief accepts only that canonical fact and fails closed when
+    the canonical reader cannot produce a finite value.
     """
+    # SCOPE: this held family read. DRAIN: refresh canonical observation evidence.
+    # RESET: a subsequent finite canonical fact is accepted without stored blocking.
     metric_l = str(metric or "").strip().lower()
     if metric_l not in {"high", "low"}:
         return None
@@ -647,9 +655,6 @@ def _observed_running_extreme_native(
         from src.state.db import ZEUS_WORLD_DB_PATH
 
         world_db_path = str(ZEUS_WORLD_DB_PATH)
-    extreme_col = "running_min" if metric_l == "low" else "running_max"
-    agg = "MIN" if metric_l == "low" else "MAX"
-    now_iso = now.astimezone(timezone.utc).isoformat()
     try:
         timeout = _remaining_read_timeout(deadline_monotonic)
         conn = sqlite3.connect(
@@ -675,70 +680,17 @@ def _observed_running_extreme_native(
                     decision_time=now,
                     require_settlement_channel=True,
                 )
-            except (sqlite3.Error, TypeError, ValueError):
+            except (TypeError, ValueError):
                 fact = None
             if fact is not None:
                 try:
-                    return float(fact["observed_extreme_native"])
-                except (KeyError, TypeError, ValueError):
-                    pass
-            for table_ref in ("world.observation_instants", "observation_instants"):
-                if deadline_monotonic is not None:
-                    remaining = _remaining_read_timeout(deadline_monotonic)
-                    conn.execute(
-                        f"PRAGMA busy_timeout = {max(1, int(remaining * 1000.0))}"
-                    )
-                try:
-                    row = conn.execute(
-                        f"""
-                    SELECT {agg}(CAST({extreme_col} AS REAL)) AS extreme,
-                           COUNT(*) AS n_rows
-                    FROM {table_ref}
-                    WHERE city = ?
-                      AND target_date = ?
-                      AND substr(local_timestamp, 1, 10) = target_date
-                      AND utc_timestamp <= ?
-                      AND COALESCE(causality_status, 'OK') = 'OK'
-                      AND (
-                            (
-                                UPPER(COALESCE(authority, '')) = 'VERIFIED'
-                                AND COALESCE(source_role, '') = 'historical_hourly'
-                                AND COALESCE(training_allowed, 0) = 1
-                                AND (
-                                    LOWER(COALESCE(source, '')) LIKE 'wu%'
-                                    OR LOWER(COALESCE(source, '')) LIKE 'ogimet_metar_%'
-                                )
-                            )
-                            OR (
-                                city = 'Hong Kong'
-                                AND LOWER(COALESCE(source, '')) = 'hko_hourly_accumulator'
-                                AND UPPER(COALESCE(authority, '')) = 'ICAO_STATION_NATIVE'
-                                AND COALESCE(source_role, '') = 'runtime_monitoring'
-                                AND COALESCE(training_allowed, 0) = 0
-                            )
-                      )
-                      AND {extreme_col} IS NOT NULL
-                        """,
-                        (city, target_date, now_iso),
-                    ).fetchone()
-                except sqlite3.Error as exc:
-                    if (
-                        deadline_monotonic is not None
-                        and time.monotonic() >= float(deadline_monotonic)
-                    ):
-                        raise _BeliefReadDeadlineExceeded(
-                            "held-belief world-floor deadline elapsed"
-                        ) from exc
-                    continue
-                if row is None:
-                    continue
-                extreme = row["extreme"] if hasattr(row, "keys") else row[0]
-                n_rows = int(
-                    (row["n_rows"] if hasattr(row, "keys") else row[1]) or 0
-                )
-                if extreme is None or n_rows <= 0:
-                    continue
-                return float(extreme)
+                    observed = float(fact["observed_extreme_native"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return None
+                return observed if math.isfinite(observed) else None
+        return None
+    except sqlite3.Error:
+        # Budget errors must reach the deadline context before optional-floor recovery.
         return None
     finally:
         try:

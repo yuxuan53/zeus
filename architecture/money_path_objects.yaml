@@ -88,6 +88,24 @@ economic_objects:
         meaning: "Settlement source finality time."
 
 state_machines:
+  post_fill_book_observation_reason:
+    owner: src/ingest/post_fill_book_observer.py
+    description: >
+      Passive source receipt rejections are recorded on SOURCE_OBSERVED;
+      CLOCK_ROLLBACK is recorded on FETCH_ERROR. These reasons grant no trading
+      authority and are not position, command, order, or venue lifecycle states.
+    states:
+      - CLOCK_ROLLBACK
+      - SOURCE_TYPE_UNSUPPORTED
+      - SOURCE_PAYLOAD_TOO_LARGE
+      - SOURCE_PAYLOAD_JSON_INVALID
+      - SOURCE_PAYLOAD_HASH_MISMATCH
+      - SOURCE_TRADE_ID_MISMATCH
+      - SOURCE_ORDER_ID_MISMATCH
+      - SOURCE_MATCH_TIME_INVALID
+      - SOURCE_MATCH_TIME_MISMATCH
+    invariant_tests:
+      - tests/ingest/test_post_fill_book_observer.py
   reactor_runtime_config:
     owner: src/engine/event_reactor_adapter.py
     description: >

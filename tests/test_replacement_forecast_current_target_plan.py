@@ -1,6 +1,6 @@
 # Created: 2026-06-06
-# Last reused/audited: 2026-08-12
-# Lifecycle: created=2026-06-06; last_reviewed=2026-08-12; last_reused=2026-08-12
+# Last reused/audited: 2026-09-08
+# Lifecycle: created=2026-06-06; last_reviewed=2026-09-08; last_reused=2026-09-08
 # Purpose: Protect current-market replacement forecast download and materialization planning.
 # Reuse: Run before changing current replacement target coverage or source-run matching.
 # Authority basis: Replacement forecast coverage must bind to the live baseline source_run, not stale city/date rows.
@@ -464,6 +464,135 @@ def test_day0_global_fact_uses_provider_report_time_and_rejects_lookahead() -> N
         decision_time=datetime(2026, 7, 24, 1, 30, tzinfo=timezone.utc),
         require_settlement_channel=True,
     ) is None
+    conn.close()
+
+
+@pytest.mark.parametrize("temperature_metric", ("high", "low"))
+def test_day0_durable_sample_count_uses_only_causal_clock_qualified_rows(
+    temperature_metric: str,
+) -> None:
+    """The durable row count must use the same three-clock causal filter as facts."""
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE observation_instants (
+            city TEXT, target_date TEXT, source TEXT, station_id TEXT,
+            temp_unit TEXT, imported_at TEXT, local_timestamp TEXT,
+            utc_timestamp TEXT, running_max REAL, running_min REAL,
+            authority TEXT, training_allowed INTEGER, causality_status TEXT,
+            source_role TEXT, raw_response TEXT, provenance_json TEXT
+        )
+        """
+    )
+
+    def add_row(
+        utc_timestamp: str,
+        observation_time: str,
+        imported_at: str,
+        value: float,
+    ) -> None:
+        value = value if temperature_metric == "high" else 63.0 - value
+        conn.execute(
+            "INSERT INTO observation_instants VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "Paris",
+                "2026-07-10",
+                "wu_icao_history",
+                "LFPB",
+                "C",
+                imported_at,
+                "2026-07-10T22:00:00+02:00",
+                utc_timestamp,
+                value,
+                value,
+                "VERIFIED",
+                1,
+                "OK",
+                "historical_hourly",
+                None,
+                json.dumps({"latest_raw_ts": observation_time}),
+            ),
+        )
+
+    # Two rows are causal at the first decision. Each later row violates one
+    # independent clock while retaining the other two clocks as valid.
+    add_row(
+        "2026-07-10T19:00:00+00:00",
+        "2026-07-10T19:05:00+00:00",
+        "2026-07-10T19:10:00+00:00",
+        31.0,
+    )
+    add_row(
+        "2026-07-10T19:30:00+00:00",
+        "2026-07-10T19:35:00+00:00",
+        "2026-07-10T19:40:00+00:00",
+        32.0,
+    )
+    add_row(
+        "2026-07-10T21:01:00+00:00",
+        "2026-07-10T19:45:00+00:00",
+        "2026-07-10T19:50:00+00:00",
+        33.0,
+    )
+    add_row(
+        "2026-07-10T19:45:00+00:00",
+        "2026-07-10T21:01:00+00:00",
+        "2026-07-10T19:55:00+00:00",
+        34.0,
+    )
+    add_row(
+        "2026-07-10T19:50:00+00:00",
+        "2026-07-10T19:55:00+00:00",
+        "2026-07-10T21:01:00+00:00",
+        35.0,
+    )
+    add_row(
+        "not-a-time",
+        "2026-07-10T19:55:00+00:00",
+        "2026-07-10T19:56:00+00:00",
+        36.0,
+    )
+
+    add_row(
+        "2026-07-10T19:50:00+00:00", "not-a-time",
+        "2026-07-10T19:56:00+00:00", 38.0,
+    )
+    add_row(
+        "2026-07-10T19:50:00+00:00", "2026-07-10T19:55:00+00:00",
+        "not-a-time", 39.0,
+    )
+
+    first = _latest_authorized_day0_fact(
+        conn,
+        city="Paris",
+        target_date="2026-07-10",
+        temperature_metric=temperature_metric,
+        decision_time=datetime(2026, 7, 10, 20, tzinfo=timezone.utc),
+        require_settlement_channel=True,
+    )
+    assert first is not None
+    assert first["sample_count"] == 2
+    assert first["observed_extreme_native"] == (32.0 if temperature_metric == "high" else 31.0)
+
+    add_row(
+        "2026-07-10T20:15:00+00:00",
+        "2026-07-10T20:20:00+00:00",
+        "2026-07-10T20:25:00+00:00",
+        37.0,
+    )
+    later = _latest_authorized_day0_fact(
+        conn,
+        city="Paris",
+        target_date="2026-07-10",
+        temperature_metric=temperature_metric,
+        decision_time=datetime(2026, 7, 10, 20, 31, tzinfo=timezone.utc),
+        require_settlement_channel=True,
+    )
+    assert later is not None
+    assert later["sample_count"] == 3
+    assert later["observed_extreme_native"] == (37.0 if temperature_metric == "high" else 26.0)
     conn.close()
 
 

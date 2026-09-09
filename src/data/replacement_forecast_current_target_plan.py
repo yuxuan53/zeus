@@ -931,7 +931,6 @@ def _latest_authorized_day0_fact(
             SELECT observed_extreme_native,
                    utc_timestamp,
                    observation_fact_time AS observation_time,
-                   (SELECT COUNT(*) FROM authorized) AS sample_count,
                    source AS observation_source,
                    station_id,
                    temp_unit,
@@ -948,6 +947,7 @@ def _latest_authorized_day0_fact(
         # append-only print ledger has canonicalized corrections below. A
         # single SQL extreme can be retracted, while a later plateau row can
         # own the writer-validated digest of the canonical extreme.
+        eligible_instant_rows = []
         for row in instant_rows:
             if not row["observation_time"] or row["observed_extreme_native"] is None:
                 continue
@@ -963,11 +963,14 @@ def _latest_authorized_day0_fact(
                 or available_clock > decision_utc
             ):
                 continue
+            eligible_instant_rows.append(row)
+        eligible_sample_count = len(eligible_instant_rows)
+        for row in eligible_instant_rows:
             facts.append(
                 {
                     "observed_extreme_native": float(row["observed_extreme_native"]),
                     "observation_time": str(row["observation_time"]),
-                    "sample_count": int(row["sample_count"] or 0),
+                    "sample_count": eligible_sample_count,
                     "source": "durable_observation_instants",
                     "observation_source": str(row["observation_source"] or ""),
                     "station_id": str(row["station_id"] or ""),

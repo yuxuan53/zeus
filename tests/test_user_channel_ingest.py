@@ -49,7 +49,8 @@ HASH_E = "e" * 64
 
 
 @pytest.fixture
-def conn():
+def conn(monkeypatch):
+    monkeypatch.setenv("ZEUS_ENTRY_Q_VERSION_STRICT", "1")
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
@@ -102,6 +103,7 @@ def _snapshot(snapshot_id: str = "snap-ws") -> ExecutableMarketSnapshot:
 
 def _envelope(
     *,
+    order_id: str = "ord-ws",
     side: str = "BUY",
     price: Decimal = Decimal("0.50"),
     size: Decimal = Decimal("10"),
@@ -121,7 +123,7 @@ def _envelope(
         side=side,
         price=price,
         size=size,
-        order_type="GTC",
+        order_type="FAK",
         post_only=False,
         tick_size=Decimal("0.01"),
         min_order_size=Decimal("5"),
@@ -131,8 +133,8 @@ def _envelope(
         signed_order=b"fake-signed-order",
         signed_order_hash=HASH_E,
         raw_request_hash=HASH_A,
-        raw_response_json=json.dumps({"orderID": "ord-ws", "status": "live"}, sort_keys=True),
-        order_id="ord-ws",
+        raw_response_json=json.dumps({"orderID": order_id, "status": "live"}, sort_keys=True),
+        order_id=order_id,
         trade_ids=("trade-ws",),
         transaction_hashes=("0xtx",),
         error_code=None,
@@ -141,7 +143,7 @@ def _envelope(
     )
 
 
-def _entry_submit_payload() -> dict:
+def _entry_submit_payload(certificate_id: str = "cert-cmd-ws") -> dict:
     return {
         "execution_capability": {
             "allowed": True,
@@ -167,22 +169,44 @@ def _entry_submit_payload() -> dict:
                 {
                     "component": "entry_actionable_certificate",
                     "allowed": True,
-                    "details": {"certificate_id": "cert-ws"},
+                    "details": {"certificate_id": certificate_id},
                 },
             ],
         },
     }
 
 
+def _seed_entry_certificate(c, command_id: str) -> str:
+    if "world" not in {row[1] for row in c.execute("PRAGMA database_list")}:
+        c.execute("ATTACH DATABASE ':memory:' AS world")
+        c.execute(
+            """CREATE TABLE world.decision_certificates (
+                certificate_hash TEXT PRIMARY KEY,
+                certificate_type TEXT NOT NULL, mode TEXT NOT NULL,
+                verifier_status TEXT NOT NULL, payload_json TEXT NOT NULL
+            )"""
+        )
+    certificate_hash = f"cert-{command_id}"
+    c.execute(
+        "INSERT INTO world.decision_certificates VALUES "
+        "(?, 'ActionableTradeCertificate', 'LIVE', 'VERIFIED', ?)",
+        (certificate_hash, json.dumps({
+            "condition_id": "condition-ws", "token_id": "yes-token-ws",
+            "direction": "buy_yes",
+        })),
+    )
+    return certificate_hash
+
+
 def _seed_acknowledged_command(c) -> None:
     insert_snapshot(c, _snapshot())
-    insert_submission_envelope(c, _envelope(), envelope_id="env-ws")
     _seed_trade_decision_runtime_alias(c, trade_id=1, runtime_trade_id="1")
     insert_command(
         c,
         command_id="cmd-ws",
         snapshot_id="snap-ws",
         envelope_id="env-ws",
+        submission_envelope=_envelope(),
         position_id="1",
         decision_id="dec-ws",
         idempotency_key="idem-cmd-ws",
@@ -198,6 +222,8 @@ def _seed_acknowledged_command(c) -> None:
         expected_min_order_size=Decimal("5"),
         expected_neg_risk=False,
         venue_order_id="ord-ws",
+        q_version="q-test",
+        decision_certificate_hash=_seed_entry_certificate(c, "cmd-ws"),
     )
     append_event(
         c,
@@ -779,6 +805,70 @@ def test_ws_message_parsed_to_trade_fact(conn):
     assert _command_state(conn) == "PARTIAL"
 
 
+@pytest.mark.parametrize(
+    ("clock_fields", "expected"),
+    (
+        ({"matchtime": "bad-clock"}, None),
+        ({"matchtime": "1e100"}, None),
+        ({"matchtime": True}, None),
+        ({"matchtime": "NaN"}, None),
+        ({"matchtime": NOW.replace(tzinfo=None).isoformat()}, None),
+        ({"last_update": NOW.isoformat()}, None),
+        ({"match_time": str(int(NOW.timestamp()) * 1000)}, None),
+        ({"match_time": str(int(NOW.timestamp())) + ".0000001"}, None),
+        ({"match_time": NOW.isoformat().replace("+", ".1234567+", 1)}, None),
+        ({"match_time": NOW.isoformat(), "matchtime": (NOW - timedelta(seconds=1)).isoformat()}, None),
+        ({"match_time": NOW.isoformat(), "matchtime": "broken"}, None),
+        ({"matchtime": str(int(NOW.timestamp()))}, NOW),
+        ({"matchTime": str(int(NOW.timestamp()) - 1) + ".123456"}, NOW - timedelta(microseconds=876544)),
+        ({"match_time": NOW.astimezone(timezone(timedelta(hours=2))).isoformat()}, NOW),
+        ({"match_time": NOW.isoformat(), "matchTime": str(int(NOW.timestamp()))}, NOW),
+        ({"match_time": None, "matchtime": NOW.isoformat()}, NOW),
+    ),
+)
+def test_native_match_clock_reaches_post_fill_sampling_without_local_fallback(
+    conn, monkeypatch, clock_fields, expected,
+):
+    """Real WS ingestion must preserve fills without manufacturing their H anchor."""
+    import src.ingest.polymarket_user_channel as channel
+    from src.ingest.post_fill_book_observer import _source_rows, classify_source_fact
+    from src.state import post_fill_book_repo as books
+
+    monkeypatch.setattr(channel, "_utcnow", lambda: NOW)
+    books.register_protocol(
+        conn, protocol_id="native-clock", caller="native-clock-antibody",
+        horizon_seconds=30, window_seconds=2,
+        clock=lambda: NOW - timedelta(seconds=2),
+    )
+    message = _trade_message("MATCHED", **clock_fields)
+    result = _ingestor(conn).handle_message(message)
+
+    assert result and result["trade_fact_id"]
+    fact, = _rows(conn, "venue_trade_facts")
+    assert fact["venue_timestamp"] == (expected.isoformat() if expected else None)
+    assert fact["observed_at"] == NOW.isoformat()
+    assert fact["filled_size"] == "5" and fact["fill_price"] == "0.50"
+    assert fact["state"] == "MATCHED"
+    assert json.loads(fact["raw_payload_json"]) == message
+    assert _command_state(conn) == "PARTIAL"
+    assert books.observe_source_facts(
+        conn, protocol_id="native-clock",
+        rows=_source_rows(conn, "native-clock", 100),
+        observed_at=NOW.isoformat(), classify=classify_source_fact,
+    ) == 1
+    source_event, = _rows(conn, "post_fill_book_observation_events")
+    requests = _rows(conn, "post_fill_book_requests")
+    assert source_event["event_type"] == "SOURCE_OBSERVED"
+    assert source_event["clock_provenance_verified"] == 0
+    if expected is None:
+        assert source_event["reason"] == "VENUE_TIMESTAMP_INVALID"
+        assert requests == []
+    else:
+        assert source_event["reason"] == "SCHEDULED"
+        request, = requests
+        assert request["due_at"] == (expected + timedelta(seconds=30)).isoformat()
+
+
 def test_unmatched_trade_event_is_deferred_not_thread_fatal(conn):
     result = _ingestor(conn).handle_message(_trade_message("MATCHED", taker_order_id="ord-race-fill"))
 
@@ -1064,12 +1154,12 @@ def test_maker_side_partial_fill_lifecycle_uses_zeus_maker_leg_economics(conn):
 def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
     ingestor = _ingestor(conn)
     ingestor.handle_message(_trade_message("MATCHED"))
-    insert_submission_envelope(conn, _envelope(), envelope_id="env-other")
     insert_command(
         conn,
         command_id="cmd-other",
         snapshot_id="snap-ws",
         envelope_id="env-other",
+        submission_envelope=_envelope(order_id="ord-other"),
         position_id="2",
         decision_id="dec-other",
         idempotency_key="idem-cmd-other",
@@ -1085,13 +1175,15 @@ def test_same_trade_id_different_order_requires_review_not_rebinding(conn):
         expected_min_order_size=Decimal("5"),
         expected_neg_risk=False,
         venue_order_id="ord-other",
+        q_version="q-test",
+        decision_certificate_hash=_seed_entry_certificate(conn, "cmd-other"),
     )
     append_event(
         conn,
         command_id="cmd-other",
         event_type="SUBMIT_REQUESTED",
         occurred_at=NOW.isoformat(),
-        payload=_entry_submit_payload(),
+        payload=_entry_submit_payload("cert-cmd-other"),
     )
     append_event(
         conn,

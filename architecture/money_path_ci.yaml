@@ -274,6 +274,61 @@ segments:
       - tests/test_phase_aware_kelly_live.py
     future_object_rules:
       price_probability_assignment: requires_economic_isolation_test
+  actual_capital_admission:
+    invariant_ids: [MP-STR-002]
+    files:
+      - src/engine/global_batch_runtime.py
+      - src/riskguard/riskguard.py
+    relationship_tests:
+      - tests/test_riskguard.py
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_auction_receipt_persists_complete_buy_sell_hold_cash_comparison
+      - tests/integration/test_w3_solve_seam_g3.py::test_capital_proof_counterfactual_rejects_any_venue_side_effect
+      - tests/integration/test_w3_solve_seam_g3.py::test_real_global_batch_has_no_synthetic_producer_and_preserves_auction_contract
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_batch_commits_receipts_before_external_io
+  day0_causal_observations:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/data/replacement_forecast_current_target_plan.py
+      - src/engine/position_belief.py
+    relationship_tests:
+      - tests/test_replacement_forecast_current_target_plan.py
+      - tests/engine/test_position_belief_authority.py
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_rebinds_stale_carrier_to_current_conditioning
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_compares_physical_state_not_carrier_provenance
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_day0_actuation_binds_native_fahrenheit_to_conditioned_celsius
+  day0_remaining_grid:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/signal/day0_window.py
+      - src/engine/monitor_refresh.py
+    relationship_tests:
+      - tests/test_day0_remaining_day_pricing.py
+      - tests/test_day0_window.py
+  global_sqlite_deadline:
+    invariant_ids: [MP-EXT-002]
+    files:
+      - src/engine/global_auction_universe.py
+    relationship_tests:
+      - tests/integration/test_w3_solve_seam_g3.py::test_bounded_sqlite_preserves_error_identity_at_timeout_precision
+      - tests/integration/test_w3_solve_seam_g3.py::test_global_work_deadline_bounds_selection_schema_lock_before_network
+  native_fill_time:
+    invariant_ids: [MP-EXT-001, MP-EXT-002]
+    files:
+      - src/ingest/trade_match_time.py
+      - src/ingest/fill_synchronizer.py
+      - src/ingest/polymarket_user_channel.py
+    relationship_tests:
+      - tests/test_fill_synchronizer.py
+      - tests/test_user_channel_ingest.py
+  post_fill_observation:
+    invariant_ids: [MP-EXT-001, MP-EXT-002, MP-SCH-001, MP-SCH-002]
+    files:
+      - src/ingest/post_fill_book_observer.py
+      - src/state/post_fill_book_repo.py
+      - src/state/schema/post_fill_book_observations_schema.py
+    relationship_tests:
+      - tests/ingest/test_post_fill_book_observer.py
+      - tests/state/test_post_fill_book_repo.py
   external_truth:
     invariant_ids: [MP-EXT-001, MP-EXT-002]
     files:

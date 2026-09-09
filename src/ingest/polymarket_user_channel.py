@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from src.control import ws_gap_guard
 from src.execution.command_bus import CommandState, IN_FLIGHT_STATES
+from src.ingest.trade_match_time import trade_match_time
 from src.state.db import get_trade_connection_with_world
 from src.state.venue_command_repo import (
     append_event,
@@ -939,8 +940,7 @@ class PolymarketUserChannelIngestor:
             # observed_at = WS delivery 'timestamp' (Zeus ingest wall-clock).
             # venue_timestamp = matchtime field (real venue event time); None if absent.
             observed = _parse_dt(message.get("timestamp") or message.get("last_update"))
-            _raw_matchtime = message.get("matchtime") or message.get("matchTime") or message.get("match_time")
-            venue_matchtime = _parse_dt(_raw_matchtime) if _raw_matchtime else None
+            venue_matchtime = trade_match_time(message)
             size_raw, price_raw = _trade_fill_economics_for_command(message, venue_order_id)
             missing = _missing_trade_fill_economics(status, size=size_raw, price=price_raw)
             if missing:

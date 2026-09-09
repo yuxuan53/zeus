@@ -1,6 +1,6 @@
 # Created: 2026-08-12
-# Last reused/audited: 2026-08-23
-# Authority: current-regime capital proof must fail closed before entry reopens.
+# Last reused/audited: 2026-09-08
+# Authority basis: report-only current-regime capital evidence; no order authority.
 
 from __future__ import annotations
 
@@ -185,7 +185,7 @@ def test_placeholder_database_is_rejected(tmp_path):
 def test_current_receipt_without_settled_capital_proof_fails():
     verdict, failures = evaluator._build_verdict(
         receipt={"ready": True},
-        shadows={
+        counterfactual_evidence={
             "day0": {
                 "global_selection_revision_bound": False,
                 "independent_target_date_count": 0,
@@ -205,7 +205,7 @@ def test_current_receipt_without_settled_capital_proof_fails():
 def test_counterfactual_admission_does_not_require_impossible_prior_live_fills():
     verdict, failures = evaluator._build_counterfactual_admission_verdict(
         receipt={"ready": True},
-        shadows={
+        counterfactual_evidence={
             "combined": {
                 "global_selection_revision_bound": True,
                 "independent_target_date_count": 30,
@@ -1273,7 +1273,7 @@ def test_globally_compared_hold_is_graded_at_verified_binary_settlement():
 def test_only_complete_positive_exact_revision_evidence_passes():
     verdict, failures = evaluator._build_verdict(
         receipt={"ready": True},
-        shadows={
+        counterfactual_evidence={
             "combined": {
                 "global_selection_revision_bound": True,
                 "independent_target_date_count": 30,
